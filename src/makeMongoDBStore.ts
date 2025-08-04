@@ -1,6 +1,5 @@
 import { MongoClient, Db, Collection } from 'mongodb'
-import type { Logger } from 'pino'
-import { proto } from '@whiskeysockets/baileys'
+import { proto } from 'baileys'
 import type { 
     BaileysEventEmitter, 
     Chat, 
@@ -8,13 +7,11 @@ import type {
     Contact, 
     GroupMetadata, 
     PresenceData, 
-    WAMessage, 
-    WAMessageCursor, 
-    WAMessageKey 
-} from '@whiskeysockets/baileys'
-import type { Label } from '@whiskeysockets/baileys'
-import type { LabelAssociation, LabelAssociationType } from '@whiskeysockets/baileys'
-import { jidNormalizedUser, jidDecode, updateMessageWithReceipt, updateMessageWithReaction, toNumber } from '@whiskeysockets/baileys'
+    WAMessageCursor 
+} from 'baileys'
+import { jidNormalizedUser, updateMessageWithReceipt, updateMessageWithReaction, toNumber } from 'baileys'
+import type { Label } from 'baileys/lib/Types/Label'
+import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 import type { MongoDBStoreConfig, MongoDBStore } from './types'
 
 const DEFAULT_TTL_DAYS = 30
@@ -45,7 +42,6 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         database: dbName,
         instanceId,
         ttlDays = DEFAULT_TTL_DAYS,
-        logger,
         collectionPrefix = 'baileys_'
     } = config
 
@@ -113,7 +109,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             collections.labelAssociations.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds })
         ])
         
-        logger?.info('MongoDB indexes created successfully')
+        // MongoDB indexes created successfully
     }
     
     await createIndexes()
@@ -230,7 +226,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             return proto.WebMessageInfo.fromObject(msg)
         },
 
-        async upsertMessage(jid: string, message: proto.IWebMessageInfo, mode: 'append' | 'prepend'): Promise<void> {
+        async upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void> {
             await collections.messages.replaceOne(
                 {
                     instanceId,
@@ -385,7 +381,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     instanceId,
                     chatId: association.chatId,
                     labelId: association.labelId,
-                    messageId: association.messageId || ''
+                    messageId: 'messageId' in association ? association.messageId : ''
                 },
                 {
                     ...association,
@@ -401,7 +397,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 instanceId,
                 chatId: association.chatId,
                 labelId: association.labelId,
-                messageId: association.messageId || ''
+                messageId: 'messageId' in association ? association.messageId : ''
             })
         },
 
@@ -426,7 +422,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 if (newMessages?.length) {
                     for (const msg of newMessages) {
                         const jid = msg.key.remoteJid!
-                        await store.upsertMessage(jid, msg, 'prepend')
+                        await store.upsertMessage(jid, msg)
                     }
                 }
             })
@@ -484,7 +480,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             ev.on('messages.upsert', async ({ messages: newMessages, type }) => {
                 for (const msg of newMessages) {
                     const jid = jidNormalizedUser(msg.key.remoteJid!)
-                    await store.upsertMessage(jid, msg, type === 'append' || type === 'notify' ? 'append' : 'prepend')
+                    await store.upsertMessage(jid, msg)
                     
                     if (type === 'notify' && !(await store.getChat(jid))) {
                         await store.upsertChats({

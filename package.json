@@ -22,10 +22,10 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "mongodb": "^6.3.0"
+    "mongodb": "^6.3.0",
+    "baileys": "^6.7.18"
   },
   "peerDependencies": {
-    "@whiskeysockets/baileys": "*",
     "@adiwajshing/keyed-db": "*",
     "pino": "*"
   },

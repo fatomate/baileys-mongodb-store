@@ -1,9 +1,9 @@
 import type { Comparable } from '@adiwajshing/keyed-db/lib/Types'
 import type { Logger } from 'pino'
-import type { proto } from '@whiskeysockets/baileys'
-import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata, PresenceData, WAMessage, WAMessageCursor, WAMessageKey } from '@whiskeysockets/baileys'
-import type { Label } from '@whiskeysockets/baileys'
-import type { LabelAssociation } from '@whiskeysockets/baileys'
+import type { proto } from 'baileys'
+import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata, PresenceData, WAMessage, WAMessageCursor, WAMessageKey } from 'baileys'
+import type { Label } from 'baileys/lib/Types/Label'
+import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 
 export interface MongoDBStoreConfig {
     /**
@@ -107,7 +107,7 @@ export interface MongoDBStore {
     /**
      * Upsert a message
      */
-    upsertMessage(jid: string, message: proto.IWebMessageInfo, mode: 'append' | 'prepend'): Promise<void>
+    upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void>
     
     /**
      * Update a message
