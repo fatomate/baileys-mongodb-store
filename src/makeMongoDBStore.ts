@@ -19,6 +19,15 @@ import type { MongoDBStoreConfig, MongoDBStore } from './types'
 
 const DEFAULT_TTL_DAYS = 30
 
+interface ActiveConnection {
+    client: MongoClient
+    database: string
+    instanceId: string
+    collectionPrefix: string
+}
+
+let activeConnections: ActiveConnection[] = []
+
 interface MongoCollections {
     chats: Collection<Chat & { instanceId: string; updatedAt: Date }>
     contacts: Collection<Contact & { instanceId: string; updatedAt: Date }>
@@ -29,8 +38,6 @@ interface MongoCollections {
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
 }
-
-let activeConnections: MongoClient[] = []
 
 export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<MongoDBStore> => {
     const {
@@ -44,7 +51,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
     const client = new MongoClient(uri)
     await client.connect()
-    activeConnections.push(client)
+    activeConnections.push({
+        client,
+        database: dbName,
+        instanceId,
+        collectionPrefix
+    })
     
     const db: Db = client.db(dbName)
     
@@ -612,7 +624,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
         async close(): Promise<void> {
             await client.close()
-            activeConnections = activeConnections.filter(c => c !== client)
+            activeConnections = activeConnections.filter(c => c.client !== client)
         }
     }
 
@@ -620,16 +632,66 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 }
 
 /**
- * Cleanup all MongoDB connections
- * Useful for graceful shutdown
+ * Cleanup MongoDB store data for a specific instance
+ * @param instanceId - The instance ID to cleanup. If not provided, closes all connections.
+ * @param deleteData - Whether to delete all data for the instance (default: false)
  */
-export const cleanupMongoDBStore = async (): Promise<void> => {
-    for (const client of activeConnections) {
+export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boolean = false): Promise<void> => {
+    if (!instanceId) {
+        // Just close all connections
+        for (const conn of activeConnections) {
+            try {
+                await conn.client.close()
+            } catch (error) {
+                console.error('Error closing MongoDB connection:', error)
+            }
+        }
+        activeConnections = []
+        return
+    }
+
+    // Find connections for the specific instance
+    const instanceConnections = activeConnections.filter(c => c.instanceId === instanceId)
+    
+    if (instanceConnections.length === 0) {
+        console.warn(`No active connections found for instance: ${instanceId}`)
+        return
+    }
+
+    for (const conn of instanceConnections) {
         try {
-            await client.close()
+            if (deleteData) {
+                // Delete all data for this instance
+                const db = conn.client.db(conn.database)
+                const collections = [
+                    `${conn.collectionPrefix}chats`,
+                    `${conn.collectionPrefix}contacts`,
+                    `${conn.collectionPrefix}messages`,
+                    `${conn.collectionPrefix}groupMetadata`,
+                    `${conn.collectionPrefix}state`,
+                    `${conn.collectionPrefix}presences`,
+                    `${conn.collectionPrefix}labels`,
+                    `${conn.collectionPrefix}labelAssociations`
+                ]
+
+                for (const collName of collections) {
+                    try {
+                        await db.collection(collName).deleteMany({ instanceId })
+                    } catch (error) {
+                        console.error(`Error deleting data from ${collName}:`, error)
+                    }
+                }
+                console.log(`Deleted all data for instance: ${instanceId}`)
+            }
+
+            // Close the connection
+            await conn.client.close()
+            
         } catch (error) {
-            console.error('Error closing MongoDB connection:', error)
+            console.error(`Error cleaning up instance ${instanceId}:`, error)
         }
     }
-    activeConnections = []
+
+    // Remove from active connections
+    activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
 }

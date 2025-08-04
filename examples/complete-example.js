@@ -143,11 +143,24 @@ async function main() {
             // Close socket
             sock.end()
             
-            // Cleanup all MongoDB connections
+            // Option 1: Just close connection
+            // await cleanupMongoDBStore(store.instanceId)
+            
+            // Option 2: Delete all data for this instance and close
+            // await cleanupMongoDBStore(store.instanceId, true)
+            
+            // Option 3: Close all connections (default)
             await cleanupMongoDBStore()
             
             logger.info('Shutdown complete')
             process.exit(0)
+        })
+
+        // Example: Cleanup specific instance on demand
+        process.on('SIGUSR1', async () => {
+            logger.info('Cleaning up instance data...')
+            await cleanupMongoDBStore(store.instanceId, true)
+            logger.info('Instance data cleaned up')
         })
 
         // Error handler

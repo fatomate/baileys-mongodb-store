@@ -268,13 +268,47 @@ try {
     console.error('Failed to connect to MongoDB:', error)
 }
 
-// Graceful shutdown
+// Graceful shutdown - close all connections
 process.on('SIGINT', async () => {
     console.log('Shutting down...')
-    // Cleanup all MongoDB connections
-    await cleanupMongoDBStore()
+    await cleanupMongoDBStore() // Closes all connections
     process.exit(0)
 })
+
+// Or cleanup a specific instance
+await cleanupMongoDBStore('my_instance') // Just close connection
+await cleanupMongoDBStore('my_instance', true) // Delete all data and close
+```
+
+### Cleanup Function Options
+
+The `cleanupMongoDBStore` function provides flexible cleanup options:
+
+```javascript
+// Option 1: Close all connections (no data deletion)
+await cleanupMongoDBStore()
+
+// Option 2: Close connection for specific instance (no data deletion)
+await cleanupMongoDBStore('instance_001')
+
+// Option 3: Delete all data for instance AND close connection
+await cleanupMongoDBStore('instance_001', true)
+
+// Example: Clean up before switching instances
+async function switchInstance(oldInstanceId, newInstanceId) {
+    // Clean up old instance data
+    await cleanupMongoDBStore(oldInstanceId, true)
+    
+    // Create new store for new instance
+    const newStore = await makeMongoDBStore({
+        uri: 'mongodb://localhost:27017',
+        database: 'whatsapp_bot',
+        instanceId: newInstanceId,
+        ttlDays: 30
+    })
+    
+    return newStore
+}
 ```
 
 ## Performance Tips
