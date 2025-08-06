@@ -169,8 +169,8 @@ const convertBinaryToBuffer = (obj: any): any => {
         }
         return result
     } catch (error) {
-        console.error('Error converting Binary to Buffer:', error)
-        return obj // Return original object if conversion fails
+        // Error converting Binary to Buffer - return original object
+        return obj
     }
 }
 
@@ -260,12 +260,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 collectionPrefix
             })
             
-            console.log(`MongoDB connected successfully for instance ${instanceId}`)
+            log(`MongoDB connected successfully for instance ${instanceId}`)
         } catch (error) {
             isConnected = false
             isConnecting = false
             connectionError = error as Error
-            console.error(`MongoDB connection failed for instance ${instanceId}:`, error)
+            logError(`MongoDB connection failed for instance ${instanceId}:`, error)
             throw error
         }
     }
@@ -301,7 +301,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         const delay = RECONNECT_DELAY_BASE * Math.pow(2, Math.min(reconnectAttempts, 5))
         
         if (reconnectAttempts > 0) {
-            console.log(`Attempting to reconnect (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}) after ${delay}ms...`)
+            log(`Attempting to reconnect (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}) after ${delay}ms...`)
             await new Promise(resolve => setTimeout(resolve, delay))
         }
         
@@ -328,7 +328,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         if (!redis) return
         
         try {
-            console.log(`🐂 Initializing Bull queues for instance ${instanceId}...`)
+            log(`🐂 Initializing Bull queues for instance ${instanceId}...`)
             
             // Create Redis connection with BullMQ requirements
             if (typeof redis.connection === 'string') {
@@ -354,8 +354,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const config = await redisConnection.config('GET', 'maxmemory-policy') as [string, string]
                 const policy = config[1]
                 if (policy && policy !== 'noeviction') {
-                    console.warn(`⚠️  Redis eviction policy is '${policy}'. Consider using 'noeviction' for BullMQ or a separate Redis instance.`)
-                    console.warn(`   Current settings will work but jobs may be lost if Redis memory fills up.`)
+                    logWarn(`⚠️  Redis eviction policy is '${policy}'. Consider using 'noeviction' for BullMQ or a separate Redis instance.`)
+                    logWarn(`   Current settings will work but jobs may be lost if Redis memory fills up.`)
                 }
             } catch (err) {
                 // Config command might be disabled, continue anyway
@@ -387,23 +387,23 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                 )
                 
-                console.log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`)
+                log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`)
                 
                 // Set up event handlers
                 worker.on('completed', (job) => {
                     // Only log for label associations in debug mode
                     if (queueType !== QueueType.LABEL_ASSOCIATIONS) {
-                        console.log(`✅ ${queueType} job ${job.id} completed`)
+                        log(`✅ ${queueType} job ${job.id} completed`)
                     }
                 })
                 
                 worker.on('failed', (job, err) => {
-                    console.error(`❌ ${queueType} job ${job?.id} failed:`, err.message)
+                    logError(`❌ ${queueType} job ${job?.id} failed:`, err.message)
                     performanceMetrics.errors++
                 })
                 
                 worker.on('stalled', (jobId) => {
-                    console.warn(`⚠️ ${queueType} job ${jobId} stalled`)
+                    logWarn(`⚠️ ${queueType} job ${jobId} stalled`)
                 })
                 
                 workers.set(queueType, worker)
@@ -434,12 +434,23 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         { upsert: true }
                     )
                 } else if (type === 'delete') {
-                    await collections.labelAssociations.deleteOne({
+                    // For delete operations, we need to be more flexible with messageId matching
+                    const filter: any = {
                         instanceId,
                         chatId: association.chatId,
-                        labelId: association.labelId,
-                        messageId: 'messageId' in association ? association.messageId : ''
-                    })
+                        labelId: association.labelId
+                    }
+                    
+                    // Only add messageId to filter if it exists in the association
+                    if ('messageId' in association && association.messageId) {
+                        filter.messageId = association.messageId
+                    }
+                    
+                    const result = await collections.labelAssociations.deleteOne(filter)
+                    
+                    if (enableLogging && result.deletedCount === 0) {
+                        log(`[Bull Label] Warning: No document found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
+                    }
                 }
                 
                 performanceMetrics.labelsProcessed++
@@ -616,7 +627,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 try {
                     // Check Redis connection
                     if (redisConnection?.status !== 'ready') {
-                        console.error('⚠️ Redis connection lost, attempting to reconnect...')
+                        logError('⚠️ Redis connection lost, attempting to reconnect...')
                         await restartQueues()
                         return
                     }
@@ -629,12 +640,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             
                             // Check for stuck jobs (waiting too long)
                             if (counts.waiting > 100) {
-                                console.warn(`⚠️ ${queueType} queue has ${counts.waiting} waiting jobs`)
+                                logWarn(`⚠️ ${queueType} queue has ${counts.waiting} waiting jobs`)
                             }
                             
                             // Check if worker is running
                             if (worker && !worker.isRunning()) {
-                                console.error(`❌ ${queueType} worker stopped, restarting...`)
+                                logError(`❌ ${queueType} worker stopped, restarting...`)
                                 await worker.run()
                             }
                             
@@ -644,19 +655,19 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             for (const job of activeJobs) {
                                 const processingTime = now - job.processedOn!
                                 if (processingTime > QUEUE_STALE_THRESHOLD) {
-                                    console.warn(`⚠️ Stale job detected in ${queueType}: ${job.id} (${processingTime}ms)`)
+                                    logWarn(`⚠️ Stale job detected in ${queueType}: ${job.id} (${processingTime}ms)`)
                                     // Move stale job back to waiting
                                     await job.moveToFailed(new Error('Job stale, moving to failed'), false)
                                 }
                             }
                         } catch (error) {
-                            console.error(`Health check failed for ${queueType}:`, error)
+                            logError(`Health check failed for ${queueType}:`, error)
                         }
                     }
                     
                     lastHealthCheck = Date.now()
                 } catch (error) {
-                    console.error('Queue health check error:', error)
+                    logError('Queue health check error:', error)
                     // Try to restart if health check completely fails
                     if (Date.now() - lastHealthCheck > QUEUE_STALE_THRESHOLD * 2) {
                         await restartQueues()
@@ -666,7 +677,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Function to restart queues
             const restartQueues = async () => {
-                console.log('🔄 Restarting Bull queues...')
+                log('🔄 Restarting Bull queues...')
                 
                 try {
                     // Close existing workers and queues
@@ -704,9 +715,9 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     // Recreate all queues and workers
                     await initializeBullQueues()
                     
-                    console.log('✅ Queues restarted successfully')
+                    log('✅ Queues restarted successfully')
                 } catch (error) {
-                    console.error('❌ Failed to restart queues:', error)
+                    logError('❌ Failed to restart queues:', error)
                     bullInitialized = false
                 }
             }
@@ -728,10 +739,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             }, 60000) // Clean every minute as safety net
             
             bullInitialized = true
-            console.log(`✅ Bull queues initialized successfully for instance ${instanceId}`)
+            log(`✅ Bull queues initialized successfully for instance ${instanceId}`)
         } catch (error) {
-            console.error(`❌ Failed to initialize Bull queues for instance ${instanceId}:`, error)
-            console.log('⚠️  Falling back to in-memory queue processing')
+            logError(`❌ Failed to initialize Bull queues for instance ${instanceId}:`, error)
+            log('⚠️  Falling back to in-memory queue processing')
             // Clean up partial initialization
             for (const worker of workers.values()) {
                 await worker.close()
@@ -799,7 +810,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             if (error.message?.includes('Client must be connected') || 
                 error.message?.includes('Topology is closed') ||
                 error.code === 'ECONNREFUSED') {
-                console.log(`Connection error detected for instance ${instanceId}, attempting reconnection...`)
+                log(`Connection error detected for instance ${instanceId}, attempting reconnection...`)
                 isConnected = false
                 await ensureConnection()
                 collections = getCollections()
@@ -813,7 +824,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     const processBatchedLabelAssociations = async () => {
         // Prevent concurrent processing
         if (labelAssociationBatch.processing) {
-            console.log(`[Label Batch] Skipping - already processing`)
+            log(`[Label Batch] Skipping - already processing`)
             return
         }
         
@@ -833,11 +844,11 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         // Take all items atomically
         const itemsToProcess = labelAssociationBatch.items.splice(0)
         const pendingPromises = labelAssociationBatch.pendingPromises?.splice(0, itemsToProcess.length) || []
-        console.log(`[Label Batch] Processing ${itemsToProcess.length} label associations`)
+        log(`[Label Batch] Processing ${itemsToProcess.length} label associations`)
         
         // Add protection against memory leaks from excessive batch accumulation
         if (itemsToProcess.length > BATCH_SIZE * 10) {
-            console.warn(`Batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`)
+            logWarn(`Batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`)
             itemsToProcess.splice(BATCH_SIZE * 10)
         }
         
@@ -1073,7 +1084,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }
         
         // Create TTL indexes - failures are logged but don't block operation
-        console.log(`🗑️  Creating TTL indexes for instance ${instanceId}...`)
+        log(`🗑️  Creating TTL indexes for instance ${instanceId}...`)
         const ttlResults = await Promise.allSettled(
             ttlIndexes.map(idx => createIndexWithRetry(idx, 2))
         )
@@ -1158,7 +1169,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull Chats] Failed to queue, falling back:', error)
+                    logError('[Bull Chats] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1192,7 +1203,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return true
                 } catch (error) {
-                    console.error('[Bull Chats] Failed to queue update, falling back:', error)
+                    logError('[Bull Chats] Failed to queue update, falling back:', error)
                 }
             }
             
@@ -1224,7 +1235,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull Chats] Failed to queue delete, falling back:', error)
+                    logError('[Bull Chats] Failed to queue delete, falling back:', error)
                 }
             }
             
@@ -1282,7 +1293,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                     return
                 } catch (error) {
-                    console.error('[Bull Contacts] Failed to queue, falling back:', error)
+                    logError('[Bull Contacts] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1366,7 +1377,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     binaryConversionCache.del(cacheKey)
                     return
                 } catch (error) {
-                    console.error('[Bull Messages] Failed to queue, falling back:', error)
+                    logError('[Bull Messages] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1427,7 +1438,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return true
                 } catch (error) {
-                    console.error('[Bull Messages] Failed to queue update, falling back:', error)
+                    logError('[Bull Messages] Failed to queue update, falling back:', error)
                 }
             }
             
@@ -1482,7 +1493,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull Messages] Failed to queue delete, falling back:', error)
+                    logError('[Bull Messages] Failed to queue delete, falling back:', error)
                 }
             }
             
@@ -1523,7 +1534,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull GroupMetadata] Failed to queue, falling back:', error)
+                    logError('[Bull GroupMetadata] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1561,7 +1572,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull State] Failed to queue, falling back:', error)
+                    logError('[Bull State] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1606,7 +1617,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull Presences] Failed to queue, falling back:', error)
+                    logError('[Bull Presences] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1653,7 +1664,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull Labels] Failed to queue, falling back:', error)
+                    logError('[Bull Labels] Failed to queue, falling back:', error)
                 }
             }
             
@@ -1682,7 +1693,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     return
                 } catch (error) {
-                    console.error('[Bull Labels] Failed to queue delete, falling back:', error)
+                    logError('[Bull Labels] Failed to queue delete, falling back:', error)
                 }
             }
             
@@ -1731,10 +1742,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     )
                     
                     labelAssociationBatch.totalReceived = (labelAssociationBatch.totalReceived || 0) + 1
-                    console.log(`[Bull Label] Job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`)
+                    log(`[Bull Label] Job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`)
                     return
                 } catch (error) {
-                    console.error('[Bull Label] Failed to queue job, falling back to in-memory:', error)
+                    logError('[Bull Label] Failed to queue job, falling back to in-memory:', error)
                     // Fall through to in-memory processing
                 }
             }
@@ -1752,18 +1763,18 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const totalReceived = labelAssociationBatch.totalReceived
                 const totalProcessed = labelAssociationBatch.totalProcessed || 0
                 
-                console.log(`[Label Association] #${totalReceived} Added to batch (queue: ${currentBatchSize}, received: ${totalReceived}, processed: ${totalProcessed}) - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
+                log(`[Label Association] #${totalReceived} Added to batch (queue: ${currentBatchSize}, received: ${totalReceived}, processed: ${totalProcessed}) - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
                 
                 // Process immediately if batch is full
                 if (currentBatchSize >= BATCH_SIZE) {
-                    console.log(`[Label Association] Batch full (${currentBatchSize}/${BATCH_SIZE}), processing immediately`)
+                    log(`[Label Association] Batch full (${currentBatchSize}/${BATCH_SIZE}), processing immediately`)
                     // Cancel any pending timer before processing
                     if (labelAssociationBatch.timer) {
                         clearTimeout(labelAssociationBatch.timer)
                         labelAssociationBatch.timer = null
                     }
                     processBatchedLabelAssociations().catch(error => {
-                        console.error('[Label Association] Error in batch processing:', error)
+                        logError('[Label Association] Error in batch processing:', error)
                     })
                 } else {
                     // Schedule batch processing after timeout
@@ -1788,21 +1799,31 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         defaultJobOptions
                     )
                     
-                    console.log(`[Bull Label] Delete job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`)
+                    log(`[Bull Label] Delete job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`)
                     return
                 } catch (error) {
-                    console.error('[Bull Label] Failed to queue delete job, falling back to direct deletion:', error)
+                    logError('[Bull Label] Failed to queue delete job, falling back to direct deletion:', error)
                     // Fall through to direct deletion
                 }
             }
             
             // Direct deletion (fallback)
-            await collections.labelAssociations.deleteOne({
+            const filter: any = {
                 instanceId,
                 chatId: association.chatId,
-                labelId: association.labelId,
-                messageId: 'messageId' in association ? association.messageId : ''
-            })
+                labelId: association.labelId
+            }
+            
+            // Only add messageId to filter if it exists in the association
+            if ('messageId' in association && association.messageId) {
+                filter.messageId = association.messageId
+            }
+            
+            const result = await collections.labelAssociations.deleteOne(filter)
+            
+            if (enableLogging && result.deletedCount === 0) {
+                log(`[Direct Delete] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
+            }
         },
 
         bind(ev: BaileysEventEmitter): void {
@@ -1885,11 +1906,11 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 // For label associations, check if we should flush periodically
                 const stats = store.getPerformanceStats()
                 if (stats.labelStats && stats.labelStats.totalReceived % 50 === 0 && stats.labelStats.totalReceived > 0) {
-                    console.log(`[Label Event] Periodic status - received: ${stats.labelStats.totalReceived}, processed: ${stats.labelStats.totalProcessed}, queued: ${stats.labelStats.currentQueueSize}`)
+                    log(`[Label Event] Periodic status - received: ${stats.labelStats.totalReceived}, processed: ${stats.labelStats.totalProcessed}, queued: ${stats.labelStats.currentQueueSize}`)
                     // If too many are queued, force a flush
                     if (stats.labelStats.currentQueueSize > BATCH_SIZE * 2) {
-                        console.log('[Label Event] Queue backlog detected, forcing flush')
-                        store.flushLabelAssociations().catch(err => console.error('[Label Event] Flush error:', err))
+                        log('[Label Event] Queue backlog detected, forcing flush')
+                        store.flushLabelAssociations().catch(err => logError('[Label Event] Flush error:', err))
                     }
                 }
             })
@@ -2088,7 +2109,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
         
         async flushLabelAssociations(): Promise<void> {
-            console.log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`)
+            log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`)
             
             // Cancel any pending timers
             if (labelAssociationBatch.timer) {
@@ -2098,7 +2119,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Wait for any current processing to complete
             while (labelAssociationBatch.processing) {
-                console.log('[Label Flush] Waiting for current batch to complete...')
+                log('[Label Flush] Waiting for current batch to complete...')
                 await new Promise(resolve => setTimeout(resolve, 50))
             }
             
@@ -2109,7 +2130,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 await new Promise(resolve => setTimeout(resolve, 10))
             }
             
-            console.log(`[Label Flush] Flush complete. Total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived}`)
+            log(`[Label Flush] Flush complete. Total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived}`)
         },
         
         resetPerformanceStats(): void {

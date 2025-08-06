@@ -19,6 +19,10 @@ async function connectToWhatsApp() {
         ttlDays: parseInt(process.env.TTL_DAYS) || 30,
         logger: logger.child({ module: 'mongodb-store' }),
         
+        // Enable detailed logging for debugging (default: false)
+        // Set DEBUG=true environment variable to enable
+        enableLogging: process.env.DEBUG === 'true',
+        
         // Redis/Bull configuration for production reliability
         redis: process.env.REDIS_URL ? {
             connection: process.env.REDIS_URL,

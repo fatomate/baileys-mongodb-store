@@ -91,6 +91,12 @@ export interface MongoDBStoreConfig {
      * If provided, will use Bull for robust queue handling
      */
     redis?: RedisConfig
+    
+    /**
+     * Enable logging for debugging purposes
+     * Default: false
+     */
+    enableLogging?: boolean
 }
 
 export interface MongoDBStore {
