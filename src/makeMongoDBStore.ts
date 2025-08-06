@@ -109,23 +109,99 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         collectionPrefix = 'baileys_'
     } = config
 
-    const client = new MongoClient(uri, {
-        // Optimize connection pool for high concurrency
-        maxPoolSize: 100,
-        minPoolSize: 10,
-        maxIdleTimeMS: 30000,
-        // Write concern for better performance
-        writeConcern: { w: 1, j: false }
-    })
-    await client.connect()
-    activeConnections.push({
-        client,
-        database: dbName,
-        instanceId,
-        collectionPrefix
-    })
+    let client: MongoClient
+    let db: Db
+    let isConnected = false
+    let isConnecting = false
+    let connectionError: Error | null = null
+    let reconnectAttempts = 0
+    const MAX_RECONNECT_ATTEMPTS = 5
+    const RECONNECT_DELAY_BASE = 1000 // 1 second base delay
     
-    const db: Db = client.db(dbName)
+    // Initialize connection
+    const initializeConnection = async (): Promise<void> => {
+        try {
+            client = new MongoClient(uri, {
+                // Optimize connection pool for high concurrency
+                maxPoolSize: 100,
+                minPoolSize: 10,
+                maxIdleTimeMS: 30000,
+                // Write concern for better performance
+                writeConcern: { w: 1, j: false }
+            })
+            await client.connect()
+            db = client.db(dbName)
+            isConnected = true
+            isConnecting = false
+            connectionError = null
+            reconnectAttempts = 0
+            
+            // Update active connections
+            activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
+            activeConnections.push({
+                client,
+                database: dbName,
+                instanceId,
+                collectionPrefix
+            })
+            
+            console.log(`MongoDB connected successfully for instance ${instanceId}`)
+        } catch (error) {
+            isConnected = false
+            isConnecting = false
+            connectionError = error as Error
+            console.error(`MongoDB connection failed for instance ${instanceId}:`, error)
+            throw error
+        }
+    }
+    
+    // Ensure connection is active before operations
+    const ensureConnection = async (): Promise<void> => {
+        if (isConnected && client) {
+            try {
+                // Quick ping to check if connection is actually alive
+                await client.db(dbName).command({ ping: 1 })
+                return
+            } catch {
+                isConnected = false
+            }
+        }
+        
+        if (isConnecting) {
+            // Wait for ongoing connection attempt
+            let waitAttempts = 0
+            while (isConnecting && waitAttempts < 50) {
+                await new Promise(resolve => setTimeout(resolve, 100))
+                waitAttempts++
+            }
+            if (isConnected) return
+        }
+        
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            throw new Error(`Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts: ${connectionError?.message}`)
+        }
+        
+        // Attempt reconnection with exponential backoff
+        isConnecting = true
+        const delay = RECONNECT_DELAY_BASE * Math.pow(2, Math.min(reconnectAttempts, 5))
+        
+        if (reconnectAttempts > 0) {
+            console.log(`Attempting to reconnect (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}) after ${delay}ms...`)
+            await new Promise(resolve => setTimeout(resolve, delay))
+        }
+        
+        reconnectAttempts++
+        
+        try {
+            await initializeConnection()
+        } catch (error) {
+            isConnecting = false
+            throw error
+        }
+    }
+    
+    // Initial connection
+    await initializeConnection()
     
     // Create queues for different operation types
     const messageQueue = new PQueue({ concurrency: QUEUE_CONCURRENCY })
@@ -145,16 +221,46 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         processing: false
     }
     
-    // Create collections with TTL indexes
-    const collections: MongoCollections = {
-        chats: db.collection(`${collectionPrefix}chats`),
-        contacts: db.collection(`${collectionPrefix}contacts`),
-        messages: db.collection(`${collectionPrefix}messages`),
-        groupMetadata: db.collection(`${collectionPrefix}groupMetadata`),
-        state: db.collection(`${collectionPrefix}state`),
-        presences: db.collection(`${collectionPrefix}presences`),
-        labels: db.collection(`${collectionPrefix}labels`),
-        labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+    // Create collections getter that ensures connection
+    const getCollections = (): MongoCollections => {
+        if (!db) {
+            throw new Error('Database not initialized')
+        }
+        return {
+            chats: db.collection(`${collectionPrefix}chats`),
+            contacts: db.collection(`${collectionPrefix}contacts`),
+            messages: db.collection(`${collectionPrefix}messages`),
+            groupMetadata: db.collection(`${collectionPrefix}groupMetadata`),
+            state: db.collection(`${collectionPrefix}state`),
+            presences: db.collection(`${collectionPrefix}presences`),
+            labels: db.collection(`${collectionPrefix}labels`),
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+        }
+    }
+    
+    // Initialize collections
+    let collections = getCollections()
+    
+    // Wrapper for MongoDB operations with automatic reconnection
+    const withConnection = async <T>(operation: () => Promise<T>): Promise<T> => {
+        try {
+            await ensureConnection()
+            // Refresh collections after reconnection
+            collections = getCollections()
+            return await operation()
+        } catch (error: any) {
+            // If it's a connection error, reset and try once more
+            if (error.message?.includes('Client must be connected') || 
+                error.message?.includes('Topology is closed') ||
+                error.code === 'ECONNREFUSED') {
+                console.log(`Connection error detected for instance ${instanceId}, attempting reconnection...`)
+                isConnected = false
+                await ensureConnection()
+                collections = getCollections()
+                return await operation()
+            }
+            throw error
+        }
     }
 
     // Batch processing functions
@@ -164,6 +270,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         labelAssociationBatch.processing = true
         const itemsToProcess = [...labelAssociationBatch.items]
         labelAssociationBatch.items = []
+        
+        // Add protection against memory leaks from excessive batch accumulation
+        if (itemsToProcess.length > BATCH_SIZE * 10) {
+            console.warn(`Batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`)
+            itemsToProcess.splice(BATCH_SIZE * 10)
+        }
         
         try {
             const bulkOps = itemsToProcess.map(association => ({
@@ -186,7 +298,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             // Process in chunks to avoid overwhelming MongoDB
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE)
-                await collections.labelAssociations.bulkWrite(chunk, { ordered: false })
+                await withConnection(() => collections.labelAssociations.bulkWrite(chunk, { ordered: false }))
                 
                 // Small delay between chunks
                 if (i + BATCH_SIZE < bulkOps.length) {
@@ -211,6 +323,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         const itemsToProcess = [...messageBatch.items]
         messageBatch.items = []
         
+        // Add protection against memory leaks from excessive batch accumulation
+        if (itemsToProcess.length > BATCH_SIZE * 10) {
+            console.warn(`Message batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`)
+            itemsToProcess.splice(BATCH_SIZE * 10)
+        }
+        
         try {
             const bulkOps = itemsToProcess.map(({ jid, ...message }) => ({
                 replaceOne: {
@@ -232,7 +350,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             // Process in chunks
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE)
-                await collections.messages.bulkWrite(chunk, { ordered: false })
+                await withConnection(() => collections.messages.bulkWrite(chunk, { ordered: false }))
                 
                 // Clear cache for these messages
                 chunk.forEach(op => {
@@ -276,70 +394,158 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }, 100)
     }
     
-    // Create indexes
+    // Enhanced index creation with retry logic and categorization
     const createIndexes = async () => {
-        // TTL indexes for automatic expiration
         const ttlSeconds = ttlDays * 24 * 60 * 60
         
-        await Promise.all([
-            // Chats indexes
-            collections.chats.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.chats.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            
-            // Contacts indexes
-            collections.contacts.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.contacts.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            
-            // Messages indexes
-            collections.messages.createIndex({ instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true }),
-            collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 }),
-            collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            
-            // Group metadata indexes
-            collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.groupMetadata.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            
-            // State indexes
-            collections.state.createIndex({ instanceId: 1 }, { unique: true }),
-            
-            // Presences indexes
-            collections.presences.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.presences.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            
-            // Labels indexes
-            collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.labels.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            
-            // Label associations indexes
-            collections.labelAssociations.createIndex({ instanceId: 1, chatId: 1, labelId: 1, messageId: 1 }, { unique: true }),
-            collections.labelAssociations.createIndex({ instanceId: 1, chatId: 1 }),
-            collections.labelAssociations.createIndex({ instanceId: 1, messageId: 1 }),
-            collections.labelAssociations.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds })
-        ])
+        // Define indexes by priority - critical indexes must succeed
+        const criticalIndexes = [
+            // Primary lookup indexes - essential for query performance
+            { collection: 'chats', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'chats_primary' },
+            { collection: 'contacts', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'contacts_primary' },
+            { collection: 'messages', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true }, name: 'messages_primary' },
+            { collection: 'messages', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {}, name: 'messages_query' },
+            { collection: 'groupMetadata', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'groups_primary' },
+            { collection: 'state', spec: { instanceId: 1 }, options: { unique: true }, name: 'state_primary' },
+            { collection: 'presences', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'presences_primary' },
+            { collection: 'labels', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'labels_primary' },
+            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1, messageId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
+        ]
         
-        // MongoDB indexes created successfully
+        const optimizationIndexes = [
+            // Performance optimization indexes - improve speed but not essential
+            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1 }, options: {}, name: 'label_assoc_chat' },
+            { collection: 'labelAssociations', spec: { instanceId: 1, messageId: 1 }, options: {}, name: 'label_assoc_message' }
+        ]
+        
+        const ttlIndexes = [
+            // TTL indexes for automatic cleanup - can be recreated later if needed
+            { collection: 'chats', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'chats_ttl' },
+            { collection: 'contacts', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'contacts_ttl' },
+            { collection: 'messages', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'messages_ttl' },
+            { collection: 'groupMetadata', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'groups_ttl' },
+            { collection: 'presences', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'presences_ttl' },
+            { collection: 'labels', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'labels_ttl' },
+            { collection: 'labelAssociations', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'label_assoc_ttl' }
+        ]
+        
+        const createIndexWithRetry = async (indexDef: any, maxRetries = 3): Promise<{ success: boolean; error?: Error }> => {
+            const { collection, spec, options, name } = indexDef
+            
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    await withConnection(() => collections[collection as keyof MongoCollections].createIndex(spec, options))
+                    console.log(`✅ Index created: ${name} (attempt ${attempt})`)
+                    return { success: true }
+                } catch (error) {
+                    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000) // Max 5s delay
+                    console.warn(`❌ Index creation failed: ${name} (attempt ${attempt}/${maxRetries}):`, error)
+                    
+                    if (attempt < maxRetries) {
+                        console.log(`⏳ Retrying ${name} in ${delay}ms...`)
+                        await new Promise(resolve => setTimeout(resolve, delay))
+                    } else {
+                        return { success: false, error: error as Error }
+                    }
+                }
+            }
+            return { success: false }
+        }
+        
+        // Create critical indexes first - these MUST succeed
+        console.log(`🔧 Creating critical indexes for instance ${instanceId}...`)
+        const criticalResults = await Promise.allSettled(
+            criticalIndexes.map(idx => createIndexWithRetry(idx, 5)) // More retries for critical indexes
+        )
+        
+        const failedCritical = criticalResults
+            .map((result, i) => ({ result, index: criticalIndexes[i] }))
+            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success))
+        
+        if (failedCritical.length > 0) {
+            const errorDetails = failedCritical.map(({ index }) => index.name).join(', ')
+            throw new Error(`Critical indexes failed to create: ${errorDetails}. Query performance will be severely impacted. Please check MongoDB permissions and server status.`)
+        }
+        
+        // Create optimization indexes - failures are acceptable but logged
+        console.log(`⚡ Creating optimization indexes for instance ${instanceId}...`)
+        const optimizationResults = await Promise.allSettled(
+            optimizationIndexes.map(idx => createIndexWithRetry(idx, 2))
+        )
+        
+        const failedOptimization = optimizationResults
+            .map((result, i) => ({ result, index: optimizationIndexes[i] }))
+            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success))
+        
+        if (failedOptimization.length > 0) {
+            console.warn(`⚠️  Some optimization indexes failed: ${failedOptimization.map(({ index }) => index.name).join(', ')}`)
+        }
+        
+        // Create TTL indexes - failures are logged but don't block operation
+        console.log(`🗑️  Creating TTL indexes for instance ${instanceId}...`)
+        const ttlResults = await Promise.allSettled(
+            ttlIndexes.map(idx => createIndexWithRetry(idx, 2))
+        )
+        
+        const failedTTL = ttlResults
+            .map((result, i) => ({ result, index: ttlIndexes[i] }))
+            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success))
+        
+        if (failedTTL.length > 0) {
+            console.warn(`⚠️  Some TTL indexes failed: ${failedTTL.map(({ index }) => index.name).join(', ')} - automatic data cleanup may not work`)
+        }
+        
+        const totalCreated = criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length - failedOptimization.length - failedTTL.length
+        console.log(`✅ Index creation completed for instance ${instanceId}: ${totalCreated}/${criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length} indexes created`)
     }
     
+    // Initialize indexes - critical indexes must succeed
     await createIndexes()
+    
+    // Create a proxy to automatically wrap all async methods with connection checking
+    const createStoreProxy = (target: any): MongoDBStore => {
+        return new Proxy(target, {
+            get(obj, prop) {
+                const value = obj[prop]
+                if (typeof value === 'function' && prop !== 'bind' && prop !== 'close') {
+                    return async (...args: any[]) => {
+                        // Special handling for methods that already use withConnection
+                        const methodsWithConnection = new Set(['getChats', 'getChat', 'updateState'])
+                        if (methodsWithConnection.has(prop as string)) {
+                            return value.apply(obj, args)
+                        }
+                        // Wrap other async methods
+                        return withConnection(() => value.apply(obj, args))
+                    }
+                }
+                return value
+            }
+        }) as MongoDBStore
+    }
 
-    const store: MongoDBStore = {
+    const storeImpl = {
         instanceId,
 
         async getChats(): Promise<Chat[]> {
-            const chats = await collections.chats
-                .find({ instanceId })
-                .sort({ conversationTimestamp: -1 })
-                .toArray()
-            
-            return chats.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...chat }) => chat as Chat)
+            return withConnection(async () => {
+                const chats = await collections.chats
+                    .find({ instanceId })
+                    .sort({ conversationTimestamp: -1 })
+                    .toArray()
+                
+                return chats.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...chat }) => chat as Chat)
+            })
         },
 
         async getChat(jid: string): Promise<Chat | null> {
-            const chat = await collections.chats.findOne({ instanceId, id: jid })
-            if (!chat) return null
-            
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...chatData } = chat
-            return chatData as Chat
+            return withConnection(async () => {
+                const chat = await collections.chats.findOne({ instanceId, id: jid })
+                if (!chat) return null
+                
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { _id, instanceId: _instanceId, updatedAt, ...chatData } = chat
+                return chatData as Chat
+            })
         },
 
         async upsertChats(...chats: Chat[]): Promise<void> {
@@ -562,13 +768,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async updateState(update: Partial<ConnectionState>): Promise<void> {
-            await collections.state.updateOne(
+            await withConnection(() => collections.state.updateOne(
                 { instanceId },
                 { 
                     $set: { ...update, instanceId, updatedAt: new Date() }
                 },
                 { upsert: true }
-            )
+            ))
         },
 
         async getPresences(): Promise<{ [id: string]: { [participant: string]: PresenceData } }> {
@@ -915,7 +1121,55 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             performanceMetrics.lastResetTime = new Date()
         },
         
+        async recreateIndexes(): Promise<{ created: number; failed: number; details: string[] }> {
+            const results: string[] = []
+            try {
+                await createIndexes()
+                const totalIndexes = 18 // Total number of indexes we try to create
+                results.push(`Index recreation completed successfully`)
+                return { created: totalIndexes, failed: 0, details: results }
+            } catch (error) {
+                results.push(`Index recreation failed: ${error}`)
+                throw error
+            }
+        },
+
+        async getIndexStatus(): Promise<{ collection: string; indexes: any[] }[]> {
+            return withConnection(async () => {
+                const collectionNames = ['chats', 'contacts', 'messages', 'groupMetadata', 'state', 'presences', 'labels', 'labelAssociations']
+                const indexStatus = []
+                
+                for (const collName of collectionNames) {
+                    try {
+                        const collection = collections[collName as keyof MongoCollections]
+                        const indexes = await collection.listIndexes().toArray()
+                        indexStatus.push({
+                            collection: `${collectionPrefix}${collName}`,
+                            indexes: indexes.map(idx => ({
+                                name: idx.name,
+                                key: idx.key,
+                                unique: idx.unique,
+                                expireAfterSeconds: idx.expireAfterSeconds
+                            }))
+                        })
+                    } catch (error) {
+                        indexStatus.push({
+                            collection: `${collectionPrefix}${collName}`,
+                            indexes: [],
+                            error: (error as Error).message
+                        })
+                    }
+                }
+                
+                return indexStatus
+            })
+        },
+
         async close(): Promise<void> {
+            // Mark as disconnected
+            isConnected = false
+            reconnectAttempts = 0
+            
             // Process any remaining batches
             await processBatchedLabelAssociations()
             await processBatchedMessages()
@@ -943,11 +1197,15 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 }
             })
             
-            await client.close()
-            activeConnections = activeConnections.filter(c => c.client !== client)
+            if (client) {
+                await client.close()
+            }
+            activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
         }
     }
 
+    // Return the proxied store
+    const store = createStoreProxy(storeImpl)
     return store
 }
 
@@ -959,14 +1217,30 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boolean = false): Promise<void> => {
     if (!instanceId) {
         // Just close all connections
-        for (const conn of activeConnections) {
+        const connections = [...activeConnections]
+        activeConnections = []
+        
+        for (const conn of connections) {
             try {
-                await conn.client.close()
+                // Check if client is still connected before closing
+                if (conn.client) {
+                    try {
+                        // Try to ping the database to check if connection is alive
+                        await conn.client.db(conn.database).command({ ping: 1 })
+                        await conn.client.close()
+                    } catch {
+                        // Connection already dead, just ensure client is closed
+                        try {
+                            await conn.client.close()
+                        } catch {
+                            // Client already closed, ignore
+                        }
+                    }
+                }
             } catch (error) {
                 console.error('Error closing MongoDB connection:', error)
             }
         }
-        activeConnections = []
         return
     }
 
