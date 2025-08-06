@@ -348,7 +348,12 @@ console.log('Performance Stats:', {
     labelsProcessed: stats.labelsProcessed,
     batchesProcessed: stats.batchesProcessed,
     errors: stats.errors,
-    uptime: `${Math.floor(stats.uptime / 1000)}s`
+    uptime: `${Math.floor(stats.uptime / 1000)}s`,
+    labelQueue: stats.labelStats ? {
+        received: stats.labelStats.totalReceived,
+        processed: stats.labelStats.totalProcessed,
+        pending: stats.labelStats.currentQueueSize
+    } : undefined
 })
 
 // Reset statistics
@@ -363,7 +368,7 @@ setInterval(() => {
 
 ### Handling High Load
 
-The store automatically handles high-load scenarios:
+The store automatically handles high-load scenarios with improved queuing:
 
 ```javascript
 // When receiving thousands of labels (e.g., during initial sync)
@@ -374,6 +379,15 @@ ev.on('labels.association', async ({ type, association }) => {
         await store.upsertLabelAssociation(association)
     }
 })
+
+// Force flush pending label associations if needed
+await store.flushLabelAssociations()
+
+// Monitor label processing status
+const stats = store.getPerformanceStats()
+if (stats.labelStats) {
+    console.log(`Labels: ${stats.labelStats.totalProcessed}/${stats.labelStats.totalReceived} processed`)
+}
 
 // For bulk message imports, the store uses batch mode automatically
 ev.on('messaging-history.set', async ({ messages }) => {

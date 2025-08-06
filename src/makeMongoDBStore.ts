@@ -40,6 +40,9 @@ interface BatchAccumulator<T> {
     items: T[]
     timer: NodeJS.Timeout | null
     processing: boolean
+    totalReceived?: number  // Track total items received
+    totalProcessed?: number // Track total items processed
+    pendingPromises?: Array<{ resolve: () => void; reject: (error: any) => void }> // Track pending promises
 }
 
 // Performance tracking
@@ -208,11 +211,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     const labelQueue = new PQueue({ concurrency: QUEUE_CONCURRENCY })
     const generalQueue = new PQueue({ concurrency: QUEUE_CONCURRENCY })
     
-    // Batch accumulators
+    // Batch accumulators with tracking
     const labelAssociationBatch: BatchAccumulator<LabelAssociation> = {
         items: [],
         timer: null,
-        processing: false
+        processing: false,
+        totalReceived: 0,
+        totalProcessed: 0,
+        pendingPromises: []
     }
     
     const messageBatch: BatchAccumulator<proto.IWebMessageInfo & { jid: string }> = {
@@ -265,11 +271,29 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
     // Batch processing functions
     const processBatchedLabelAssociations = async () => {
-        if (labelAssociationBatch.processing || labelAssociationBatch.items.length === 0) return
+        // Prevent concurrent processing
+        if (labelAssociationBatch.processing) {
+            console.log(`[Label Batch] Skipping - already processing`)
+            return
+        }
+        
+        // Check if there are items to process
+        if (labelAssociationBatch.items.length === 0) {
+            return
+        }
         
         labelAssociationBatch.processing = true
-        const itemsToProcess = [...labelAssociationBatch.items]
-        labelAssociationBatch.items = []
+        
+        // Clear the timer immediately to prevent duplicate processing
+        if (labelAssociationBatch.timer) {
+            clearTimeout(labelAssociationBatch.timer)
+            labelAssociationBatch.timer = null
+        }
+        
+        // Take all items atomically
+        const itemsToProcess = labelAssociationBatch.items.splice(0)
+        const pendingPromises = labelAssociationBatch.pendingPromises?.splice(0, itemsToProcess.length) || []
+        console.log(`[Label Batch] Processing ${itemsToProcess.length} label associations`)
         
         // Add protection against memory leaks from excessive batch accumulation
         if (itemsToProcess.length > BATCH_SIZE * 10) {
@@ -308,11 +332,29 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             performanceMetrics.labelsProcessed += itemsToProcess.length
             performanceMetrics.batchesProcessed++
+            labelAssociationBatch.totalProcessed = (labelAssociationBatch.totalProcessed || 0) + itemsToProcess.length
+            
+            // Resolve all pending promises for this batch
+            pendingPromises.forEach(p => p.resolve())
+            
+            console.log(`[Label Batch] Successfully processed ${itemsToProcess.length} label associations (total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived})`)
         } catch (error) {
             console.error('Error processing label associations batch:', error)
             performanceMetrics.errors++
+            
+            // Reject all pending promises for this batch
+            pendingPromises.forEach(p => p.reject(error))
+            
+            // Re-add failed items to the queue for retry
+            labelAssociationBatch.items.unshift(...itemsToProcess)
+            console.log(`[Label Batch] Re-queued ${itemsToProcess.length} items after error`)
         } finally {
             labelAssociationBatch.processing = false
+            // Check if more items accumulated during processing
+            if (labelAssociationBatch.items.length > 0) {
+                console.log(`[Label Batch] ${labelAssociationBatch.items.length} new items accumulated, scheduling next batch`)
+                scheduleLabelBatch()
+            }
         }
     }
     
@@ -375,12 +417,21 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }
     }
     
-    // Schedule batch processing
+    // Schedule batch processing with deduplication
     const scheduleLabelBatch = () => {
+        // Don't schedule if already processing
+        if (labelAssociationBatch.processing) {
+            return
+        }
+        
+        // Clear existing timer
         if (labelAssociationBatch.timer) {
             clearTimeout(labelAssociationBatch.timer)
         }
+        
+        // Set new timer
         labelAssociationBatch.timer = setTimeout(() => {
+            labelAssociationBatch.timer = null
             processBatchedLabelAssociations()
         }, 100) // Process after 100ms of inactivity
     }
@@ -533,7 +584,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     .sort({ conversationTimestamp: -1 })
                     .toArray()
                 
-                return chats.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...chat }) => chat as Chat)
+                return chats.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...chat }) => chat as Chat)
             })
         },
 
@@ -587,7 +638,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             const contactsMap: { [id: string]: Contact } = {}
             for (const contact of contacts) {
-                const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...contactData } = contact
                 contactsMap[contact.id] = contactData as Contact
             }
             
@@ -598,7 +650,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const contact = await collections.contacts.findOne({ instanceId, id: jid })
             if (!contact) return null
             
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...contactData } = contact
             return contactData as Contact
         },
 
@@ -634,7 +687,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .toArray()
             
             // Convert Binary objects and preserve messageContextInfo
-            return messages.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg))
+            return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg))
         },
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
@@ -651,7 +704,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             if (!message) return null
             
-            const { _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg } = message
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message
             // Convert all MongoDB Binary objects to Buffers and preserve messageContextInfo
             const converted = convertBinaryToBuffer(msg)
             
@@ -747,7 +801,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const metadata = await collections.groupMetadata.findOne({ instanceId, id: jid })
             if (!metadata) return null
             
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...metadataData } = metadata
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadataData } = metadata
             return metadataData as GroupMetadata
         },
 
@@ -763,7 +818,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const state = await collections.state.findOne({ instanceId })
             if (!state) return { connection: 'close' }
             
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...stateData } = state
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...stateData } = state
             return stateData as ConnectionState
         },
 
@@ -807,7 +863,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             const labelsMap: { [id: string]: Label } = {}
             for (const label of labels) {
-                const { _id: _1, instanceId: _2, updatedAt: _3, ...labelData } = label
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...labelData } = label
                 labelsMap[label.id] = labelData as Label
             }
             
@@ -831,7 +888,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .find({ instanceId })
                 .toArray()
             
-            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc as LabelAssociation)
+            return associations.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...assoc }) => assoc as LabelAssociation)
         },
 
         async getChatLabels(chatId: string): Promise<LabelAssociation[]> {
@@ -839,7 +896,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .find({ instanceId, chatId })
                 .toArray()
             
-            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc as LabelAssociation)
+            return associations.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...assoc }) => assoc as LabelAssociation)
         },
 
         async getMessageLabels(messageId: string): Promise<string[]> {
@@ -851,14 +908,36 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async upsertLabelAssociation(association: LabelAssociation): Promise<void> {
-            // Always use batching for label associations as they come in bulk
-            labelAssociationBatch.items.push(association)
-            scheduleLabelBatch()
-            
-            // Force process if batch is full
-            if (labelAssociationBatch.items.length >= BATCH_SIZE) {
-                await processBatchedLabelAssociations()
-            }
+            return new Promise((resolve, reject) => {
+                // Track total received
+                labelAssociationBatch.totalReceived = (labelAssociationBatch.totalReceived || 0) + 1
+                
+                // Add to batch queue
+                labelAssociationBatch.items.push(association)
+                labelAssociationBatch.pendingPromises?.push({ resolve, reject })
+                
+                const currentBatchSize = labelAssociationBatch.items.length
+                const totalReceived = labelAssociationBatch.totalReceived
+                const totalProcessed = labelAssociationBatch.totalProcessed || 0
+                
+                console.log(`[Label Association] #${totalReceived} Added to batch (queue: ${currentBatchSize}, received: ${totalReceived}, processed: ${totalProcessed}) - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
+                
+                // Process immediately if batch is full
+                if (currentBatchSize >= BATCH_SIZE) {
+                    console.log(`[Label Association] Batch full (${currentBatchSize}/${BATCH_SIZE}), processing immediately`)
+                    // Cancel any pending timer before processing
+                    if (labelAssociationBatch.timer) {
+                        clearTimeout(labelAssociationBatch.timer)
+                        labelAssociationBatch.timer = null
+                    }
+                    processBatchedLabelAssociations().catch(error => {
+                        console.error('[Label Association] Error in batch processing:', error)
+                    })
+                } else {
+                    // Schedule batch processing after timeout
+                    scheduleLabelBatch()
+                }
+            })
         },
 
         async deleteLabelAssociation(association: LabelAssociation): Promise<void> {
@@ -945,6 +1024,17 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     await store.upsertLabelAssociation(association)
                 } else if (type === 'remove') {
                     await store.deleteLabelAssociation(association)
+                }
+                
+                // For label associations, check if we should flush periodically
+                const stats = store.getPerformanceStats()
+                if (stats.labelStats && stats.labelStats.totalReceived % 50 === 0 && stats.labelStats.totalReceived > 0) {
+                    console.log(`[Label Event] Periodic status - received: ${stats.labelStats.totalReceived}, processed: ${stats.labelStats.totalProcessed}, queued: ${stats.labelStats.currentQueueSize}`)
+                    // If too many are queued, force a flush
+                    if (stats.labelStats.currentQueueSize > BATCH_SIZE * 2) {
+                        console.log('[Label Event] Queue backlog detected, forcing flush')
+                        store.flushLabelAssociations().catch(err => console.error('[Label Event] Flush error:', err))
+                    }
                 }
             })
 
@@ -1069,7 +1159,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     .sort({ messageTimestamp: -1 })
                     .limit(count)
                     .toArray()
-                    .then(msgs => msgs.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg)))
+                    .then(msgs => msgs.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg)))
             }
             
             return messages
@@ -1105,12 +1195,43 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             ])
         },
 
-        getPerformanceStats(): PerformanceMetrics & { uptime: number } {
+        getPerformanceStats(): PerformanceMetrics & { uptime: number; labelStats?: any } {
             const uptime = Date.now() - performanceMetrics.lastResetTime.getTime()
             return {
                 ...performanceMetrics,
-                uptime
+                uptime,
+                labelStats: {
+                    totalReceived: labelAssociationBatch.totalReceived || 0,
+                    totalProcessed: labelAssociationBatch.totalProcessed || 0,
+                    currentQueueSize: labelAssociationBatch.items.length,
+                    isProcessing: labelAssociationBatch.processing
+                }
             }
+        },
+        
+        async flushLabelAssociations(): Promise<void> {
+            console.log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`)
+            
+            // Cancel any pending timers
+            if (labelAssociationBatch.timer) {
+                clearTimeout(labelAssociationBatch.timer)
+                labelAssociationBatch.timer = null
+            }
+            
+            // Wait for any current processing to complete
+            while (labelAssociationBatch.processing) {
+                console.log('[Label Flush] Waiting for current batch to complete...')
+                await new Promise(resolve => setTimeout(resolve, 50))
+            }
+            
+            // Process all remaining items
+            while (labelAssociationBatch.items.length > 0) {
+                await processBatchedLabelAssociations()
+                // Small delay to ensure processing completes
+                await new Promise(resolve => setTimeout(resolve, 10))
+            }
+            
+            console.log(`[Label Flush] Flush complete. Total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived}`)
         },
         
         resetPerformanceStats(): void {
@@ -1170,8 +1291,15 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             isConnected = false
             reconnectAttempts = 0
             
-            // Process any remaining batches
-            await processBatchedLabelAssociations()
+            // Flush all pending label associations first
+            if (store.flushLabelAssociations) {
+                await store.flushLabelAssociations()
+            } else {
+                // Fallback to old method
+                await processBatchedLabelAssociations()
+            }
+            
+            // Process any remaining message batches
             await processBatchedMessages()
             
             // Clear all timers

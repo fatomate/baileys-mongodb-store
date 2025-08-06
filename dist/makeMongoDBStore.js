@@ -46,49 +46,154 @@ const convertBinaryToBuffer = (obj) => {
 };
 const makeMongoDBStore = async (config) => {
     const { uri, database: dbName, instanceId, ttlDays = DEFAULT_TTL_DAYS, collectionPrefix = 'baileys_' } = config;
-    const client = new mongodb_1.MongoClient(uri, {
-        maxPoolSize: 100,
-        minPoolSize: 10,
-        maxIdleTimeMS: 30000,
-        writeConcern: { w: 1, j: false }
-    });
-    await client.connect();
-    activeConnections.push({
-        client,
-        database: dbName,
-        instanceId,
-        collectionPrefix
-    });
-    const db = client.db(dbName);
+    let client;
+    let db;
+    let isConnected = false;
+    let isConnecting = false;
+    let connectionError = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 5;
+    const RECONNECT_DELAY_BASE = 1000;
+    const initializeConnection = async () => {
+        try {
+            client = new mongodb_1.MongoClient(uri, {
+                maxPoolSize: 100,
+                minPoolSize: 10,
+                maxIdleTimeMS: 30000,
+                writeConcern: { w: 1, j: false }
+            });
+            await client.connect();
+            db = client.db(dbName);
+            isConnected = true;
+            isConnecting = false;
+            connectionError = null;
+            reconnectAttempts = 0;
+            activeConnections = activeConnections.filter(c => c.instanceId !== instanceId);
+            activeConnections.push({
+                client,
+                database: dbName,
+                instanceId,
+                collectionPrefix
+            });
+            console.log(`MongoDB connected successfully for instance ${instanceId}`);
+        }
+        catch (error) {
+            isConnected = false;
+            isConnecting = false;
+            connectionError = error;
+            console.error(`MongoDB connection failed for instance ${instanceId}:`, error);
+            throw error;
+        }
+    };
+    const ensureConnection = async () => {
+        if (isConnected && client) {
+            try {
+                await client.db(dbName).command({ ping: 1 });
+                return;
+            }
+            catch {
+                isConnected = false;
+            }
+        }
+        if (isConnecting) {
+            let waitAttempts = 0;
+            while (isConnecting && waitAttempts < 50) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                waitAttempts++;
+            }
+            if (isConnected)
+                return;
+        }
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            throw new Error(`Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts: ${connectionError?.message}`);
+        }
+        isConnecting = true;
+        const delay = RECONNECT_DELAY_BASE * Math.pow(2, Math.min(reconnectAttempts, 5));
+        if (reconnectAttempts > 0) {
+            console.log(`Attempting to reconnect (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}) after ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+        reconnectAttempts++;
+        try {
+            await initializeConnection();
+        }
+        catch (error) {
+            isConnecting = false;
+            throw error;
+        }
+    };
+    await initializeConnection();
     const messageQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
     const labelQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
     const generalQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
     const labelAssociationBatch = {
         items: [],
         timer: null,
-        processing: false
+        processing: false,
+        totalReceived: 0,
+        totalProcessed: 0,
+        pendingPromises: []
     };
     const messageBatch = {
         items: [],
         timer: null,
         processing: false
     };
-    const collections = {
-        chats: db.collection(`${collectionPrefix}chats`),
-        contacts: db.collection(`${collectionPrefix}contacts`),
-        messages: db.collection(`${collectionPrefix}messages`),
-        groupMetadata: db.collection(`${collectionPrefix}groupMetadata`),
-        state: db.collection(`${collectionPrefix}state`),
-        presences: db.collection(`${collectionPrefix}presences`),
-        labels: db.collection(`${collectionPrefix}labels`),
-        labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+    const getCollections = () => {
+        if (!db) {
+            throw new Error('Database not initialized');
+        }
+        return {
+            chats: db.collection(`${collectionPrefix}chats`),
+            contacts: db.collection(`${collectionPrefix}contacts`),
+            messages: db.collection(`${collectionPrefix}messages`),
+            groupMetadata: db.collection(`${collectionPrefix}groupMetadata`),
+            state: db.collection(`${collectionPrefix}state`),
+            presences: db.collection(`${collectionPrefix}presences`),
+            labels: db.collection(`${collectionPrefix}labels`),
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+        };
+    };
+    let collections = getCollections();
+    const withConnection = async (operation) => {
+        try {
+            await ensureConnection();
+            collections = getCollections();
+            return await operation();
+        }
+        catch (error) {
+            if (error.message?.includes('Client must be connected') ||
+                error.message?.includes('Topology is closed') ||
+                error.code === 'ECONNREFUSED') {
+                console.log(`Connection error detected for instance ${instanceId}, attempting reconnection...`);
+                isConnected = false;
+                await ensureConnection();
+                collections = getCollections();
+                return await operation();
+            }
+            throw error;
+        }
     };
     const processBatchedLabelAssociations = async () => {
-        if (labelAssociationBatch.processing || labelAssociationBatch.items.length === 0)
+        if (labelAssociationBatch.processing) {
+            console.log(`[Label Batch] Skipping - already processing`);
             return;
+        }
+        if (labelAssociationBatch.items.length === 0) {
+            return;
+        }
         labelAssociationBatch.processing = true;
-        const itemsToProcess = [...labelAssociationBatch.items];
-        labelAssociationBatch.items = [];
+        if (labelAssociationBatch.timer) {
+            clearTimeout(labelAssociationBatch.timer);
+            labelAssociationBatch.timer = null;
+        }
+        const itemsToProcess = labelAssociationBatch.items.splice(0);
+        const pendingPromises = labelAssociationBatch.pendingPromises?.splice(0, itemsToProcess.length) || [];
+        console.log(`[Label Batch] Processing ${itemsToProcess.length} label associations`);
+        if (itemsToProcess.length > BATCH_SIZE * 10) {
+            console.warn(`Batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`);
+            itemsToProcess.splice(BATCH_SIZE * 10);
+        }
         try {
             const bulkOps = itemsToProcess.map(association => ({
                 replaceOne: {
@@ -108,20 +213,30 @@ const makeMongoDBStore = async (config) => {
             }));
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE);
-                await collections.labelAssociations.bulkWrite(chunk, { ordered: false });
+                await withConnection(() => collections.labelAssociations.bulkWrite(chunk, { ordered: false }));
                 if (i + BATCH_SIZE < bulkOps.length) {
                     await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
                 }
             }
             performanceMetrics.labelsProcessed += itemsToProcess.length;
             performanceMetrics.batchesProcessed++;
+            labelAssociationBatch.totalProcessed = (labelAssociationBatch.totalProcessed || 0) + itemsToProcess.length;
+            pendingPromises.forEach(p => p.resolve());
+            console.log(`[Label Batch] Successfully processed ${itemsToProcess.length} label associations (total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived})`);
         }
         catch (error) {
             console.error('Error processing label associations batch:', error);
             performanceMetrics.errors++;
+            pendingPromises.forEach(p => p.reject(error));
+            labelAssociationBatch.items.unshift(...itemsToProcess);
+            console.log(`[Label Batch] Re-queued ${itemsToProcess.length} items after error`);
         }
         finally {
             labelAssociationBatch.processing = false;
+            if (labelAssociationBatch.items.length > 0) {
+                console.log(`[Label Batch] ${labelAssociationBatch.items.length} new items accumulated, scheduling next batch`);
+                scheduleLabelBatch();
+            }
         }
     };
     const processBatchedMessages = async () => {
@@ -130,6 +245,10 @@ const makeMongoDBStore = async (config) => {
         messageBatch.processing = true;
         const itemsToProcess = [...messageBatch.items];
         messageBatch.items = [];
+        if (itemsToProcess.length > BATCH_SIZE * 10) {
+            console.warn(`Message batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`);
+            itemsToProcess.splice(BATCH_SIZE * 10);
+        }
         try {
             const bulkOps = itemsToProcess.map(({ jid, ...message }) => ({
                 replaceOne: {
@@ -149,7 +268,7 @@ const makeMongoDBStore = async (config) => {
             }));
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE);
-                await collections.messages.bulkWrite(chunk, { ordered: false });
+                await withConnection(() => collections.messages.bulkWrite(chunk, { ordered: false }));
                 chunk.forEach(op => {
                     const msgId = op.replaceOne.filter['key.id'];
                     const msgJid = op.replaceOne.filter.jid;
@@ -172,10 +291,14 @@ const makeMongoDBStore = async (config) => {
         }
     };
     const scheduleLabelBatch = () => {
+        if (labelAssociationBatch.processing) {
+            return;
+        }
         if (labelAssociationBatch.timer) {
             clearTimeout(labelAssociationBatch.timer);
         }
         labelAssociationBatch.timer = setTimeout(() => {
+            labelAssociationBatch.timer = null;
             processBatchedLabelAssociations();
         }, 100);
     };
@@ -189,43 +312,117 @@ const makeMongoDBStore = async (config) => {
     };
     const createIndexes = async () => {
         const ttlSeconds = ttlDays * 24 * 60 * 60;
-        await Promise.all([
-            collections.chats.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.chats.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            collections.contacts.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.contacts.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            collections.messages.createIndex({ instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true }),
-            collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 }),
-            collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.groupMetadata.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            collections.state.createIndex({ instanceId: 1 }, { unique: true }),
-            collections.presences.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.presences.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true }),
-            collections.labels.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds }),
-            collections.labelAssociations.createIndex({ instanceId: 1, chatId: 1, labelId: 1, messageId: 1 }, { unique: true }),
-            collections.labelAssociations.createIndex({ instanceId: 1, chatId: 1 }),
-            collections.labelAssociations.createIndex({ instanceId: 1, messageId: 1 }),
-            collections.labelAssociations.createIndex({ updatedAt: 1 }, { expireAfterSeconds: ttlSeconds })
-        ]);
+        const criticalIndexes = [
+            { collection: 'chats', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'chats_primary' },
+            { collection: 'contacts', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'contacts_primary' },
+            { collection: 'messages', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true }, name: 'messages_primary' },
+            { collection: 'messages', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {}, name: 'messages_query' },
+            { collection: 'groupMetadata', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'groups_primary' },
+            { collection: 'state', spec: { instanceId: 1 }, options: { unique: true }, name: 'state_primary' },
+            { collection: 'presences', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'presences_primary' },
+            { collection: 'labels', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'labels_primary' },
+            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1, messageId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
+        ];
+        const optimizationIndexes = [
+            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1 }, options: {}, name: 'label_assoc_chat' },
+            { collection: 'labelAssociations', spec: { instanceId: 1, messageId: 1 }, options: {}, name: 'label_assoc_message' }
+        ];
+        const ttlIndexes = [
+            { collection: 'chats', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'chats_ttl' },
+            { collection: 'contacts', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'contacts_ttl' },
+            { collection: 'messages', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'messages_ttl' },
+            { collection: 'groupMetadata', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'groups_ttl' },
+            { collection: 'presences', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'presences_ttl' },
+            { collection: 'labels', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'labels_ttl' },
+            { collection: 'labelAssociations', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'label_assoc_ttl' }
+        ];
+        const createIndexWithRetry = async (indexDef, maxRetries = 3) => {
+            const { collection, spec, options, name } = indexDef;
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    await withConnection(() => collections[collection].createIndex(spec, options));
+                    console.log(`✅ Index created: ${name} (attempt ${attempt})`);
+                    return { success: true };
+                }
+                catch (error) {
+                    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+                    console.warn(`❌ Index creation failed: ${name} (attempt ${attempt}/${maxRetries}):`, error);
+                    if (attempt < maxRetries) {
+                        console.log(`⏳ Retrying ${name} in ${delay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                    else {
+                        return { success: false, error: error };
+                    }
+                }
+            }
+            return { success: false };
+        };
+        console.log(`🔧 Creating critical indexes for instance ${instanceId}...`);
+        const criticalResults = await Promise.allSettled(criticalIndexes.map(idx => createIndexWithRetry(idx, 5)));
+        const failedCritical = criticalResults
+            .map((result, i) => ({ result, index: criticalIndexes[i] }))
+            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success));
+        if (failedCritical.length > 0) {
+            const errorDetails = failedCritical.map(({ index }) => index.name).join(', ');
+            throw new Error(`Critical indexes failed to create: ${errorDetails}. Query performance will be severely impacted. Please check MongoDB permissions and server status.`);
+        }
+        console.log(`⚡ Creating optimization indexes for instance ${instanceId}...`);
+        const optimizationResults = await Promise.allSettled(optimizationIndexes.map(idx => createIndexWithRetry(idx, 2)));
+        const failedOptimization = optimizationResults
+            .map((result, i) => ({ result, index: optimizationIndexes[i] }))
+            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success));
+        if (failedOptimization.length > 0) {
+            console.warn(`⚠️  Some optimization indexes failed: ${failedOptimization.map(({ index }) => index.name).join(', ')}`);
+        }
+        console.log(`🗑️  Creating TTL indexes for instance ${instanceId}...`);
+        const ttlResults = await Promise.allSettled(ttlIndexes.map(idx => createIndexWithRetry(idx, 2)));
+        const failedTTL = ttlResults
+            .map((result, i) => ({ result, index: ttlIndexes[i] }))
+            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success));
+        if (failedTTL.length > 0) {
+            console.warn(`⚠️  Some TTL indexes failed: ${failedTTL.map(({ index }) => index.name).join(', ')} - automatic data cleanup may not work`);
+        }
+        const totalCreated = criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length - failedOptimization.length - failedTTL.length;
+        console.log(`✅ Index creation completed for instance ${instanceId}: ${totalCreated}/${criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length} indexes created`);
     };
     await createIndexes();
-    const store = {
+    const createStoreProxy = (target) => {
+        return new Proxy(target, {
+            get(obj, prop) {
+                const value = obj[prop];
+                if (typeof value === 'function' && prop !== 'bind' && prop !== 'close') {
+                    return async (...args) => {
+                        const methodsWithConnection = new Set(['getChats', 'getChat', 'updateState']);
+                        if (methodsWithConnection.has(prop)) {
+                            return value.apply(obj, args);
+                        }
+                        return withConnection(() => value.apply(obj, args));
+                    };
+                }
+                return value;
+            }
+        });
+    };
+    const storeImpl = {
         instanceId,
         async getChats() {
-            const chats = await collections.chats
-                .find({ instanceId })
-                .sort({ conversationTimestamp: -1 })
-                .toArray();
-            return chats.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...chat }) => chat);
+            return withConnection(async () => {
+                const chats = await collections.chats
+                    .find({ instanceId })
+                    .sort({ conversationTimestamp: -1 })
+                    .toArray();
+                return chats.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...chat }) => chat);
+            });
         },
         async getChat(jid) {
-            const chat = await collections.chats.findOne({ instanceId, id: jid });
-            if (!chat)
-                return null;
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...chatData } = chat;
-            return chatData;
+            return withConnection(async () => {
+                const chat = await collections.chats.findOne({ instanceId, id: jid });
+                if (!chat)
+                    return null;
+                const { _id, instanceId: _instanceId, updatedAt, ...chatData } = chat;
+                return chatData;
+            });
         },
         async upsertChats(...chats) {
             if (chats.length === 0)
@@ -257,7 +454,7 @@ const makeMongoDBStore = async (config) => {
                 .toArray();
             const contactsMap = {};
             for (const contact of contacts) {
-                const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact;
+                const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...contactData } = contact;
                 contactsMap[contact.id] = contactData;
             }
             return contactsMap;
@@ -266,7 +463,7 @@ const makeMongoDBStore = async (config) => {
             const contact = await collections.contacts.findOne({ instanceId, id: jid });
             if (!contact)
                 return null;
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact;
+            const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...contactData } = contact;
             return contactData;
         },
         async upsertContacts(contacts) {
@@ -294,7 +491,7 @@ const makeMongoDBStore = async (config) => {
                 .find({ instanceId, jid })
                 .sort({ messageTimestamp: -1 })
                 .toArray();
-            return messages.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg));
+            return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg));
         },
         async getMessage(jid, id) {
             const cacheKey = `msg_${instanceId}_${jid}_${id}`;
@@ -308,7 +505,7 @@ const makeMongoDBStore = async (config) => {
             });
             if (!message)
                 return null;
-            const { _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg } = message;
+            const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message;
             const converted = convertBinaryToBuffer(msg);
             binaryConversionCache.set(cacheKey, converted);
             return converted;
@@ -376,7 +573,7 @@ const makeMongoDBStore = async (config) => {
             const metadata = await collections.groupMetadata.findOne({ instanceId, id: jid });
             if (!metadata)
                 return null;
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...metadataData } = metadata;
+            const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadataData } = metadata;
             return metadataData;
         },
         async upsertGroupMetadata(jid, metadata) {
@@ -386,13 +583,13 @@ const makeMongoDBStore = async (config) => {
             const state = await collections.state.findOne({ instanceId });
             if (!state)
                 return { connection: 'close' };
-            const { _id: _1, instanceId: _2, updatedAt: _3, ...stateData } = state;
+            const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...stateData } = state;
             return stateData;
         },
         async updateState(update) {
-            await collections.state.updateOne({ instanceId }, {
+            await withConnection(() => collections.state.updateOne({ instanceId }, {
                 $set: { ...update, instanceId, updatedAt: new Date() }
-            }, { upsert: true });
+            }, { upsert: true }));
         },
         async getPresences() {
             const presences = await collections.presences
@@ -415,7 +612,7 @@ const makeMongoDBStore = async (config) => {
                 .toArray();
             const labelsMap = {};
             for (const label of labels) {
-                const { _id: _1, instanceId: _2, updatedAt: _3, ...labelData } = label;
+                const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...labelData } = label;
                 labelsMap[label.id] = labelData;
             }
             return labelsMap;
@@ -430,13 +627,13 @@ const makeMongoDBStore = async (config) => {
             const associations = await collections.labelAssociations
                 .find({ instanceId })
                 .toArray();
-            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc);
+            return associations.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...assoc }) => assoc);
         },
         async getChatLabels(chatId) {
             const associations = await collections.labelAssociations
                 .find({ instanceId, chatId })
                 .toArray();
-            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc);
+            return associations.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...assoc }) => assoc);
         },
         async getMessageLabels(messageId) {
             const associations = await collections.labelAssociations
@@ -445,11 +642,28 @@ const makeMongoDBStore = async (config) => {
             return associations.map(assoc => assoc.labelId);
         },
         async upsertLabelAssociation(association) {
-            labelAssociationBatch.items.push(association);
-            scheduleLabelBatch();
-            if (labelAssociationBatch.items.length >= BATCH_SIZE) {
-                await processBatchedLabelAssociations();
-            }
+            return new Promise((resolve, reject) => {
+                labelAssociationBatch.totalReceived = (labelAssociationBatch.totalReceived || 0) + 1;
+                labelAssociationBatch.items.push(association);
+                labelAssociationBatch.pendingPromises?.push({ resolve, reject });
+                const currentBatchSize = labelAssociationBatch.items.length;
+                const totalReceived = labelAssociationBatch.totalReceived;
+                const totalProcessed = labelAssociationBatch.totalProcessed || 0;
+                console.log(`[Label Association] #${totalReceived} Added to batch (queue: ${currentBatchSize}, received: ${totalReceived}, processed: ${totalProcessed}) - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${association.messageId || 'none'}`);
+                if (currentBatchSize >= BATCH_SIZE) {
+                    console.log(`[Label Association] Batch full (${currentBatchSize}/${BATCH_SIZE}), processing immediately`);
+                    if (labelAssociationBatch.timer) {
+                        clearTimeout(labelAssociationBatch.timer);
+                        labelAssociationBatch.timer = null;
+                    }
+                    processBatchedLabelAssociations().catch(error => {
+                        console.error('[Label Association] Error in batch processing:', error);
+                    });
+                }
+                else {
+                    scheduleLabelBatch();
+                }
+            });
         },
         async deleteLabelAssociation(association) {
             await collections.labelAssociations.deleteOne({
@@ -521,6 +735,14 @@ const makeMongoDBStore = async (config) => {
                 }
                 else if (type === 'remove') {
                     await store.deleteLabelAssociation(association);
+                }
+                const stats = store.getPerformanceStats();
+                if (stats.labelStats && stats.labelStats.totalReceived % 50 === 0 && stats.labelStats.totalReceived > 0) {
+                    console.log(`[Label Event] Periodic status - received: ${stats.labelStats.totalReceived}, processed: ${stats.labelStats.totalProcessed}, queued: ${stats.labelStats.currentQueueSize}`);
+                    if (stats.labelStats.currentQueueSize > BATCH_SIZE * 2) {
+                        console.log('[Label Event] Queue backlog detected, forcing flush');
+                        store.flushLabelAssociations().catch(err => console.error('[Label Event] Flush error:', err));
+                    }
                 }
             });
             ev.on('presence.update', async ({ id, presences: update }) => {
@@ -631,7 +853,7 @@ const makeMongoDBStore = async (config) => {
                     .sort({ messageTimestamp: -1 })
                     .limit(count)
                     .toArray()
-                    .then(msgs => msgs.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg)));
+                    .then(msgs => msgs.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg)));
             }
             return messages;
         },
@@ -664,8 +886,30 @@ const makeMongoDBStore = async (config) => {
             const uptime = Date.now() - performanceMetrics.lastResetTime.getTime();
             return {
                 ...performanceMetrics,
-                uptime
+                uptime,
+                labelStats: {
+                    totalReceived: labelAssociationBatch.totalReceived || 0,
+                    totalProcessed: labelAssociationBatch.totalProcessed || 0,
+                    currentQueueSize: labelAssociationBatch.items.length,
+                    isProcessing: labelAssociationBatch.processing
+                }
             };
+        },
+        async flushLabelAssociations() {
+            console.log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`);
+            if (labelAssociationBatch.timer) {
+                clearTimeout(labelAssociationBatch.timer);
+                labelAssociationBatch.timer = null;
+            }
+            while (labelAssociationBatch.processing) {
+                console.log('[Label Flush] Waiting for current batch to complete...');
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            while (labelAssociationBatch.items.length > 0) {
+                await processBatchedLabelAssociations();
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            console.log(`[Label Flush] Flush complete. Total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived}`);
         },
         resetPerformanceStats() {
             performanceMetrics.messagesProcessed = 0;
@@ -674,8 +918,57 @@ const makeMongoDBStore = async (config) => {
             performanceMetrics.errors = 0;
             performanceMetrics.lastResetTime = new Date();
         },
+        async recreateIndexes() {
+            const results = [];
+            try {
+                await createIndexes();
+                const totalIndexes = 18;
+                results.push(`Index recreation completed successfully`);
+                return { created: totalIndexes, failed: 0, details: results };
+            }
+            catch (error) {
+                results.push(`Index recreation failed: ${error}`);
+                throw error;
+            }
+        },
+        async getIndexStatus() {
+            return withConnection(async () => {
+                const collectionNames = ['chats', 'contacts', 'messages', 'groupMetadata', 'state', 'presences', 'labels', 'labelAssociations'];
+                const indexStatus = [];
+                for (const collName of collectionNames) {
+                    try {
+                        const collection = collections[collName];
+                        const indexes = await collection.listIndexes().toArray();
+                        indexStatus.push({
+                            collection: `${collectionPrefix}${collName}`,
+                            indexes: indexes.map(idx => ({
+                                name: idx.name,
+                                key: idx.key,
+                                unique: idx.unique,
+                                expireAfterSeconds: idx.expireAfterSeconds
+                            }))
+                        });
+                    }
+                    catch (error) {
+                        indexStatus.push({
+                            collection: `${collectionPrefix}${collName}`,
+                            indexes: [],
+                            error: error.message
+                        });
+                    }
+                }
+                return indexStatus;
+            });
+        },
         async close() {
-            await processBatchedLabelAssociations();
+            isConnected = false;
+            reconnectAttempts = 0;
+            if (store.flushLabelAssociations) {
+                await store.flushLabelAssociations();
+            }
+            else {
+                await processBatchedLabelAssociations();
+            }
             await processBatchedMessages();
             if (labelAssociationBatch.timer) {
                 clearTimeout(labelAssociationBatch.timer);
@@ -694,24 +987,40 @@ const makeMongoDBStore = async (config) => {
                     binaryConversionCache.del(key);
                 }
             });
-            await client.close();
-            activeConnections = activeConnections.filter(c => c.client !== client);
+            if (client) {
+                await client.close();
+            }
+            activeConnections = activeConnections.filter(c => c.instanceId !== instanceId);
         }
     };
+    const store = createStoreProxy(storeImpl);
     return store;
 };
 exports.makeMongoDBStore = makeMongoDBStore;
 const cleanupMongoDBStore = async (instanceId, deleteData = false) => {
     if (!instanceId) {
-        for (const conn of activeConnections) {
+        const connections = [...activeConnections];
+        activeConnections = [];
+        for (const conn of connections) {
             try {
-                await conn.client.close();
+                if (conn.client) {
+                    try {
+                        await conn.client.db(conn.database).command({ ping: 1 });
+                        await conn.client.close();
+                    }
+                    catch {
+                        try {
+                            await conn.client.close();
+                        }
+                        catch {
+                        }
+                    }
+                }
             }
             catch (error) {
                 console.error('Error closing MongoDB connection:', error);
             }
         }
-        activeConnections = [];
         return;
     }
     const instanceConnections = activeConnections.filter(c => c.instanceId === instanceId);

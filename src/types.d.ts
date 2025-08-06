@@ -225,7 +225,18 @@ export interface MongoDBStore {
         errors: number
         lastResetTime: Date
         uptime: number
+        labelStats?: {
+            totalReceived: number
+            totalProcessed: number
+            currentQueueSize: number
+            isProcessing: boolean
+        }
     }
+    
+    /**
+     * Force flush all pending label associations
+     */
+    flushLabelAssociations(): Promise<void>
     
     /**
      * Reset performance statistics
