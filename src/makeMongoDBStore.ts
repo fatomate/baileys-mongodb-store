@@ -213,8 +213,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     
     // Default job options for automatic cleanup - remove immediately
     const defaultJobOptions = {
-        removeOnComplete: true,  // Remove immediately when completed
-        removeOnFail: true,      // Remove immediately when failed
+        removeOnComplete: {
+            age: 60,    // Keep completed jobs for 60 seconds max
+            count: 10   // Keep max 10 completed jobs
+        },
+        removeOnFail: {
+            age: 300    // Keep failed jobs for 5 minutes for debugging
+        },
         attempts: 3,
         backoff: {
             type: 'exponential' as const,
@@ -325,20 +330,36 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         try {
             console.log(`🐂 Initializing Bull queues for instance ${instanceId}...`)
             
-            // Create Redis connection
+            // Create Redis connection with BullMQ requirements
             if (typeof redis.connection === 'string') {
                 redisConnection = new Redis(redis.connection, {
-                    maxRetriesPerRequest: null
+                    maxRetriesPerRequest: null,
+                    enableReadyCheck: true,
+                    lazyConnect: false
                 })
             } else {
                 redisConnection = new Redis({
                     ...redis.connection,
-                    maxRetriesPerRequest: null
+                    maxRetriesPerRequest: null,
+                    enableReadyCheck: true,
+                    lazyConnect: false
                 })
             }
             
             // Test Redis connection
             await redisConnection.ping()
+            
+            // Check eviction policy (warning only, not blocking)
+            try {
+                const config = await redisConnection.config('GET', 'maxmemory-policy') as [string, string]
+                const policy = config[1]
+                if (policy && policy !== 'noeviction') {
+                    console.warn(`⚠️  Redis eviction policy is '${policy}'. Consider using 'noeviction' for BullMQ or a separate Redis instance.`)
+                    console.warn(`   Current settings will work but jobs may be lost if Redis memory fills up.`)
+                }
+            } catch (err) {
+                // Config command might be disabled, continue anyway
+            }
             
             const queuePrefix = redis.queuePrefix || 'baileys'
             const redisOpts = { connection: redisConnection }
@@ -665,12 +686,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         redisConnection.disconnect()
                         if (typeof redis.connection === 'string') {
                             redisConnection = new Redis(redis.connection, {
-                                maxRetriesPerRequest: null
+                                maxRetriesPerRequest: null,
+                                enableReadyCheck: true,
+                                lazyConnect: false
                             })
                         } else {
                             redisConnection = new Redis({
                                 ...redis.connection,
-                                maxRetriesPerRequest: null
+                                maxRetriesPerRequest: null,
+                                enableReadyCheck: true,
+                                lazyConnect: false
                             })
                         }
                         await redisConnection.ping()

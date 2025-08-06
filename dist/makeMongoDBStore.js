@@ -72,8 +72,13 @@ const makeMongoDBStore = async (config) => {
     let redisConnection = null;
     let bullInitialized = false;
     const defaultJobOptions = {
-        removeOnComplete: true,
-        removeOnFail: true,
+        removeOnComplete: {
+            age: 60,
+            count: 10
+        },
+        removeOnFail: {
+            age: 300
+        },
         attempts: 3,
         backoff: {
             type: 'exponential',
@@ -163,16 +168,30 @@ const makeMongoDBStore = async (config) => {
             console.log(`🐂 Initializing Bull queues for instance ${instanceId}...`);
             if (typeof redis.connection === 'string') {
                 redisConnection = new ioredis_1.default(redis.connection, {
-                    maxRetriesPerRequest: null
+                    maxRetriesPerRequest: null,
+                    enableReadyCheck: true,
+                    lazyConnect: false
                 });
             }
             else {
                 redisConnection = new ioredis_1.default({
                     ...redis.connection,
-                    maxRetriesPerRequest: null
+                    maxRetriesPerRequest: null,
+                    enableReadyCheck: true,
+                    lazyConnect: false
                 });
             }
             await redisConnection.ping();
+            try {
+                const config = await redisConnection.config('GET', 'maxmemory-policy');
+                const policy = config[1];
+                if (policy && policy !== 'noeviction') {
+                    console.warn(`⚠️  Redis eviction policy is '${policy}'. Consider using 'noeviction' for BullMQ or a separate Redis instance.`);
+                    console.warn(`   Current settings will work but jobs may be lost if Redis memory fills up.`);
+                }
+            }
+            catch (err) {
+            }
             const queuePrefix = redis.queuePrefix || 'baileys';
             const redisOpts = { connection: redisConnection };
             const createQueueAndWorker = (queueType, processor) => {
@@ -394,13 +413,17 @@ const makeMongoDBStore = async (config) => {
                         redisConnection.disconnect();
                         if (typeof redis.connection === 'string') {
                             redisConnection = new ioredis_1.default(redis.connection, {
-                                maxRetriesPerRequest: null
+                                maxRetriesPerRequest: null,
+                                enableReadyCheck: true,
+                                lazyConnect: false
                             });
                         }
                         else {
                             redisConnection = new ioredis_1.default({
                                 ...redis.connection,
-                                maxRetriesPerRequest: null
+                                maxRetriesPerRequest: null,
+                                enableReadyCheck: true,
+                                lazyConnect: false
                             });
                         }
                         await redisConnection.ping();
