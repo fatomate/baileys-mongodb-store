@@ -237,12 +237,15 @@ const makeMongoDBStore = async (config) => {
             createQueueAndWorker(QueueType.LABEL_ASSOCIATIONS, async (job) => {
                 const { type, association } = job.data;
                 if (type === 'upsert') {
-                    await collections.labelAssociations.replaceOne({
+                    const filter = {
                         instanceId,
                         chatId: association.chatId,
-                        labelId: association.labelId,
-                        messageId: 'messageId' in association ? association.messageId : ''
-                    }, {
+                        labelId: association.labelId
+                    };
+                    if ('messageId' in association && association.messageId) {
+                        filter.messageId = association.messageId;
+                    }
+                    await collections.labelAssociations.replaceOne(filter, {
                         ...association,
                         instanceId,
                         updatedAt: new Date()
@@ -557,22 +560,27 @@ const makeMongoDBStore = async (config) => {
             itemsToProcess.splice(BATCH_SIZE * 10);
         }
         try {
-            const bulkOps = itemsToProcess.map(association => ({
-                replaceOne: {
-                    filter: {
-                        instanceId,
-                        chatId: association.chatId,
-                        labelId: association.labelId,
-                        messageId: 'messageId' in association ? association.messageId : ''
-                    },
-                    replacement: {
-                        ...association,
-                        instanceId,
-                        updatedAt: new Date()
-                    },
-                    upsert: true
+            const bulkOps = itemsToProcess.map(association => {
+                const filter = {
+                    instanceId,
+                    chatId: association.chatId,
+                    labelId: association.labelId
+                };
+                if ('messageId' in association && association.messageId) {
+                    filter.messageId = association.messageId;
                 }
-            }));
+                return {
+                    replaceOne: {
+                        filter,
+                        replacement: {
+                            ...association,
+                            instanceId,
+                            updatedAt: new Date()
+                        },
+                        upsert: true
+                    }
+                };
+            });
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE);
                 await withConnection(() => collections.labelAssociations.bulkWrite(chunk, { ordered: false }));

@@ -439,13 +439,21 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const { type, association } = job.data
                 
                 if (type === 'upsert') {
+                    // For contact labels, we don't include messageId in the filter
+                    // to prevent duplicate key errors during rapid add/remove operations
+                    const filter: any = {
+                        instanceId,
+                        chatId: association.chatId,
+                        labelId: association.labelId
+                    }
+                    
+                    // Only include messageId in filter if it's a message label (not a contact label)
+                    if ('messageId' in association && association.messageId) {
+                        filter.messageId = association.messageId
+                    }
+                    
                     await collections.labelAssociations.replaceOne(
-                        {
-                            instanceId,
-                            chatId: association.chatId,
-                            labelId: association.labelId,
-                            messageId: 'messageId' in association ? association.messageId : ''
-                        },
+                        filter,
                         {
                             ...association,
                             instanceId,
@@ -873,22 +881,31 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }
         
         try {
-            const bulkOps = itemsToProcess.map(association => ({
-                replaceOne: {
-                    filter: {
-                        instanceId,
-                        chatId: association.chatId,
-                        labelId: association.labelId,
-                        messageId: 'messageId' in association ? association.messageId : ''
-                    },
-                    replacement: {
-                        ...association,
-                        instanceId,
-                        updatedAt: new Date()
-                    },
-                    upsert: true
+            const bulkOps = itemsToProcess.map(association => {
+                // Build filter based on whether it's a message or contact label
+                const filter: any = {
+                    instanceId,
+                    chatId: association.chatId,
+                    labelId: association.labelId
                 }
-            }))
+                
+                // Only include messageId for message labels
+                if ('messageId' in association && association.messageId) {
+                    filter.messageId = association.messageId
+                }
+                
+                return {
+                    replaceOne: {
+                        filter,
+                        replacement: {
+                            ...association,
+                            instanceId,
+                            updatedAt: new Date()
+                        },
+                        upsert: true
+                    }
+                }
+            })
             
             // Process in chunks to avoid overwhelming MongoDB
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
