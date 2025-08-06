@@ -683,7 +683,7 @@ const makeMongoDBStore = async (config) => {
             { collection: 'state', spec: { instanceId: 1 }, options: { unique: true }, name: 'state_primary' },
             { collection: 'presences', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'presences_primary' },
             { collection: 'labels', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'labels_primary' },
-            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1, messageId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
+            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
         ];
         const optimizationIndexes = [
             { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1 }, options: {}, name: 'label_assoc_chat' },
@@ -748,6 +748,34 @@ const makeMongoDBStore = async (config) => {
         const totalCreated = criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length - failedOptimization.length - failedTTL.length;
         console.log(`✅ Index creation completed for instance ${instanceId}: ${totalCreated}/${criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length} indexes created`);
     };
+    const checkAndFixLabelAssociationsIndex = async () => {
+        try {
+            const existingIndexes = await collections.labelAssociations.indexes();
+            const oldIndex = existingIndexes.find(idx => {
+                const keys = Object.keys(idx.key || {});
+                return keys.includes('instanceId') &&
+                    keys.includes('chatId') &&
+                    keys.includes('labelId') &&
+                    keys.includes('messageId') &&
+                    keys.length === 4;
+            });
+            if (oldIndex) {
+                console.log(`🔧 Found old labelAssociations index with messageId field, updating...`);
+                const indexName = oldIndex.name || 'instanceId_1_chatId_1_labelId_1_messageId_1';
+                try {
+                    await collections.labelAssociations.dropIndex(indexName);
+                    console.log(`✅ Dropped old index: ${indexName}`);
+                }
+                catch (dropError) {
+                    console.warn(`⚠️  Failed to drop old index ${indexName}:`, dropError);
+                }
+            }
+        }
+        catch (error) {
+            console.warn('⚠️  Could not check existing labelAssociations indexes:', error);
+        }
+    };
+    await checkAndFixLabelAssociationsIndex();
     await createIndexes();
     const createStoreProxy = (target) => {
         return new Proxy(target, {

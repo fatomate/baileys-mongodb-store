@@ -1121,6 +1121,41 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         console.log(`✅ Index creation completed for instance ${instanceId}: ${totalCreated}/${criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length} indexes created`)
     }
     
+    // Check and fix labelAssociations index if needed
+    const checkAndFixLabelAssociationsIndex = async () => {
+        try {
+            const existingIndexes = await collections.labelAssociations.indexes()
+            
+            // Look for the old problematic index that includes messageId
+            const oldIndex = existingIndexes.find(idx => {
+                const keys = Object.keys(idx.key || {})
+                return keys.includes('instanceId') && 
+                       keys.includes('chatId') && 
+                       keys.includes('labelId') && 
+                       keys.includes('messageId') && 
+                       keys.length === 4
+            })
+            
+            if (oldIndex) {
+                console.log(`🔧 Found old labelAssociations index with messageId field, updating...`)
+                
+                // Drop the old index
+                const indexName = oldIndex.name || 'instanceId_1_chatId_1_labelId_1_messageId_1'
+                try {
+                    await collections.labelAssociations.dropIndex(indexName)
+                    console.log(`✅ Dropped old index: ${indexName}`)
+                } catch (dropError) {
+                    console.warn(`⚠️  Failed to drop old index ${indexName}:`, dropError)
+                }
+            }
+        } catch (error) {
+            console.warn('⚠️  Could not check existing labelAssociations indexes:', error)
+        }
+    }
+    
+    // Fix old index before creating new ones
+    await checkAndFixLabelAssociationsIndex()
+    
     // Initialize indexes - critical indexes must succeed
     await createIndexes()
     
