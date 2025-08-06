@@ -340,7 +340,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Helper to create queue and worker for each event type
             const createQueueAndWorker = <T>(queueType: QueueType, processor: (job: Job<T>) => Promise<any>) => {
-                const queueName = `${queuePrefix}:${queueType}:${instanceId}`
+                const queueName = `${queuePrefix}_${queueType}_${instanceId}`
                 
                 // Create queue
                 const queue = new Queue<T>(queueName, redisOpts)

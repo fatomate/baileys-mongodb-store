@@ -171,7 +171,7 @@ const makeMongoDBStore = async (config) => {
             const queuePrefix = redis.queuePrefix || 'baileys';
             const redisOpts = { connection: redisConnection };
             const createQueueAndWorker = (queueType, processor) => {
-                const queueName = `${queuePrefix}:${queueType}:${instanceId}`;
+                const queueName = `${queuePrefix}_${queueType}_${instanceId}`;
                 const queue = new bullmq_1.Queue(queueName, redisOpts);
                 queues.set(queueType, queue);
                 const concurrency = queueType === QueueType.LABEL_ASSOCIATIONS ? 1 : (redis.concurrency || 50);
