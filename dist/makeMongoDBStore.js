@@ -162,10 +162,15 @@ const makeMongoDBStore = async (config) => {
         try {
             console.log(`🐂 Initializing Bull queues for instance ${instanceId}...`);
             if (typeof redis.connection === 'string') {
-                redisConnection = new ioredis_1.default(redis.connection);
+                redisConnection = new ioredis_1.default(redis.connection, {
+                    maxRetriesPerRequest: null
+                });
             }
             else {
-                redisConnection = new ioredis_1.default(redis.connection);
+                redisConnection = new ioredis_1.default({
+                    ...redis.connection,
+                    maxRetriesPerRequest: null
+                });
             }
             await redisConnection.ping();
             const queuePrefix = redis.queuePrefix || 'baileys';
@@ -388,10 +393,15 @@ const makeMongoDBStore = async (config) => {
                     if (redisConnection && redisConnection.status !== 'ready') {
                         redisConnection.disconnect();
                         if (typeof redis.connection === 'string') {
-                            redisConnection = new ioredis_1.default(redis.connection);
+                            redisConnection = new ioredis_1.default(redis.connection, {
+                                maxRetriesPerRequest: null
+                            });
                         }
                         else {
-                            redisConnection = new ioredis_1.default(redis.connection);
+                            redisConnection = new ioredis_1.default({
+                                ...redis.connection,
+                                maxRetriesPerRequest: null
+                            });
                         }
                         await redisConnection.ping();
                     }

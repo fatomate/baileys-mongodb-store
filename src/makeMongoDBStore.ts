@@ -327,9 +327,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Create Redis connection
             if (typeof redis.connection === 'string') {
-                redisConnection = new Redis(redis.connection)
+                redisConnection = new Redis(redis.connection, {
+                    maxRetriesPerRequest: null
+                })
             } else {
-                redisConnection = new Redis(redis.connection)
+                redisConnection = new Redis({
+                    ...redis.connection,
+                    maxRetriesPerRequest: null
+                })
             }
             
             // Test Redis connection
@@ -659,9 +664,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     if (redisConnection && redisConnection.status !== 'ready') {
                         redisConnection.disconnect()
                         if (typeof redis.connection === 'string') {
-                            redisConnection = new Redis(redis.connection)
+                            redisConnection = new Redis(redis.connection, {
+                                maxRetriesPerRequest: null
+                            })
                         } else {
-                            redisConnection = new Redis(redis.connection)
+                            redisConnection = new Redis({
+                                ...redis.connection,
+                                maxRetriesPerRequest: null
+                            })
                         }
                         await redisConnection.ping()
                     }
