@@ -193,8 +193,28 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         instanceId,
         ttlDays = DEFAULT_TTL_DAYS,
         collectionPrefix = 'baileys_',
-        redis
+        redis,
+        logLevel = 'none'
     } = config
+    
+    // Helper functions for conditional logging based on log level
+    const log = (...args: any[]) => {
+        if (logLevel === 'all') {
+            console.log(...args)
+        }
+    }
+    
+    const logError = (...args: any[]) => {
+        if (logLevel === 'error' || logLevel === 'warn' || logLevel === 'all') {
+            console.error(...args)
+        }
+    }
+    
+    const logWarn = (...args: any[]) => {
+        if (logLevel === 'warn' || logLevel === 'all') {
+            console.warn(...args)
+        }
+    }
 
     let client: MongoClient
     let db: Db
@@ -448,8 +468,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     
                     const result = await collections.labelAssociations.deleteOne(filter)
                     
-                    if (enableLogging && result.deletedCount === 0) {
-                        log(`[Bull Label] Warning: No document found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
+                    if (result.deletedCount === 0) {
+                        logWarn(`[Bull Label] Warning: No document found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
                     }
                 }
                 
@@ -1821,8 +1841,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             const result = await collections.labelAssociations.deleteOne(filter)
             
-            if (enableLogging && result.deletedCount === 0) {
-                log(`[Direct Delete] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
+            if (result.deletedCount === 0) {
+                logWarn(`[Direct Delete] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
             }
         },
 

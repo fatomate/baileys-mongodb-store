@@ -10,6 +10,9 @@ async function testLabelAssociations() {
         database: 'baileys_test',
         instanceId: 'test_instance_' + Date.now(),
         
+        // Enable all logs to see label operations
+        logLevel: 'all',
+        
         // Enable Redis/Bull for testing - label associations use concurrency: 1
         redis: process.env.REDIS_URL ? {
             connection: process.env.REDIS_URL,

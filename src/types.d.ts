@@ -93,10 +93,14 @@ export interface MongoDBStoreConfig {
     redis?: RedisConfig
     
     /**
-     * Enable logging for debugging purposes
-     * Default: false
+     * Log level for debugging purposes
+     * - 'none': No logging (default)
+     * - 'error': Only error messages
+     * - 'warn': Warning and error messages
+     * - 'all': All messages including info/debug
+     * Default: 'none'
      */
-    enableLogging?: boolean
+    logLevel?: 'none' | 'error' | 'warn' | 'all'
 }
 
 export interface MongoDBStore {

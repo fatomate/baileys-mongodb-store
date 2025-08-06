@@ -20,9 +20,12 @@ async function connectToWhatsApp() {
         ttlDays: 30,
         logger: logger.child({ module: 'mongodb-store' }),
         
-        // Optional: Enable logging for debugging
-        // Set to true to see detailed logs about store operations
-        enableLogging: process.env.DEBUG === 'true' || false,
+        // Optional: Set log level for debugging
+        // 'none' (default): No logging
+        // 'error': Only error messages
+        // 'warn': Warning and error messages  
+        // 'all': All messages including info/debug
+        logLevel: process.env.LOG_LEVEL || 'none',
         
         // Optional: Enable Redis/Bull for production-grade reliability
         // All jobs are automatically removed after completion/failure

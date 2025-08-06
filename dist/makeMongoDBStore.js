@@ -53,12 +53,26 @@ const convertBinaryToBuffer = (obj) => {
         return result;
     }
     catch (error) {
-        console.error('Error converting Binary to Buffer:', error);
         return obj;
     }
 };
 const makeMongoDBStore = async (config) => {
-    const { uri, database: dbName, instanceId, ttlDays = DEFAULT_TTL_DAYS, collectionPrefix = 'baileys_', redis } = config;
+    const { uri, database: dbName, instanceId, ttlDays = DEFAULT_TTL_DAYS, collectionPrefix = 'baileys_', redis, logLevel = 'none' } = config;
+    const log = (...args) => {
+        if (logLevel === 'all') {
+            console.log(...args);
+        }
+    };
+    const logError = (...args) => {
+        if (logLevel === 'error' || logLevel === 'warn' || logLevel === 'all') {
+            console.error(...args);
+        }
+    };
+    const logWarn = (...args) => {
+        if (logLevel === 'warn' || logLevel === 'all') {
+            console.warn(...args);
+        }
+    };
     let client;
     let db;
     let isConnected = false;
@@ -110,13 +124,13 @@ const makeMongoDBStore = async (config) => {
                 instanceId,
                 collectionPrefix
             });
-            console.log(`MongoDB connected successfully for instance ${instanceId}`);
+            log(`MongoDB connected successfully for instance ${instanceId}`);
         }
         catch (error) {
             isConnected = false;
             isConnecting = false;
             connectionError = error;
-            console.error(`MongoDB connection failed for instance ${instanceId}:`, error);
+            logError(`MongoDB connection failed for instance ${instanceId}:`, error);
             throw error;
         }
     };
@@ -145,7 +159,7 @@ const makeMongoDBStore = async (config) => {
         isConnecting = true;
         const delay = RECONNECT_DELAY_BASE * Math.pow(2, Math.min(reconnectAttempts, 5));
         if (reconnectAttempts > 0) {
-            console.log(`Attempting to reconnect (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}) after ${delay}ms...`);
+            log(`Attempting to reconnect (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS}) after ${delay}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
         }
         reconnectAttempts++;
@@ -165,7 +179,7 @@ const makeMongoDBStore = async (config) => {
         if (!redis)
             return;
         try {
-            console.log(`🐂 Initializing Bull queues for instance ${instanceId}...`);
+            log(`🐂 Initializing Bull queues for instance ${instanceId}...`);
             if (typeof redis.connection === 'string') {
                 redisConnection = new ioredis_1.default(redis.connection, {
                     maxRetriesPerRequest: null,
@@ -186,8 +200,8 @@ const makeMongoDBStore = async (config) => {
                 const config = await redisConnection.config('GET', 'maxmemory-policy');
                 const policy = config[1];
                 if (policy && policy !== 'noeviction') {
-                    console.warn(`⚠️  Redis eviction policy is '${policy}'. Consider using 'noeviction' for BullMQ or a separate Redis instance.`);
-                    console.warn(`   Current settings will work but jobs may be lost if Redis memory fills up.`);
+                    logWarn(`⚠️  Redis eviction policy is '${policy}'. Consider using 'noeviction' for BullMQ or a separate Redis instance.`);
+                    logWarn(`   Current settings will work but jobs may be lost if Redis memory fills up.`);
                 }
             }
             catch (err) {
@@ -204,18 +218,18 @@ const makeMongoDBStore = async (config) => {
                     concurrency,
                     autorun: true
                 });
-                console.log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`);
+                log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`);
                 worker.on('completed', (job) => {
                     if (queueType !== QueueType.LABEL_ASSOCIATIONS) {
-                        console.log(`✅ ${queueType} job ${job.id} completed`);
+                        log(`✅ ${queueType} job ${job.id} completed`);
                     }
                 });
                 worker.on('failed', (job, err) => {
-                    console.error(`❌ ${queueType} job ${job?.id} failed:`, err.message);
+                    logError(`❌ ${queueType} job ${job?.id} failed:`, err.message);
                     performanceMetrics.errors++;
                 });
                 worker.on('stalled', (jobId) => {
-                    console.warn(`⚠️ ${queueType} job ${jobId} stalled`);
+                    logWarn(`⚠️ ${queueType} job ${jobId} stalled`);
                 });
                 workers.set(queueType, worker);
                 queue.obliterate({ force: true }).catch(() => { });
@@ -235,12 +249,18 @@ const makeMongoDBStore = async (config) => {
                     }, { upsert: true });
                 }
                 else if (type === 'delete') {
-                    await collections.labelAssociations.deleteOne({
+                    const filter = {
                         instanceId,
                         chatId: association.chatId,
-                        labelId: association.labelId,
-                        messageId: 'messageId' in association ? association.messageId : ''
-                    });
+                        labelId: association.labelId
+                    };
+                    if ('messageId' in association && association.messageId) {
+                        filter.messageId = association.messageId;
+                    }
+                    const result = await collections.labelAssociations.deleteOne(filter);
+                    if (result.deletedCount === 0) {
+                        logWarn(`[Bull Label] Warning: No document found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${association.messageId || 'none'}`);
+                    }
                 }
                 performanceMetrics.labelsProcessed++;
                 return { success: true };
@@ -360,7 +380,7 @@ const makeMongoDBStore = async (config) => {
             const checkQueuesHealth = async () => {
                 try {
                     if (redisConnection?.status !== 'ready') {
-                        console.error('⚠️ Redis connection lost, attempting to reconnect...');
+                        logError('⚠️ Redis connection lost, attempting to reconnect...');
                         await restartQueues();
                         return;
                     }
@@ -369,10 +389,10 @@ const makeMongoDBStore = async (config) => {
                             const counts = await queue.getJobCounts();
                             const worker = workers.get(queueType);
                             if (counts.waiting > 100) {
-                                console.warn(`⚠️ ${queueType} queue has ${counts.waiting} waiting jobs`);
+                                logWarn(`⚠️ ${queueType} queue has ${counts.waiting} waiting jobs`);
                             }
                             if (worker && !worker.isRunning()) {
-                                console.error(`❌ ${queueType} worker stopped, restarting...`);
+                                logError(`❌ ${queueType} worker stopped, restarting...`);
                                 await worker.run();
                             }
                             const activeJobs = await queue.getActive();
@@ -380,26 +400,26 @@ const makeMongoDBStore = async (config) => {
                             for (const job of activeJobs) {
                                 const processingTime = now - job.processedOn;
                                 if (processingTime > QUEUE_STALE_THRESHOLD) {
-                                    console.warn(`⚠️ Stale job detected in ${queueType}: ${job.id} (${processingTime}ms)`);
+                                    logWarn(`⚠️ Stale job detected in ${queueType}: ${job.id} (${processingTime}ms)`);
                                     await job.moveToFailed(new Error('Job stale, moving to failed'), false);
                                 }
                             }
                         }
                         catch (error) {
-                            console.error(`Health check failed for ${queueType}:`, error);
+                            logError(`Health check failed for ${queueType}:`, error);
                         }
                     }
                     lastHealthCheck = Date.now();
                 }
                 catch (error) {
-                    console.error('Queue health check error:', error);
+                    logError('Queue health check error:', error);
                     if (Date.now() - lastHealthCheck > QUEUE_STALE_THRESHOLD * 2) {
                         await restartQueues();
                     }
                 }
             };
             const restartQueues = async () => {
-                console.log('🔄 Restarting Bull queues...');
+                log('🔄 Restarting Bull queues...');
                 try {
                     for (const worker of workers.values()) {
                         await worker.close();
@@ -429,10 +449,10 @@ const makeMongoDBStore = async (config) => {
                         await redisConnection.ping();
                     }
                     await initializeBullQueues();
-                    console.log('✅ Queues restarted successfully');
+                    log('✅ Queues restarted successfully');
                 }
                 catch (error) {
-                    console.error('❌ Failed to restart queues:', error);
+                    logError('❌ Failed to restart queues:', error);
                     bullInitialized = false;
                 }
             };
@@ -448,11 +468,11 @@ const makeMongoDBStore = async (config) => {
                 }
             }, 60000);
             bullInitialized = true;
-            console.log(`✅ Bull queues initialized successfully for instance ${instanceId}`);
+            log(`✅ Bull queues initialized successfully for instance ${instanceId}`);
         }
         catch (error) {
-            console.error(`❌ Failed to initialize Bull queues for instance ${instanceId}:`, error);
-            console.log('⚠️  Falling back to in-memory queue processing');
+            logError(`❌ Failed to initialize Bull queues for instance ${instanceId}:`, error);
+            log('⚠️  Falling back to in-memory queue processing');
             for (const worker of workers.values()) {
                 await worker.close();
             }
@@ -507,7 +527,7 @@ const makeMongoDBStore = async (config) => {
             if (error.message?.includes('Client must be connected') ||
                 error.message?.includes('Topology is closed') ||
                 error.code === 'ECONNREFUSED') {
-                console.log(`Connection error detected for instance ${instanceId}, attempting reconnection...`);
+                log(`Connection error detected for instance ${instanceId}, attempting reconnection...`);
                 isConnected = false;
                 await ensureConnection();
                 collections = getCollections();
@@ -518,7 +538,7 @@ const makeMongoDBStore = async (config) => {
     };
     const processBatchedLabelAssociations = async () => {
         if (labelAssociationBatch.processing) {
-            console.log(`[Label Batch] Skipping - already processing`);
+            log(`[Label Batch] Skipping - already processing`);
             return;
         }
         if (labelAssociationBatch.items.length === 0) {
@@ -531,9 +551,9 @@ const makeMongoDBStore = async (config) => {
         }
         const itemsToProcess = labelAssociationBatch.items.splice(0);
         const pendingPromises = labelAssociationBatch.pendingPromises?.splice(0, itemsToProcess.length) || [];
-        console.log(`[Label Batch] Processing ${itemsToProcess.length} label associations`);
+        log(`[Label Batch] Processing ${itemsToProcess.length} label associations`);
         if (itemsToProcess.length > BATCH_SIZE * 10) {
-            console.warn(`Batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`);
+            logWarn(`Batch size exceeded for instance ${instanceId} (${itemsToProcess.length} items), processing first ${BATCH_SIZE * 10} items`);
             itemsToProcess.splice(BATCH_SIZE * 10);
         }
         try {
@@ -717,7 +737,7 @@ const makeMongoDBStore = async (config) => {
         if (failedOptimization.length > 0) {
             console.warn(`⚠️  Some optimization indexes failed: ${failedOptimization.map(({ index }) => index.name).join(', ')}`);
         }
-        console.log(`🗑️  Creating TTL indexes for instance ${instanceId}...`);
+        log(`🗑️  Creating TTL indexes for instance ${instanceId}...`);
         const ttlResults = await Promise.allSettled(ttlIndexes.map(idx => createIndexWithRetry(idx, 2)));
         const failedTTL = ttlResults
             .map((result, i) => ({ result, index: ttlIndexes[i] }))
@@ -781,7 +801,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Chats] Failed to queue, falling back:', error);
+                    logError('[Bull Chats] Failed to queue, falling back:', error);
                 }
             }
             const bulkOps = chats.map(chat => ({
@@ -807,7 +827,7 @@ const makeMongoDBStore = async (config) => {
                     return true;
                 }
                 catch (error) {
-                    console.error('[Bull Chats] Failed to queue update, falling back:', error);
+                    logError('[Bull Chats] Failed to queue update, falling back:', error);
                 }
             }
             const result = await collections.chats.updateOne({ instanceId, id: jid }, {
@@ -828,7 +848,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Chats] Failed to queue delete, falling back:', error);
+                    logError('[Bull Chats] Failed to queue delete, falling back:', error);
                 }
             }
             await collections.chats.deleteMany({
@@ -872,7 +892,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Contacts] Failed to queue, falling back:', error);
+                    logError('[Bull Contacts] Failed to queue, falling back:', error);
                 }
             }
             const bulkOps = contacts.map(contact => ({
@@ -932,7 +952,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Messages] Failed to queue, falling back:', error);
+                    logError('[Bull Messages] Failed to queue, falling back:', error);
                 }
             }
             if (useBatch) {
@@ -976,7 +996,7 @@ const makeMongoDBStore = async (config) => {
                     return true;
                 }
                 catch (error) {
-                    console.error('[Bull Messages] Failed to queue update, falling back:', error);
+                    logError('[Bull Messages] Failed to queue update, falling back:', error);
                 }
             }
             const processedUpdate = convertBinaryToBuffer(update);
@@ -1017,7 +1037,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Messages] Failed to queue delete, falling back:', error);
+                    logError('[Bull Messages] Failed to queue delete, falling back:', error);
                 }
             }
             const filter = { instanceId, jid };
@@ -1047,7 +1067,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull GroupMetadata] Failed to queue, falling back:', error);
+                    logError('[Bull GroupMetadata] Failed to queue, falling back:', error);
                 }
             }
             await collections.groupMetadata.replaceOne({ instanceId, id: jid }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
@@ -1072,7 +1092,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull State] Failed to queue, falling back:', error);
+                    logError('[Bull State] Failed to queue, falling back:', error);
                 }
             }
             await withConnection(() => collections.state.updateOne({ instanceId }, {
@@ -1103,7 +1123,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Presences] Failed to queue, falling back:', error);
+                    logError('[Bull Presences] Failed to queue, falling back:', error);
                 }
             }
             await collections.presences.updateOne({ instanceId, id }, {
@@ -1135,7 +1155,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Labels] Failed to queue, falling back:', error);
+                    logError('[Bull Labels] Failed to queue, falling back:', error);
                 }
             }
             await collections.labels.replaceOne({ instanceId, id }, { ...label, instanceId, updatedAt: new Date() }, { upsert: true });
@@ -1153,7 +1173,7 @@ const makeMongoDBStore = async (config) => {
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Labels] Failed to queue delete, falling back:', error);
+                    logError('[Bull Labels] Failed to queue delete, falling back:', error);
                 }
             }
             await collections.labels.deleteOne({ instanceId, id });
@@ -1187,11 +1207,11 @@ const makeMongoDBStore = async (config) => {
                         timestamp: Date.now()
                     }, defaultJobOptions);
                     labelAssociationBatch.totalReceived = (labelAssociationBatch.totalReceived || 0) + 1;
-                    console.log(`[Bull Label] Job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`);
+                    log(`[Bull Label] Job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`);
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Label] Failed to queue job, falling back to in-memory:', error);
+                    logError('[Bull Label] Failed to queue job, falling back to in-memory:', error);
                 }
             }
             return new Promise((resolve, reject) => {
@@ -1201,15 +1221,15 @@ const makeMongoDBStore = async (config) => {
                 const currentBatchSize = labelAssociationBatch.items.length;
                 const totalReceived = labelAssociationBatch.totalReceived;
                 const totalProcessed = labelAssociationBatch.totalProcessed || 0;
-                console.log(`[Label Association] #${totalReceived} Added to batch (queue: ${currentBatchSize}, received: ${totalReceived}, processed: ${totalProcessed}) - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${association.messageId || 'none'}`);
+                log(`[Label Association] #${totalReceived} Added to batch (queue: ${currentBatchSize}, received: ${totalReceived}, processed: ${totalProcessed}) - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${association.messageId || 'none'}`);
                 if (currentBatchSize >= BATCH_SIZE) {
-                    console.log(`[Label Association] Batch full (${currentBatchSize}/${BATCH_SIZE}), processing immediately`);
+                    log(`[Label Association] Batch full (${currentBatchSize}/${BATCH_SIZE}), processing immediately`);
                     if (labelAssociationBatch.timer) {
                         clearTimeout(labelAssociationBatch.timer);
                         labelAssociationBatch.timer = null;
                     }
                     processBatchedLabelAssociations().catch(error => {
-                        console.error('[Label Association] Error in batch processing:', error);
+                        logError('[Label Association] Error in batch processing:', error);
                     });
                 }
                 else {
@@ -1227,19 +1247,25 @@ const makeMongoDBStore = async (config) => {
                         instanceId,
                         timestamp: Date.now()
                     }, defaultJobOptions);
-                    console.log(`[Bull Label] Delete job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`);
+                    log(`[Bull Label] Delete job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`);
                     return;
                 }
                 catch (error) {
-                    console.error('[Bull Label] Failed to queue delete job, falling back to direct deletion:', error);
+                    logError('[Bull Label] Failed to queue delete job, falling back to direct deletion:', error);
                 }
             }
-            await collections.labelAssociations.deleteOne({
+            const filter = {
                 instanceId,
                 chatId: association.chatId,
-                labelId: association.labelId,
-                messageId: 'messageId' in association ? association.messageId : ''
-            });
+                labelId: association.labelId
+            };
+            if ('messageId' in association && association.messageId) {
+                filter.messageId = association.messageId;
+            }
+            const result = await collections.labelAssociations.deleteOne(filter);
+            if (result.deletedCount === 0) {
+                logWarn(`[Direct Delete] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${association.messageId || 'none'}`);
+            }
         },
         bind(ev) {
             ev.on('connection.update', async (update) => {
@@ -1306,10 +1332,10 @@ const makeMongoDBStore = async (config) => {
                 }
                 const stats = store.getPerformanceStats();
                 if (stats.labelStats && stats.labelStats.totalReceived % 50 === 0 && stats.labelStats.totalReceived > 0) {
-                    console.log(`[Label Event] Periodic status - received: ${stats.labelStats.totalReceived}, processed: ${stats.labelStats.totalProcessed}, queued: ${stats.labelStats.currentQueueSize}`);
+                    log(`[Label Event] Periodic status - received: ${stats.labelStats.totalReceived}, processed: ${stats.labelStats.totalProcessed}, queued: ${stats.labelStats.currentQueueSize}`);
                     if (stats.labelStats.currentQueueSize > BATCH_SIZE * 2) {
-                        console.log('[Label Event] Queue backlog detected, forcing flush');
-                        store.flushLabelAssociations().catch(err => console.error('[Label Event] Flush error:', err));
+                        log('[Label Event] Queue backlog detected, forcing flush');
+                        store.flushLabelAssociations().catch(err => logError('[Label Event] Flush error:', err));
                     }
                 }
             });
@@ -1483,20 +1509,20 @@ const makeMongoDBStore = async (config) => {
             return stats;
         },
         async flushLabelAssociations() {
-            console.log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`);
+            log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`);
             if (labelAssociationBatch.timer) {
                 clearTimeout(labelAssociationBatch.timer);
                 labelAssociationBatch.timer = null;
             }
             while (labelAssociationBatch.processing) {
-                console.log('[Label Flush] Waiting for current batch to complete...');
+                log('[Label Flush] Waiting for current batch to complete...');
                 await new Promise(resolve => setTimeout(resolve, 50));
             }
             while (labelAssociationBatch.items.length > 0) {
                 await processBatchedLabelAssociations();
                 await new Promise(resolve => setTimeout(resolve, 10));
             }
-            console.log(`[Label Flush] Flush complete. Total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived}`);
+            log(`[Label Flush] Flush complete. Total processed: ${labelAssociationBatch.totalProcessed}/${labelAssociationBatch.totalReceived}`);
         },
         resetPerformanceStats() {
             performanceMetrics.messagesProcessed = 0;

@@ -17,6 +17,9 @@ async function connectWithRedisQueue() {
         instanceId: 'instance_001',
         ttlDays: 30,
         
+        // Set to 'warn' to see warnings about queue operations
+        logLevel: 'warn',
+        
         // Redis/Bull configuration
         redis: {
             // Option 1: Simple connection string
