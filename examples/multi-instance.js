@@ -1,18 +1,12 @@
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
-const { makeMongoDBStore, cleanupMongoDBStore } = require('../src')
+const { makeMongoDBStore, cleanupMongoDBStore } = require('../dist')
 const pino = require('pino')
 
 const logger = pino({ level: 'info' })
 
 // WhatsApp instance configuration
-// @typedef {Object} WhatsAppInstance
-// @property {string} id - Instance ID
-// @property {string} name - Instance name
-// @property {string} authFolder - Auth folder path
-// @property {number} ttlDays - TTL in days
-
-const instances: WhatsAppInstance[] = [
+const instances = [
     {
         id: 'support_bot',
         name: 'Customer Support',
@@ -33,54 +27,69 @@ const instances: WhatsAppInstance[] = [
     }
 ]
 
-async function createWhatsAppInstance(instance: WhatsAppInstance) {
+async function createWhatsAppInstance(instance) {
     const instanceLogger = logger.child({ instance: instance.id })
     
-    // Create MongoDB store for this instance
+    // Create MongoDB store for this instance with Redis/Bull queues
     const store = await makeMongoDBStore({
         uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
         database: 'whatsapp_multi_instance',
         instanceId: instance.id,
         ttlDays: instance.ttlDays,
-        logger: instanceLogger
+        logger: instanceLogger,
+        
+        // Redis/Bull configuration - each instance gets isolated queues
+        redis: process.env.REDIS_URL ? {
+            connection: process.env.REDIS_URL,
+            queuePrefix: 'multi-wa', // Queues will be like 'multi-wa:messages:support_bot'
+            concurrency: 25 // Lower concurrency per instance when running multiple
+        } : undefined
     })
+    
+    // Log queue status for this instance
+    const stats = store.getPerformanceStats()
+    if (stats.bullStats?.initialized) {
+        instanceLogger.info(`Bull queues active for ${instance.name}:`, {
+            queues: stats.bullStats.totalQueues,
+            redis: stats.bullStats.redisConnected,
+            queueTypes: Object.keys(stats.bullStats.queues)
+        })
+    } else {
+        instanceLogger.info(`${instance.name} - Using in-memory processing:`, {
+            reason: stats.bullStats?.reason || 'Redis not configured'
+        })
+    }
 
     instanceLogger.info(`MongoDB store created for ${instance.name}`)
 
     // Multi-file auth state per instance
     const { state, saveCreds } = await useMultiFileAuthState(instance.authFolder)
 
-    // Create socket
-    const suki = makeWASocket({
+    // Create socket for this instance
+    const sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
         logger: instanceLogger,
         getMessage: async (key) => {
-            const msg = await store.loadMessage(key.remoteJid!, key.id!)
-            return msg?.message || undefined
+            const msg = await store.loadMessage(key.remoteJid, key.id)
+            return msg?.message || null
         }
     })
 
-    // Bind store to socket events
-    store.bind(suki.ev)
+    // Bind store to this instance's events
+    store.bind(sock.ev)
 
     // Connection handler
-    suki.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update
-        
-        if (qr) {
-            instanceLogger.info(`QR Code for ${instance.name} - Scan with WhatsApp`)
-        }
-        
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update
+
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut
-            instanceLogger.info(`Connection closed for ${instance.name}`, lastDisconnect?.error)
-            
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
+            instanceLogger.info(`${instance.name} connection closed, reconnecting: ${shouldReconnect}`)
+
             if (shouldReconnect) {
-                // Reconnect with delay
+                // Recreate this instance
                 setTimeout(() => createWhatsAppInstance(instance), 5000)
-            } else {
-                await store.close()
             }
         } else if (connection === 'open') {
             instanceLogger.info(`${instance.name} connected successfully`)
@@ -88,140 +97,170 @@ async function createWhatsAppInstance(instance: WhatsAppInstance) {
             // Log instance statistics
             const chats = await store.getChats()
             const contacts = await store.getContacts()
-            instanceLogger.info(`${instance.name} stats - Chats: ${chats.length}, Contacts: ${Object.keys(contacts).length}`)
+            const currentStats = store.getPerformanceStats()
+            
+            instanceLogger.info(`${instance.name} loaded:`, {
+                chats: chats.length,
+                contacts: Object.keys(contacts).length,
+                bullActive: currentStats.bullStats?.initialized || false,
+                queuesActive: currentStats.bullStats?.totalQueues || 0
+            })
         }
     })
 
     // Save credentials
-    suki.ev.on('creds.update', saveCreds)
+    sock.ev.on('creds.update', saveCreds)
 
-    // Instance-specific message handlers
-    suki.ev.on('messages.upsert', async ({ messages, type }) => {
+    // Instance-specific message handler
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        instanceLogger.info(`${instance.name} received ${messages.length} messages (type: ${type})`)
+
         for (const msg of messages) {
             if (msg.key.fromMe) continue
-            
-            const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
-            
-            // Instance-specific logic
-            switch (instance.id) {
-                case 'support_bot':
-                    await handleSupportMessage(suki, store, msg, text)
-                    break
-                case 'sales_bot':
-                    await handleSalesMessage(suki, store, msg, text)
-                    break
-                case 'notification_bot':
-                    await handleNotificationMessage(suki, store, msg, text)
-                    break
+
+            const messageContent = msg.message?.conversation || 
+                                 msg.message?.extendedTextMessage?.text || ''
+
+            if (!messageContent) continue
+
+            // Instance-specific responses
+            if (messageContent.toLowerCase() === '!info') {
+                const stats = store.getPerformanceStats()
+                const responseText = `🤖 ${instance.name}\n\n` +
+                    `Instance ID: ${instance.id}\n` +
+                    `Queue System: ${stats.bullStats?.initialized ? 'Redis/Bull ⚡' : 'In-Memory 💾'}\n` +
+                    `Messages Processed: ${stats.messagesProcessed}\n` +
+                    `Labels Processed: ${stats.labelsProcessed}\n` +
+                    `Uptime: ${Math.floor(stats.uptime / 1000 / 60)}m`
+
+                await sock.sendMessage(msg.key.remoteJid, { text: responseText })
+            }
+
+            // Instance-specific behavior
+            if (instance.id === 'support_bot' && messageContent.toLowerCase().includes('help')) {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: '🆘 Customer Support Bot\n\nHow can I help you today? Please describe your issue.'
+                })
+            }
+
+            if (instance.id === 'sales_bot' && messageContent.toLowerCase().includes('price')) {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: '💰 Sales Bot\n\nI can help you with pricing information! What product are you interested in?'
+                })
+            }
+
+            if (instance.id === 'notification_bot') {
+                // Notification bot only sends, doesn't respond to messages
+                instanceLogger.info(`Notification received from ${msg.key.remoteJid}: ${messageContent}`)
             }
         }
     })
 
-    return { socket: suki, store, instance }
+    return { instance, sock, store }
 }
 
-// Support bot logic
-async function handleSupportMessage(socket, store, msg, text) {
-    const jid = msg.key.remoteJid!
-    
-    if (text.toLowerCase().includes('help')) {
-        await socket.sendMessage(jid, {
-            text: '🤝 Support Bot Here!\n\n' +
-                  'How can I help you today?\n' +
-                  '1. Technical Issues\n' +
-                  '2. Account Problems\n' +
-                  '3. General Questions\n\n' +
-                  'Reply with the number of your choice.'
+// Monitor all instances
+function setupMultiInstanceMonitoring(instanceData) {
+    setInterval(() => {
+        logger.info('📊 Multi-Instance Status Report:')
+        
+        instanceData.forEach(({ instance, store }) => {
+            const stats = store.getPerformanceStats()
+            
+            logger.info(`  ${instance.name} (${instance.id}):`, {
+                messages: stats.messagesProcessed,
+                labels: stats.labelsProcessed,
+                errors: stats.errors,
+                bullActive: stats.bullStats?.initialized || false,
+                redisConnected: stats.bullStats?.redisConnected,
+                uptime: Math.floor(stats.uptime / 1000 / 60) + 'm'
+            })
         })
-    }
-    
-    // Store support ticket info
-    const chat = await store.getChat(jid)
-    if (chat) {
-        await store.updateChat(jid, {
-            ...chat,
-            name: chat.name || 'Support Ticket'
-        })
-    }
+    }, 5 * 60 * 1000) // Every 5 minutes
 }
 
-// Sales bot logic
-async function handleSalesMessage(socket, store, msg, text) {
-    const jid = msg.key.remoteJid!
-    
-    if (text.toLowerCase().includes('price') || text.toLowerCase().includes('buy')) {
-        await socket.sendMessage(jid, {
-            text: '💰 Sales Bot Here!\n\n' +
-                  'Our current offers:\n' +
-                  '• Basic Plan: $9.99/month\n' +
-                  '• Pro Plan: $19.99/month\n' +
-                  '• Enterprise: Contact us\n\n' +
-                  'Would you like more information?'
-        })
-    }
-}
-
-// Notification bot logic
-async function handleNotificationMessage(socket, store, msg, text) {
-    const jid = msg.key.remoteJid!
-    
-    // Notification bot typically doesn't respond to messages
-    // It just sends notifications
-    logger.info(`Notification bot received message from ${jid}: ${text}`)
-}
-
-// Start all instances
+// Main function to start all instances
 async function startAllInstances() {
-    logger.info('Starting all WhatsApp instances...')
+    console.log('🚀 Starting Multi-Instance WhatsApp Bots with Redis/Bull Queues\n')
     
-    const activeInstances = []
+    console.log('📋 Configuration:')
+    console.log(`  MongoDB: ${process.env.MONGODB_URI || 'mongodb://localhost:27017'}`)
+    console.log(`  Redis: ${process.env.REDIS_URL || 'Not configured (will use in-memory)'}`)
+    console.log(`  Instances: ${instances.length}\n`)
     
+    const instanceData = []
+
+    // Create all instances
     for (const instance of instances) {
         try {
-            const whatsappInstance = await createWhatsAppInstance(instance)
-            activeInstances.push(whatsappInstance)
-            logger.info(`Started instance: ${instance.name}`)
+            logger.info(`Creating instance: ${instance.name}`)
+            const data = await createWhatsAppInstance(instance)
+            instanceData.push(data)
             
-            // Add delay between instances to avoid rate limiting
-            await new Promise(resolve => setTimeout(resolve, 3000))
+            // Small delay between instances
+            await new Promise(resolve => setTimeout(resolve, 2000))
         } catch (error) {
-            logger.error(`Failed to start ${instance.name}:`, error)
+            logger.error(`Failed to create instance ${instance.name}:`, error)
         }
     }
-    
-    logger.info(`Successfully started ${activeInstances.length} instances`)
-    
+
+    logger.info(`Successfully created ${instanceData.length}/${instances.length} instances`)
+
+    // Setup monitoring
+    setupMultiInstanceMonitoring(instanceData)
+
     // Graceful shutdown
     process.on('SIGINT', async () => {
         logger.info('Shutting down all instances...')
-        
-        // Cleanup all MongoDB connections
-        await cleanupMongoDBStore()
-        
+
+        for (const { instance, sock, store } of instanceData) {
+            try {
+                logger.info(`Shutting down ${instance.name}...`)
+                
+                // Close socket
+                sock.end()
+                
+                // Flush pending operations
+                await store.flushLabelAssociations()
+                
+                // Close store (includes Bull queues)
+                await store.close()
+                
+                logger.info(`${instance.name} shut down successfully`)
+            } catch (error) {
+                logger.error(`Error shutting down ${instance.name}:`, error)
+            }
+        }
+
+        logger.info('All instances shut down')
         process.exit(0)
     })
-}
 
-// Example: Send notification from notification bot
-async function sendBulkNotification(socket, store, message) {
-    const chats = await store.getChats()
-    const eligibleChats = chats.filter(chat => !chat.archived && chat.id.includes('@s.whatsapp.net'))
-    
-    logger.info(`Sending notification to ${eligibleChats.length} contacts`)
-    
-    for (const chat of eligibleChats) {
-        try {
-            await socket.sendMessage(chat.id, { text: message })
-            // Add delay to avoid rate limiting
-            await new Promise(resolve => setTimeout(resolve, 1000))
-        } catch (error) {
-            logger.error(`Failed to send notification to ${chat.id}:`, error)
+    // Handle cleanup signal
+    process.on('SIGUSR1', async () => {
+        logger.info('Cleaning up all instance data...')
+        
+        for (const { instance } of instanceData) {
+            await cleanupMongoDBStore(instance.id, true)
+            logger.info(`Cleaned up data for ${instance.name}`)
         }
-    }
+    })
+
+    return instanceData
 }
 
-// Start the multi-instance bot
-startAllInstances().catch((err) => {
-    logger.error('Failed to start instances:', err)
-    process.exit(1)
-})
+// Export for testing
+module.exports = { 
+    createWhatsAppInstance, 
+    startAllInstances, 
+    setupMultiInstanceMonitoring,
+    instances 
+}
+
+// Run if called directly
+if (require.main === module) {
+    startAllInstances().catch(error => {
+        logger.error('Failed to start instances:', error)
+        process.exit(1)
+    })
+}

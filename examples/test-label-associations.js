@@ -1,4 +1,4 @@
-const { makeMongoDBStore } = require('../lib/makeMongoDBStore')
+const { makeMongoDBStore } = require('../dist')
 const { MongoClient } = require('mongodb')
 
 async function testLabelAssociations() {
@@ -8,8 +8,21 @@ async function testLabelAssociations() {
     const store = await makeMongoDBStore({
         uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
         database: 'baileys_test',
-        instanceId: 'test_instance_' + Date.now()
+        instanceId: 'test_instance_' + Date.now(),
+        
+        // Enable Redis/Bull for testing - label associations use concurrency: 1
+        redis: process.env.REDIS_URL ? {
+            connection: process.env.REDIS_URL,
+            queuePrefix: 'label-test',
+            concurrency: 50 // All queues except label associations
+        } : undefined
     })
+    
+    const stats = store.getPerformanceStats()
+    console.log('Queue system:', stats.bullStats?.initialized ? 'Redis/Bull' : 'In-Memory')
+    if (stats.bullStats?.initialized) {
+        console.log('Label association processing: Sequential (concurrency: 1)')
+    }
     
     // Simulate 109 label associations being added rapidly
     const totalAssociations = 109

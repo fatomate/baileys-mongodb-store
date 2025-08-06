@@ -1,24 +1,45 @@
 /**
  * Complete example showing MongoDB store usage with Baileys
- * Similar to @baileys/redis-auth-state pattern
+ * Now includes Redis/Bull queue integration for production reliability
  */
 
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
-const { makeMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
+const { makeMongoDBStore, cleanupMongoDBStore } = require('../dist')
 const pino = require('pino')
 
 const logger = pino({ level: 'info' })
 
 async function connectToWhatsApp() {
-    // MongoDB store configuration
+    // MongoDB store configuration with Redis/Bull queues
     const store = await makeMongoDBStore({
         uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
         database: process.env.MONGODB_DB || 'whatsapp_bot',
         instanceId: process.env.INSTANCE_ID || 'main_instance',
         ttlDays: parseInt(process.env.TTL_DAYS) || 30,
-        logger: logger.child({ module: 'mongodb-store' })
+        logger: logger.child({ module: 'mongodb-store' }),
+        
+        // Redis/Bull configuration for production reliability
+        redis: process.env.REDIS_URL ? {
+            connection: process.env.REDIS_URL,
+            queuePrefix: 'wa-bot',
+            concurrency: parseInt(process.env.QUEUE_CONCURRENCY) || 50
+        } : undefined
     })
+
+    // Check if Bull queues are active
+    const stats = store.getPerformanceStats()
+    if (stats.bullStats?.initialized) {
+        logger.info('🚀 Redis/Bull queues initialized successfully', {
+            totalQueues: stats.bullStats.totalQueues,
+            redisConnected: stats.bullStats.redisConnected,
+            queues: Object.keys(stats.bullStats.queues)
+        })
+    } else {
+        logger.info('💾 Using in-memory processing', {
+            reason: stats.bullStats?.reason || 'Redis not configured'
+        })
+    }
 
     logger.info('MongoDB store initialized')
 
@@ -54,6 +75,9 @@ async function connectToWhatsApp() {
 
             if (shouldReconnect) {
                 connectToWhatsApp()
+            } else {
+                // Graceful shutdown on logout
+                await store.close()
             }
         } else if (connection === 'open') {
             logger.info('WhatsApp connection opened successfully')
@@ -61,6 +85,15 @@ async function connectToWhatsApp() {
             // Example: Access store data
             const chats = await store.getChats()
             logger.info(`Loaded ${chats.length} chats from MongoDB`)
+            
+            // Log queue statistics
+            const currentStats = store.getPerformanceStats()
+            logger.info('Store statistics:', {
+                messagesProcessed: currentStats.messagesProcessed,
+                labelsProcessed: currentStats.labelsProcessed,
+                errors: currentStats.errors,
+                uptime: Math.floor(currentStats.uptime / 1000) + 's'
+            })
         }
     })
 
@@ -92,14 +125,38 @@ async function connectToWhatsApp() {
             if (messageContent.toLowerCase() === '!stats') {
                 const chats = await store.getChats()
                 const contacts = await store.getContacts()
+                const storeStats = store.getPerformanceStats()
                 
-                await sock.sendMessage(msg.key.remoteJid, { 
-                    text: `📊 Bot Statistics:\n\n` +
-                          `• Active Chats: ${chats.length}\n` +
-                          `• Saved Contacts: ${Object.keys(contacts).length}\n` +
-                          `• Instance ID: ${store.instanceId}\n` +
-                          `• Using MongoDB Store ✅`
-                })
+                const statsText = `📊 Bot Statistics:\n\n` +
+                    `• Active Chats: ${chats.length}\n` +
+                    `• Saved Contacts: ${Object.keys(contacts).length}\n` +
+                    `• Instance ID: ${store.instanceId}\n` +
+                    `• Messages Processed: ${storeStats.messagesProcessed}\n` +
+                    `• Labels Processed: ${storeStats.labelsProcessed}\n` +
+                    `• Queue System: ${storeStats.bullStats?.initialized ? 'Redis/Bull ⚡' : 'In-Memory 💾'}\n` +
+                    `• Errors: ${storeStats.errors}\n` +
+                    `• Uptime: ${Math.floor(storeStats.uptime / 1000 / 60)}m`
+                
+                await sock.sendMessage(msg.key.remoteJid, { text: statsText })
+            }
+
+            if (messageContent.toLowerCase() === '!queues') {
+                const storeStats = store.getPerformanceStats()
+                
+                if (storeStats.bullStats?.initialized) {
+                    const queueText = `🔄 Queue Status:\n\n` +
+                        `• Redis Connected: ${storeStats.bullStats.redisConnected ? '✅' : '❌'}\n` +
+                        `• Total Queues: ${storeStats.bullStats.totalQueues}\n` +
+                        `• Queue Types: ${Object.keys(storeStats.bullStats.queues).join(', ')}\n` +
+                        `• Label Associations: ${storeStats.labelStats.totalProcessed} processed\n` +
+                        `• Current Queue Size: ${storeStats.labelStats.currentQueueSize}`
+                    
+                    await sock.sendMessage(msg.key.remoteJid, { text: queueText })
+                } else {
+                    await sock.sendMessage(msg.key.remoteJid, { 
+                        text: `💾 In-Memory Mode\n\nReason: ${storeStats.bullStats?.reason || 'Redis not configured'}` 
+                    })
+                }
             }
 
             if (messageContent.toLowerCase() === '!help') {
@@ -107,6 +164,7 @@ async function connectToWhatsApp() {
                     text: `🤖 Available Commands:\n\n` +
                           `!ping - Check if bot is online\n` +
                           `!stats - View bot statistics\n` +
+                          `!queues - View queue status\n` +
                           `!help - Show this help message`
                 })
             }
@@ -128,7 +186,55 @@ async function connectToWhatsApp() {
         logger.info(`${updates.length} chats updated`)
     })
 
+    // Labels update handler (shows Bull queue in action)
+    sock.ev.on('labels.association', ({ type, association }) => {
+        logger.info(`Label ${type}: ${association.labelId} -> ${association.chatId}`, {
+            queuedToBull: stats.bullStats?.initialized || false
+        })
+    })
+
+    // Set up performance monitoring
+    setupPerformanceMonitoring(store, logger)
+
     return { sock, store }
+}
+
+// Performance monitoring function
+function setupPerformanceMonitoring(store, logger) {
+    // Log performance stats every 5 minutes
+    setInterval(() => {
+        const stats = store.getPerformanceStats()
+        
+        if (stats.messagesProcessed > 0 || stats.labelsProcessed > 0) {
+            logger.info('📈 Performance Report', {
+                messages: stats.messagesProcessed,
+                labels: stats.labelsProcessed,
+                batches: stats.batchesProcessed,
+                errors: stats.errors,
+                uptime: Math.floor(stats.uptime / 1000 / 60) + 'm',
+                bullActive: stats.bullStats?.initialized || false,
+                redisConnected: stats.bullStats?.redisConnected
+            })
+        }
+    }, 5 * 60 * 1000) // Every 5 minutes
+
+    // Health check every minute
+    setInterval(() => {
+        const stats = store.getPerformanceStats()
+        
+        // Alert if Redis disconnected
+        if (stats.bullStats?.initialized && !stats.bullStats.redisConnected) {
+            logger.warn('🚨 Redis connection lost - running in fallback mode')
+        }
+        
+        // Alert if error rate is high
+        if (stats.errors > 0 && stats.messagesProcessed > 0) {
+            const errorRate = (stats.errors / stats.messagesProcessed) * 100
+            if (errorRate > 1) {
+                logger.warn(`⚠️ High error rate: ${errorRate.toFixed(2)}%`)
+            }
+        }
+    }, 60 * 1000) // Every minute
 }
 
 // Main function
@@ -140,20 +246,22 @@ async function main() {
         process.on('SIGINT', async () => {
             logger.info('Shutting down gracefully...')
             
-            // Close socket
-            sock.end()
-            
-            // Option 1: Just close connection
-            // await cleanupMongoDBStore(store.instanceId)
-            
-            // Option 2: Delete all data for this instance and close
-            // await cleanupMongoDBStore(store.instanceId, true)
-            
-            // Option 3: Close all connections (default)
-            await cleanupMongoDBStore()
-            
-            logger.info('Shutdown complete')
-            process.exit(0)
+            try {
+                // Flush any pending operations
+                await store.flushLabelAssociations()
+                
+                // Close socket
+                sock.end()
+                
+                // Close store (includes Bull queues)
+                await store.close()
+                
+                logger.info('Shutdown complete')
+                process.exit(0)
+            } catch (error) {
+                logger.error('Error during shutdown:', error)
+                process.exit(1)
+            }
         })
 
         // Example: Cleanup specific instance on demand
@@ -166,6 +274,11 @@ async function main() {
         // Error handler
         process.on('unhandledRejection', (err) => {
             logger.error('Unhandled rejection:', err)
+            // Don't exit immediately, let health checks handle it
+        })
+
+        process.on('uncaughtException', (err) => {
+            logger.error('Uncaught exception:', err)
             process.exit(1)
         })
 
@@ -175,5 +288,25 @@ async function main() {
     }
 }
 
-// Run the bot
-main()
+// Environment variable guide
+if (require.main === module) {
+    console.log('🚀 Starting WhatsApp Bot with MongoDB Store + Redis/Bull Queues\n')
+    
+    console.log('📋 Environment Variables:')
+    console.log('  MONGODB_URI     - MongoDB connection string')
+    console.log('  MONGODB_DB      - Database name')
+    console.log('  REDIS_URL       - Redis connection string (optional)')
+    console.log('  INSTANCE_ID     - Unique instance identifier')
+    console.log('  TTL_DAYS        - Data retention period')
+    console.log('  QUEUE_CONCURRENCY - Queue processing concurrency\n')
+    
+    if (!process.env.REDIS_URL) {
+        console.log('ℹ️  Redis not configured - will use in-memory processing')
+        console.log('   For production, set REDIS_URL for better reliability\n')
+    }
+    
+    // Run the bot
+    main()
+}
+
+module.exports = { connectToWhatsApp, setupPerformanceMonitoring }
