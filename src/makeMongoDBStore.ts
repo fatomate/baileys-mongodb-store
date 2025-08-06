@@ -13,6 +13,8 @@ import { jidNormalizedUser, updateMessageWithReceipt, updateMessageWithReaction,
 import type { Label } from 'baileys/lib/Types/Label'
 import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 import type { MongoDBStoreConfig, MongoDBStore } from './types'
+import NodeCache from 'node-cache'
+import PQueue from 'p-queue'
 
 const DEFAULT_TTL_DAYS = 30
 
@@ -24,6 +26,68 @@ interface ActiveConnection {
 }
 
 let activeConnections: ActiveConnection[] = []
+
+// Cache for Binary conversions (TTL: 5 minutes, check period: 60 seconds)
+const binaryConversionCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+
+// Queue configuration for concurrent operations
+const QUEUE_CONCURRENCY = 50 // Process up to 50 operations concurrently
+const BATCH_SIZE = 100 // Batch size for bulk operations
+const BATCH_DELAY = 50 // Delay in ms between batches to avoid overwhelming MongoDB
+
+// Batch accumulator for label associations
+interface BatchAccumulator<T> {
+    items: T[]
+    timer: NodeJS.Timeout | null
+    processing: boolean
+}
+
+// Performance tracking
+interface PerformanceMetrics {
+    messagesProcessed: number
+    labelsProcessed: number
+    batchesProcessed: number
+    errors: number
+    lastResetTime: Date
+}
+
+const performanceMetrics: PerformanceMetrics = {
+    messagesProcessed: 0,
+    labelsProcessed: 0,
+    batchesProcessed: 0,
+    errors: 0,
+    lastResetTime: new Date()
+}
+
+// Helper function to convert MongoDB Binary objects to Buffers with error handling
+const convertBinaryToBuffer = (obj: any): any => {
+    try {
+        if (!obj || typeof obj !== 'object') return obj
+        
+        // Handle Binary objects
+        if (obj.buffer && obj._bsontype === 'Binary') {
+            return Buffer.from(obj.buffer)
+        }
+        
+        // Handle arrays
+        if (Array.isArray(obj)) {
+            return obj.map(item => convertBinaryToBuffer(item))
+        }
+        
+        // Handle nested objects
+        const result: any = {}
+        for (const key in obj) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                result[key] = convertBinaryToBuffer(obj[key])
+            }
+        }
+        return result
+    } catch (error) {
+        console.error('Error converting Binary to Buffer:', error)
+        return obj // Return original object if conversion fails
+    }
+}
+
 
 interface MongoCollections {
     chats: Collection<Chat & { instanceId: string; updatedAt: Date }>
@@ -45,7 +109,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         collectionPrefix = 'baileys_'
     } = config
 
-    const client = new MongoClient(uri)
+    const client = new MongoClient(uri, {
+        // Optimize connection pool for high concurrency
+        maxPoolSize: 100,
+        minPoolSize: 10,
+        maxIdleTimeMS: 30000,
+        // Write concern for better performance
+        writeConcern: { w: 1, j: false }
+    })
     await client.connect()
     activeConnections.push({
         client,
@@ -55,6 +126,24 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     })
     
     const db: Db = client.db(dbName)
+    
+    // Create queues for different operation types
+    const messageQueue = new PQueue({ concurrency: QUEUE_CONCURRENCY })
+    const labelQueue = new PQueue({ concurrency: QUEUE_CONCURRENCY })
+    const generalQueue = new PQueue({ concurrency: QUEUE_CONCURRENCY })
+    
+    // Batch accumulators
+    const labelAssociationBatch: BatchAccumulator<LabelAssociation> = {
+        items: [],
+        timer: null,
+        processing: false
+    }
+    
+    const messageBatch: BatchAccumulator<proto.IWebMessageInfo & { jid: string }> = {
+        items: [],
+        timer: null,
+        processing: false
+    }
     
     // Create collections with TTL indexes
     const collections: MongoCollections = {
@@ -68,6 +157,125 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
     }
 
+    // Batch processing functions
+    const processBatchedLabelAssociations = async () => {
+        if (labelAssociationBatch.processing || labelAssociationBatch.items.length === 0) return
+        
+        labelAssociationBatch.processing = true
+        const itemsToProcess = [...labelAssociationBatch.items]
+        labelAssociationBatch.items = []
+        
+        try {
+            const bulkOps = itemsToProcess.map(association => ({
+                replaceOne: {
+                    filter: {
+                        instanceId,
+                        chatId: association.chatId,
+                        labelId: association.labelId,
+                        messageId: 'messageId' in association ? association.messageId : ''
+                    },
+                    replacement: {
+                        ...association,
+                        instanceId,
+                        updatedAt: new Date()
+                    },
+                    upsert: true
+                }
+            }))
+            
+            // Process in chunks to avoid overwhelming MongoDB
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const chunk = bulkOps.slice(i, i + BATCH_SIZE)
+                await collections.labelAssociations.bulkWrite(chunk, { ordered: false })
+                
+                // Small delay between chunks
+                if (i + BATCH_SIZE < bulkOps.length) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
+                }
+            }
+            
+            performanceMetrics.labelsProcessed += itemsToProcess.length
+            performanceMetrics.batchesProcessed++
+        } catch (error) {
+            console.error('Error processing label associations batch:', error)
+            performanceMetrics.errors++
+        } finally {
+            labelAssociationBatch.processing = false
+        }
+    }
+    
+    const processBatchedMessages = async () => {
+        if (messageBatch.processing || messageBatch.items.length === 0) return
+        
+        messageBatch.processing = true
+        const itemsToProcess = [...messageBatch.items]
+        messageBatch.items = []
+        
+        try {
+            const bulkOps = itemsToProcess.map(({ jid, ...message }) => ({
+                replaceOne: {
+                    filter: {
+                        instanceId,
+                        jid,
+                        'key.id': message.key?.id
+                    },
+                    replacement: {
+                        ...message,
+                        instanceId,
+                        jid,
+                        updatedAt: new Date()
+                    },
+                    upsert: true
+                }
+            }))
+            
+            // Process in chunks
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const chunk = bulkOps.slice(i, i + BATCH_SIZE)
+                await collections.messages.bulkWrite(chunk, { ordered: false })
+                
+                // Clear cache for these messages
+                chunk.forEach(op => {
+                    const msgId = op.replaceOne.filter['key.id']
+                    const msgJid = op.replaceOne.filter.jid
+                    const cacheKey = `msg_${instanceId}_${msgJid}_${msgId}`
+                    binaryConversionCache.del(cacheKey)
+                })
+                
+                if (i + BATCH_SIZE < bulkOps.length) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
+                }
+            }
+            
+            performanceMetrics.messagesProcessed += itemsToProcess.length
+            performanceMetrics.batchesProcessed++
+        } catch (error) {
+            console.error('Error processing messages batch:', error)
+            performanceMetrics.errors++
+        } finally {
+            messageBatch.processing = false
+        }
+    }
+    
+    // Schedule batch processing
+    const scheduleLabelBatch = () => {
+        if (labelAssociationBatch.timer) {
+            clearTimeout(labelAssociationBatch.timer)
+        }
+        labelAssociationBatch.timer = setTimeout(() => {
+            processBatchedLabelAssociations()
+        }, 100) // Process after 100ms of inactivity
+    }
+    
+    const scheduleMessageBatch = () => {
+        if (messageBatch.timer) {
+            clearTimeout(messageBatch.timer)
+        }
+        messageBatch.timer = setTimeout(() => {
+            processBatchedMessages()
+        }, 100)
+    }
+    
     // Create indexes
     const createIndexes = async () => {
         // TTL indexes for automatic expiration
@@ -123,14 +331,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .sort({ conversationTimestamp: -1 })
                 .toArray()
             
-            return chats.map(({ _id, instanceId, updatedAt, ...chat }) => chat as Chat)
+            return chats.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...chat }) => chat as Chat)
         },
 
         async getChat(jid: string): Promise<Chat | null> {
             const chat = await collections.chats.findOne({ instanceId, id: jid })
             if (!chat) return null
             
-            const { _id, instanceId: _, updatedAt, ...chatData } = chat
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...chatData } = chat
             return chatData as Chat
         },
 
@@ -173,7 +381,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             const contactsMap: { [id: string]: Contact } = {}
             for (const contact of contacts) {
-                const { _id, instanceId, updatedAt, ...contactData } = contact
+                const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact
                 contactsMap[contact.id] = contactData as Contact
             }
             
@@ -184,7 +392,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const contact = await collections.contacts.findOne({ instanceId, id: jid })
             if (!contact) return null
             
-            const { _id, instanceId: _, updatedAt, ...contactData } = contact
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact
             return contactData as Contact
         },
 
@@ -199,7 +407,18 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 }
             }))
             
-            await collections.contacts.bulkWrite(bulkOps)
+            // Process in chunks for large contact lists
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const chunk = bulkOps.slice(i, i + BATCH_SIZE)
+                await generalQueue.add(async () => {
+                    await collections.contacts.bulkWrite(chunk, { ordered: false })
+                })
+                
+                // Small delay between chunks for very large imports
+                if (i + BATCH_SIZE < bulkOps.length && bulkOps.length > 1000) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
+                }
+            }
         },
 
         async getMessages(jid: string): Promise<proto.IWebMessageInfo[]> {
@@ -208,12 +427,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .sort({ messageTimestamp: -1 })
                 .toArray()
             
-            return messages.map(({ _id, instanceId, jid, updatedAt, ...msg }) => 
-                proto.WebMessageInfo.fromObject(msg)
-            )
+            // Convert Binary objects and preserve messageContextInfo
+            return messages.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg))
         },
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
+            // Check cache first
+            const cacheKey = `msg_${instanceId}_${jid}_${id}`
+            const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
+            if (cached) return cached
+            
             const message = await collections.messages.findOne({
                 instanceId,
                 jid,
@@ -222,28 +445,58 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             if (!message) return null
             
-            const { _id, instanceId: _, jid: __, updatedAt, ...msg } = message
-            return proto.WebMessageInfo.fromObject(msg)
+            const { _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg } = message
+            // Convert all MongoDB Binary objects to Buffers and preserve messageContextInfo
+            const converted = convertBinaryToBuffer(msg)
+            
+            // Cache the converted message
+            binaryConversionCache.set(cacheKey, converted)
+            
+            return converted
         },
 
-        async upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void> {
-            await collections.messages.replaceOne(
-                {
-                    instanceId,
-                    jid,
-                    'key.id': message.key?.id
-                },
-                {
-                    ...message,
-                    instanceId,
-                    jid,
-                    updatedAt: new Date()
-                },
-                { upsert: true }
-            )
+        async upsertMessage(jid: string, message: proto.IWebMessageInfo, useBatch: boolean = false): Promise<void> {
+            if (useBatch) {
+                // Add to batch for processing
+                messageBatch.items.push({ ...message, jid })
+                scheduleMessageBatch()
+                
+                // Force process if batch is full
+                if (messageBatch.items.length >= BATCH_SIZE) {
+                    await processBatchedMessages()
+                }
+            } else {
+                // Invalidate cache for this message
+                const cacheKey = `msg_${instanceId}_${jid}_${message.key?.id}`
+                binaryConversionCache.del(cacheKey)
+                
+                await messageQueue.add(async () => {
+                    await collections.messages.replaceOne(
+                        {
+                            instanceId,
+                            jid,
+                            'key.id': message.key?.id
+                        },
+                        {
+                            ...message,
+                            instanceId,
+                            jid,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
+                })
+            }
         },
 
         async updateMessage(jid: string, id: string, update: Partial<proto.IWebMessageInfo>): Promise<boolean> {
+            // Invalidate cache for this message
+            const cacheKey = `msg_${instanceId}_${jid}_${id}`
+            binaryConversionCache.del(cacheKey)
+            
+            // Ensure Binary objects remain as Buffers during updates
+            const processedUpdate = convertBinaryToBuffer(update)
+            
             const result = await collections.messages.updateOne(
                 {
                     instanceId,
@@ -251,7 +504,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     'key.id': id
                 },
                 {
-                    $set: { ...update, updatedAt: new Date() }
+                    $set: { ...processedUpdate, updatedAt: new Date() }
                 }
             )
             
@@ -259,6 +512,22 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async deleteMessages(jid: string, ids?: string[]): Promise<void> {
+            // Clear cache for deleted messages
+            if (ids && ids.length > 0) {
+                ids.forEach(id => {
+                    const cacheKey = `msg_${instanceId}_${jid}_${id}`
+                    binaryConversionCache.del(cacheKey)
+                })
+            } else {
+                // Clear all cache entries for this jid if deleting all messages
+                const keys = binaryConversionCache.keys()
+                keys.forEach(key => {
+                    if (key.startsWith(`msg_${instanceId}_${jid}_`)) {
+                        binaryConversionCache.del(key)
+                    }
+                })
+            }
+            
             const filter: any = { instanceId, jid }
             
             if (ids && ids.length > 0) {
@@ -272,7 +541,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const metadata = await collections.groupMetadata.findOne({ instanceId, id: jid })
             if (!metadata) return null
             
-            const { _id, instanceId: _, updatedAt, ...metadataData } = metadata
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...metadataData } = metadata
             return metadataData as GroupMetadata
         },
 
@@ -288,7 +557,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const state = await collections.state.findOne({ instanceId })
             if (!state) return { connection: 'close' }
             
-            const { _id, instanceId: _, updatedAt, ...stateData } = state
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...stateData } = state
             return stateData as ConnectionState
         },
 
@@ -332,7 +601,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             const labelsMap: { [id: string]: Label } = {}
             for (const label of labels) {
-                const { _id, instanceId, updatedAt, ...labelData } = label
+                const { _id: _1, instanceId: _2, updatedAt: _3, ...labelData } = label
                 labelsMap[label.id] = labelData as Label
             }
             
@@ -356,7 +625,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .find({ instanceId })
                 .toArray()
             
-            return associations.map(({ _id, instanceId, updatedAt, ...assoc }) => assoc as LabelAssociation)
+            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc as LabelAssociation)
         },
 
         async getChatLabels(chatId: string): Promise<LabelAssociation[]> {
@@ -364,7 +633,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .find({ instanceId, chatId })
                 .toArray()
             
-            return associations.map(({ _id, instanceId, updatedAt, ...assoc }) => assoc as LabelAssociation)
+            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc as LabelAssociation)
         },
 
         async getMessageLabels(messageId: string): Promise<string[]> {
@@ -376,20 +645,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async upsertLabelAssociation(association: LabelAssociation): Promise<void> {
-            await collections.labelAssociations.replaceOne(
-                {
-                    instanceId,
-                    chatId: association.chatId,
-                    labelId: association.labelId,
-                    messageId: 'messageId' in association ? association.messageId : ''
-                },
-                {
-                    ...association,
-                    instanceId,
-                    updatedAt: new Date()
-                },
-                { upsert: true }
-            )
+            // Always use batching for label associations as they come in bulk
+            labelAssociationBatch.items.push(association)
+            scheduleLabelBatch()
+            
+            // Force process if batch is full
+            if (labelAssociationBatch.items.length >= BATCH_SIZE) {
+                await processBatchedLabelAssociations()
+            }
         },
 
         async deleteLabelAssociation(association: LabelAssociation): Promise<void> {
@@ -411,20 +674,32 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     await store.clearAll()
                 }
                 
+                // Process in parallel with proper queue management
+                const promises: Promise<void>[] = []
+                
                 if (newChats?.length) {
-                    await store.upsertChats(...newChats)
+                    promises.push(generalQueue.add(async () => {
+                        await store.upsertChats(...newChats)
+                    }))
                 }
                 
                 if (newContacts?.length) {
-                    await store.upsertContacts(newContacts)
+                    promises.push(generalQueue.add(async () => {
+                        await store.upsertContacts(newContacts)
+                    }))
                 }
                 
                 if (newMessages?.length) {
+                    // Use batch processing for messages
                     for (const msg of newMessages) {
                         const jid = msg.key.remoteJid!
-                        await store.upsertMessage(jid, msg)
+                        await store.upsertMessage(jid, msg, true) // Use batch mode
                     }
+                    // Force process any remaining messages
+                    await processBatchedMessages()
                 }
+                
+                await Promise.all(promises)
             })
 
             ev.on('contacts.upsert', async contacts => {
@@ -569,7 +844,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
         async loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]> {
             const mode = !cursor || 'before' in cursor ? 'before' : 'after'
-            const cursorKey = !!cursor ? ('before' in cursor ? cursor.before : cursor.after) : undefined
+            const cursorKey = cursor ? ('before' in cursor ? cursor.before : cursor.after) : undefined
             
             let messages: proto.IWebMessageInfo[] = []
             
@@ -588,9 +863,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     .sort({ messageTimestamp: -1 })
                     .limit(count)
                     .toArray()
-                    .then(msgs => msgs.map(({ _id, instanceId, jid, updatedAt, ...msg }) => 
-                        proto.WebMessageInfo.fromObject(msg)
-                    ))
+                    .then(msgs => msgs.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg)))
             }
             
             return messages
@@ -607,6 +880,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async clearAll(): Promise<void> {
+            // Clear all cache entries for this instance
+            const keys = binaryConversionCache.keys()
+            keys.forEach(key => {
+                if (key.startsWith(`msg_${instanceId}_`)) {
+                    binaryConversionCache.del(key)
+                }
+            })
+            
             await Promise.all([
                 collections.chats.deleteMany({ instanceId }),
                 collections.contacts.deleteMany({ instanceId }),
@@ -618,7 +899,50 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             ])
         },
 
+        getPerformanceStats(): PerformanceMetrics & { uptime: number } {
+            const uptime = Date.now() - performanceMetrics.lastResetTime.getTime()
+            return {
+                ...performanceMetrics,
+                uptime
+            }
+        },
+        
+        resetPerformanceStats(): void {
+            performanceMetrics.messagesProcessed = 0
+            performanceMetrics.labelsProcessed = 0
+            performanceMetrics.batchesProcessed = 0
+            performanceMetrics.errors = 0
+            performanceMetrics.lastResetTime = new Date()
+        },
+        
         async close(): Promise<void> {
+            // Process any remaining batches
+            await processBatchedLabelAssociations()
+            await processBatchedMessages()
+            
+            // Clear all timers
+            if (labelAssociationBatch.timer) {
+                clearTimeout(labelAssociationBatch.timer)
+            }
+            if (messageBatch.timer) {
+                clearTimeout(messageBatch.timer)
+            }
+            
+            // Wait for all queues to finish
+            await Promise.all([
+                messageQueue.onIdle(),
+                labelQueue.onIdle(),
+                generalQueue.onIdle()
+            ])
+            
+            // Clear all cache entries for this instance
+            const keys = binaryConversionCache.keys()
+            keys.forEach(key => {
+                if (key.startsWith(`msg_${instanceId}_`)) {
+                    binaryConversionCache.del(key)
+                }
+            })
+            
             await client.close()
             activeConnections = activeConnections.filter(c => c.client !== client)
         }

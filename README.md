@@ -1,6 +1,14 @@
 # Baileys MongoDB Store
 
-A MongoDB store implementation for [Baileys](https://github.com/WhiskeySockets/Baileys) WhatsApp Web API with multi-instance support and automatic TTL (Time To Live) for data expiration.
+A high-performance MongoDB store implementation for [Baileys](https://github.com/WhiskeySockets/Baileys) WhatsApp Web API with multi-instance support, automatic TTL (Time To Live) for data expiration, and optimized for handling thousands of concurrent operations.
+
+## 🆕 What's New
+
+- **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes
+- **Automatic Batch Processing**: Label associations and bulk messages are automatically batched
+- **Performance Monitoring**: New `getPerformanceStats()` and `resetPerformanceStats()` methods
+- **Enhanced Binary Handling**: Improved handling of MongoDB Binary objects for poll decryption
+- **Smart Caching**: Automatic caching with invalidation for better performance
 
 ## Features
 
@@ -11,6 +19,11 @@ A MongoDB store implementation for [Baileys](https://github.com/WhiskeySockets/B
 - 🔄 Real-time event binding support
 - 💾 Persistent storage across restarts
 - 🎯 TypeScript support with full type definitions
+- 🏎️ High-performance batch processing for bulk operations
+- 📊 Built-in performance monitoring and metrics
+- 🔧 Optimized for handling thousands of concurrent operations
+- 💪 Smart caching with automatic invalidation
+- 🎮 Connection pooling and queue management
 
 ## Installation
 
@@ -311,12 +324,71 @@ async function switchInstance(oldInstanceId, newInstanceId) {
 }
 ```
 
+## Performance Features
+
+### High-Performance Architecture
+
+The store is optimized to handle high-load WhatsApp accounts with thousands of messages and labels:
+
+1. **Automatic Batch Processing**: Label associations and messages are automatically batched for optimal performance
+2. **Queue Management**: Concurrent operations are managed through queues with configurable concurrency (50 operations by default)
+3. **Smart Caching**: Binary conversions are cached for 5 minutes with automatic invalidation
+4. **Connection Pooling**: Optimized MongoDB connection pool (100 max, 10 min connections)
+5. **Chunk Processing**: Large operations are processed in chunks of 100 items with delays to prevent overwhelming MongoDB
+
+### Performance Monitoring
+
+Monitor your store's performance in real-time:
+
+```javascript
+// Get performance statistics
+const stats = store.getPerformanceStats()
+console.log('Performance Stats:', {
+    messagesProcessed: stats.messagesProcessed,
+    labelsProcessed: stats.labelsProcessed,
+    batchesProcessed: stats.batchesProcessed,
+    errors: stats.errors,
+    uptime: `${Math.floor(stats.uptime / 1000)}s`
+})
+
+// Reset statistics
+store.resetPerformanceStats()
+
+// Monitor performance periodically
+setInterval(() => {
+    const stats = store.getPerformanceStats()
+    console.log(`Processed: ${stats.messagesProcessed} messages, ${stats.labelsProcessed} labels`)
+}, 60000) // Every minute
+```
+
+### Handling High Load
+
+The store automatically handles high-load scenarios:
+
+```javascript
+// When receiving thousands of labels (e.g., during initial sync)
+// Labels are automatically batched - no code changes needed!
+ev.on('labels.association', async ({ type, association }) => {
+    // This is automatically batched internally
+    if (type === 'add') {
+        await store.upsertLabelAssociation(association)
+    }
+})
+
+// For bulk message imports, the store uses batch mode automatically
+ev.on('messaging-history.set', async ({ messages }) => {
+    // Messages are processed in batches automatically
+    console.log(`Processing ${messages.length} messages...`)
+})
+```
+
 ## Performance Tips
 
 1. **Indexes**: The store automatically creates optimal indexes on first run
-2. **Connection Pooling**: MongoDB driver handles connection pooling automatically
-3. **Batch Operations**: The store uses bulk operations where possible
+2. **Connection Pooling**: Configured for high concurrency (100 connections max)
+3. **Batch Operations**: Automatic batching for labels and optional for messages
 4. **TTL**: Configure appropriate TTL to prevent unlimited data growth
+5. **Monitoring**: Use `getPerformanceStats()` to monitor performance
 
 ## Migration from In-Memory Store
 

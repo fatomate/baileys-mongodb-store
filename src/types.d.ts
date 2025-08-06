@@ -106,8 +106,9 @@ export interface MongoDBStore {
     
     /**
      * Upsert a message
+     * @param useBatch - Whether to use batch processing (for bulk operations)
      */
-    upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void>
+    upsertMessage(jid: string, message: proto.IWebMessageInfo, useBatch?: boolean): Promise<void>
     
     /**
      * Update a message
@@ -213,6 +214,23 @@ export interface MongoDBStore {
      * Clear all data for this instance
      */
     clearAll(): Promise<void>
+    
+    /**
+     * Get performance statistics
+     */
+    getPerformanceStats(): {
+        messagesProcessed: number
+        labelsProcessed: number
+        batchesProcessed: number
+        errors: number
+        lastResetTime: Date
+        uptime: number
+    }
+    
+    /**
+     * Reset performance statistics
+     */
+    resetPerformanceStats(): void
     
     /**
      * Close the MongoDB connection

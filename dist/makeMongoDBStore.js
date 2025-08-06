@@ -1,14 +1,57 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.cleanupMongoDBStore = exports.makeMongoDBStore = void 0;
 const mongodb_1 = require("mongodb");
 const baileys_1 = require("baileys");
-const baileys_2 = require("baileys");
+const node_cache_1 = __importDefault(require("node-cache"));
+const p_queue_1 = __importDefault(require("p-queue"));
 const DEFAULT_TTL_DAYS = 30;
 let activeConnections = [];
+const binaryConversionCache = new node_cache_1.default({ stdTTL: 300, checkperiod: 60 });
+const QUEUE_CONCURRENCY = 50;
+const BATCH_SIZE = 100;
+const BATCH_DELAY = 50;
+const performanceMetrics = {
+    messagesProcessed: 0,
+    labelsProcessed: 0,
+    batchesProcessed: 0,
+    errors: 0,
+    lastResetTime: new Date()
+};
+const convertBinaryToBuffer = (obj) => {
+    try {
+        if (!obj || typeof obj !== 'object')
+            return obj;
+        if (obj.buffer && obj._bsontype === 'Binary') {
+            return Buffer.from(obj.buffer);
+        }
+        if (Array.isArray(obj)) {
+            return obj.map(item => convertBinaryToBuffer(item));
+        }
+        const result = {};
+        for (const key in obj) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                result[key] = convertBinaryToBuffer(obj[key]);
+            }
+        }
+        return result;
+    }
+    catch (error) {
+        console.error('Error converting Binary to Buffer:', error);
+        return obj;
+    }
+};
 const makeMongoDBStore = async (config) => {
     const { uri, database: dbName, instanceId, ttlDays = DEFAULT_TTL_DAYS, collectionPrefix = 'baileys_' } = config;
-    const client = new mongodb_1.MongoClient(uri);
+    const client = new mongodb_1.MongoClient(uri, {
+        maxPoolSize: 100,
+        minPoolSize: 10,
+        maxIdleTimeMS: 30000,
+        writeConcern: { w: 1, j: false }
+    });
     await client.connect();
     activeConnections.push({
         client,
@@ -17,6 +60,19 @@ const makeMongoDBStore = async (config) => {
         collectionPrefix
     });
     const db = client.db(dbName);
+    const messageQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
+    const labelQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
+    const generalQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
+    const labelAssociationBatch = {
+        items: [],
+        timer: null,
+        processing: false
+    };
+    const messageBatch = {
+        items: [],
+        timer: null,
+        processing: false
+    };
     const collections = {
         chats: db.collection(`${collectionPrefix}chats`),
         contacts: db.collection(`${collectionPrefix}contacts`),
@@ -26,6 +82,110 @@ const makeMongoDBStore = async (config) => {
         presences: db.collection(`${collectionPrefix}presences`),
         labels: db.collection(`${collectionPrefix}labels`),
         labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+    };
+    const processBatchedLabelAssociations = async () => {
+        if (labelAssociationBatch.processing || labelAssociationBatch.items.length === 0)
+            return;
+        labelAssociationBatch.processing = true;
+        const itemsToProcess = [...labelAssociationBatch.items];
+        labelAssociationBatch.items = [];
+        try {
+            const bulkOps = itemsToProcess.map(association => ({
+                replaceOne: {
+                    filter: {
+                        instanceId,
+                        chatId: association.chatId,
+                        labelId: association.labelId,
+                        messageId: 'messageId' in association ? association.messageId : ''
+                    },
+                    replacement: {
+                        ...association,
+                        instanceId,
+                        updatedAt: new Date()
+                    },
+                    upsert: true
+                }
+            }));
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const chunk = bulkOps.slice(i, i + BATCH_SIZE);
+                await collections.labelAssociations.bulkWrite(chunk, { ordered: false });
+                if (i + BATCH_SIZE < bulkOps.length) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+                }
+            }
+            performanceMetrics.labelsProcessed += itemsToProcess.length;
+            performanceMetrics.batchesProcessed++;
+        }
+        catch (error) {
+            console.error('Error processing label associations batch:', error);
+            performanceMetrics.errors++;
+        }
+        finally {
+            labelAssociationBatch.processing = false;
+        }
+    };
+    const processBatchedMessages = async () => {
+        if (messageBatch.processing || messageBatch.items.length === 0)
+            return;
+        messageBatch.processing = true;
+        const itemsToProcess = [...messageBatch.items];
+        messageBatch.items = [];
+        try {
+            const bulkOps = itemsToProcess.map(({ jid, ...message }) => ({
+                replaceOne: {
+                    filter: {
+                        instanceId,
+                        jid,
+                        'key.id': message.key?.id
+                    },
+                    replacement: {
+                        ...message,
+                        instanceId,
+                        jid,
+                        updatedAt: new Date()
+                    },
+                    upsert: true
+                }
+            }));
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const chunk = bulkOps.slice(i, i + BATCH_SIZE);
+                await collections.messages.bulkWrite(chunk, { ordered: false });
+                chunk.forEach(op => {
+                    const msgId = op.replaceOne.filter['key.id'];
+                    const msgJid = op.replaceOne.filter.jid;
+                    const cacheKey = `msg_${instanceId}_${msgJid}_${msgId}`;
+                    binaryConversionCache.del(cacheKey);
+                });
+                if (i + BATCH_SIZE < bulkOps.length) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+                }
+            }
+            performanceMetrics.messagesProcessed += itemsToProcess.length;
+            performanceMetrics.batchesProcessed++;
+        }
+        catch (error) {
+            console.error('Error processing messages batch:', error);
+            performanceMetrics.errors++;
+        }
+        finally {
+            messageBatch.processing = false;
+        }
+    };
+    const scheduleLabelBatch = () => {
+        if (labelAssociationBatch.timer) {
+            clearTimeout(labelAssociationBatch.timer);
+        }
+        labelAssociationBatch.timer = setTimeout(() => {
+            processBatchedLabelAssociations();
+        }, 100);
+    };
+    const scheduleMessageBatch = () => {
+        if (messageBatch.timer) {
+            clearTimeout(messageBatch.timer);
+        }
+        messageBatch.timer = setTimeout(() => {
+            processBatchedMessages();
+        }, 100);
     };
     const createIndexes = async () => {
         const ttlSeconds = ttlDays * 24 * 60 * 60;
@@ -58,13 +218,13 @@ const makeMongoDBStore = async (config) => {
                 .find({ instanceId })
                 .sort({ conversationTimestamp: -1 })
                 .toArray();
-            return chats.map(({ _id, instanceId, updatedAt, ...chat }) => chat);
+            return chats.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...chat }) => chat);
         },
         async getChat(jid) {
             const chat = await collections.chats.findOne({ instanceId, id: jid });
             if (!chat)
                 return null;
-            const { _id, instanceId: _, updatedAt, ...chatData } = chat;
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...chatData } = chat;
             return chatData;
         },
         async upsertChats(...chats) {
@@ -97,7 +257,7 @@ const makeMongoDBStore = async (config) => {
                 .toArray();
             const contactsMap = {};
             for (const contact of contacts) {
-                const { _id, instanceId, updatedAt, ...contactData } = contact;
+                const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact;
                 contactsMap[contact.id] = contactData;
             }
             return contactsMap;
@@ -106,7 +266,7 @@ const makeMongoDBStore = async (config) => {
             const contact = await collections.contacts.findOne({ instanceId, id: jid });
             if (!contact)
                 return null;
-            const { _id, instanceId: _, updatedAt, ...contactData } = contact;
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...contactData } = contact;
             return contactData;
         },
         async upsertContacts(contacts) {
@@ -119,16 +279,28 @@ const makeMongoDBStore = async (config) => {
                     upsert: true
                 }
             }));
-            await collections.contacts.bulkWrite(bulkOps);
+            for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
+                const chunk = bulkOps.slice(i, i + BATCH_SIZE);
+                await generalQueue.add(async () => {
+                    await collections.contacts.bulkWrite(chunk, { ordered: false });
+                });
+                if (i + BATCH_SIZE < bulkOps.length && bulkOps.length > 1000) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+                }
+            }
         },
         async getMessages(jid) {
             const messages = await collections.messages
                 .find({ instanceId, jid })
                 .sort({ messageTimestamp: -1 })
                 .toArray();
-            return messages.map(({ _id, instanceId, jid, updatedAt, ...msg }) => baileys_1.proto.WebMessageInfo.fromObject(msg));
+            return messages.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg));
         },
         async getMessage(jid, id) {
+            const cacheKey = `msg_${instanceId}_${jid}_${id}`;
+            const cached = binaryConversionCache.get(cacheKey);
+            if (cached)
+                return cached;
             const message = await collections.messages.findOne({
                 instanceId,
                 jid,
@@ -136,32 +308,64 @@ const makeMongoDBStore = async (config) => {
             });
             if (!message)
                 return null;
-            const { _id, instanceId: _, jid: __, updatedAt, ...msg } = message;
-            return baileys_1.proto.WebMessageInfo.fromObject(msg);
+            const { _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg } = message;
+            const converted = convertBinaryToBuffer(msg);
+            binaryConversionCache.set(cacheKey, converted);
+            return converted;
         },
-        async upsertMessage(jid, message) {
-            await collections.messages.replaceOne({
-                instanceId,
-                jid,
-                'key.id': message.key?.id
-            }, {
-                ...message,
-                instanceId,
-                jid,
-                updatedAt: new Date()
-            }, { upsert: true });
+        async upsertMessage(jid, message, useBatch = false) {
+            if (useBatch) {
+                messageBatch.items.push({ ...message, jid });
+                scheduleMessageBatch();
+                if (messageBatch.items.length >= BATCH_SIZE) {
+                    await processBatchedMessages();
+                }
+            }
+            else {
+                const cacheKey = `msg_${instanceId}_${jid}_${message.key?.id}`;
+                binaryConversionCache.del(cacheKey);
+                await messageQueue.add(async () => {
+                    await collections.messages.replaceOne({
+                        instanceId,
+                        jid,
+                        'key.id': message.key?.id
+                    }, {
+                        ...message,
+                        instanceId,
+                        jid,
+                        updatedAt: new Date()
+                    }, { upsert: true });
+                });
+            }
         },
         async updateMessage(jid, id, update) {
+            const cacheKey = `msg_${instanceId}_${jid}_${id}`;
+            binaryConversionCache.del(cacheKey);
+            const processedUpdate = convertBinaryToBuffer(update);
             const result = await collections.messages.updateOne({
                 instanceId,
                 jid,
                 'key.id': id
             }, {
-                $set: { ...update, updatedAt: new Date() }
+                $set: { ...processedUpdate, updatedAt: new Date() }
             });
             return result.modifiedCount > 0;
         },
         async deleteMessages(jid, ids) {
+            if (ids && ids.length > 0) {
+                ids.forEach(id => {
+                    const cacheKey = `msg_${instanceId}_${jid}_${id}`;
+                    binaryConversionCache.del(cacheKey);
+                });
+            }
+            else {
+                const keys = binaryConversionCache.keys();
+                keys.forEach(key => {
+                    if (key.startsWith(`msg_${instanceId}_${jid}_`)) {
+                        binaryConversionCache.del(key);
+                    }
+                });
+            }
             const filter = { instanceId, jid };
             if (ids && ids.length > 0) {
                 filter['key.id'] = { $in: ids };
@@ -172,7 +376,7 @@ const makeMongoDBStore = async (config) => {
             const metadata = await collections.groupMetadata.findOne({ instanceId, id: jid });
             if (!metadata)
                 return null;
-            const { _id, instanceId: _, updatedAt, ...metadataData } = metadata;
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...metadataData } = metadata;
             return metadataData;
         },
         async upsertGroupMetadata(jid, metadata) {
@@ -182,7 +386,7 @@ const makeMongoDBStore = async (config) => {
             const state = await collections.state.findOne({ instanceId });
             if (!state)
                 return { connection: 'close' };
-            const { _id, instanceId: _, updatedAt, ...stateData } = state;
+            const { _id: _1, instanceId: _2, updatedAt: _3, ...stateData } = state;
             return stateData;
         },
         async updateState(update) {
@@ -211,7 +415,7 @@ const makeMongoDBStore = async (config) => {
                 .toArray();
             const labelsMap = {};
             for (const label of labels) {
-                const { _id, instanceId, updatedAt, ...labelData } = label;
+                const { _id: _1, instanceId: _2, updatedAt: _3, ...labelData } = label;
                 labelsMap[label.id] = labelData;
             }
             return labelsMap;
@@ -226,13 +430,13 @@ const makeMongoDBStore = async (config) => {
             const associations = await collections.labelAssociations
                 .find({ instanceId })
                 .toArray();
-            return associations.map(({ _id, instanceId, updatedAt, ...assoc }) => assoc);
+            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc);
         },
         async getChatLabels(chatId) {
             const associations = await collections.labelAssociations
                 .find({ instanceId, chatId })
                 .toArray();
-            return associations.map(({ _id, instanceId, updatedAt, ...assoc }) => assoc);
+            return associations.map(({ _id: _1, instanceId: _2, updatedAt: _3, ...assoc }) => assoc);
         },
         async getMessageLabels(messageId) {
             const associations = await collections.labelAssociations
@@ -241,16 +445,11 @@ const makeMongoDBStore = async (config) => {
             return associations.map(assoc => assoc.labelId);
         },
         async upsertLabelAssociation(association) {
-            await collections.labelAssociations.replaceOne({
-                instanceId,
-                chatId: association.chatId,
-                labelId: association.labelId,
-                messageId: 'messageId' in association ? association.messageId : ''
-            }, {
-                ...association,
-                instanceId,
-                updatedAt: new Date()
-            }, { upsert: true });
+            labelAssociationBatch.items.push(association);
+            scheduleLabelBatch();
+            if (labelAssociationBatch.items.length >= BATCH_SIZE) {
+                await processBatchedLabelAssociations();
+            }
         },
         async deleteLabelAssociation(association) {
             await collections.labelAssociations.deleteOne({
@@ -268,18 +467,25 @@ const makeMongoDBStore = async (config) => {
                 if (isLatest) {
                     await store.clearAll();
                 }
+                const promises = [];
                 if (newChats?.length) {
-                    await store.upsertChats(...newChats);
+                    promises.push(generalQueue.add(async () => {
+                        await store.upsertChats(...newChats);
+                    }));
                 }
                 if (newContacts?.length) {
-                    await store.upsertContacts(newContacts);
+                    promises.push(generalQueue.add(async () => {
+                        await store.upsertContacts(newContacts);
+                    }));
                 }
                 if (newMessages?.length) {
                     for (const msg of newMessages) {
                         const jid = msg.key.remoteJid;
-                        await store.upsertMessage(jid, msg);
+                        await store.upsertMessage(jid, msg, true);
                     }
+                    await processBatchedMessages();
                 }
+                await Promise.all(promises);
             });
             ev.on('contacts.upsert', async (contacts) => {
                 await store.upsertContacts(contacts);
@@ -327,12 +533,12 @@ const makeMongoDBStore = async (config) => {
             });
             ev.on('messages.upsert', async ({ messages: newMessages, type }) => {
                 for (const msg of newMessages) {
-                    const jid = (0, baileys_2.jidNormalizedUser)(msg.key.remoteJid);
+                    const jid = (0, baileys_1.jidNormalizedUser)(msg.key.remoteJid);
                     await store.upsertMessage(jid, msg);
                     if (type === 'notify' && !(await store.getChat(jid))) {
                         await store.upsertChats({
                             id: jid,
-                            conversationTimestamp: (0, baileys_2.toNumber)(msg.messageTimestamp),
+                            conversationTimestamp: (0, baileys_1.toNumber)(msg.messageTimestamp),
                             unreadCount: 1
                         });
                     }
@@ -340,7 +546,7 @@ const makeMongoDBStore = async (config) => {
             });
             ev.on('messages.update', async (updates) => {
                 for (const { update, key } of updates) {
-                    const jid = (0, baileys_2.jidNormalizedUser)(key.remoteJid);
+                    const jid = (0, baileys_1.jidNormalizedUser)(key.remoteJid);
                     await store.updateMessage(jid, key.id, update);
                 }
             });
@@ -393,7 +599,7 @@ const makeMongoDBStore = async (config) => {
                 for (const { key, receipt } of updates) {
                     const msg = await store.getMessage(key.remoteJid, key.id);
                     if (msg) {
-                        (0, baileys_2.updateMessageWithReceipt)(msg, receipt);
+                        (0, baileys_1.updateMessageWithReceipt)(msg, receipt);
                         await store.updateMessage(key.remoteJid, key.id, msg);
                     }
                 }
@@ -402,7 +608,7 @@ const makeMongoDBStore = async (config) => {
                 for (const { key, reaction } of reactions) {
                     const msg = await store.getMessage(key.remoteJid, key.id);
                     if (msg) {
-                        (0, baileys_2.updateMessageWithReaction)(msg, reaction);
+                        (0, baileys_1.updateMessageWithReaction)(msg, reaction);
                         await store.updateMessage(key.remoteJid, key.id, msg);
                     }
                 }
@@ -410,7 +616,7 @@ const makeMongoDBStore = async (config) => {
         },
         async loadMessages(jid, count, cursor) {
             const mode = !cursor || 'before' in cursor ? 'before' : 'after';
-            const cursorKey = !!cursor ? ('before' in cursor ? cursor.before : cursor.after) : undefined;
+            const cursorKey = cursor ? ('before' in cursor ? cursor.before : cursor.after) : undefined;
             let messages = [];
             if (mode === 'before') {
                 const query = { instanceId, jid };
@@ -425,7 +631,7 @@ const makeMongoDBStore = async (config) => {
                     .sort({ messageTimestamp: -1 })
                     .limit(count)
                     .toArray()
-                    .then(msgs => msgs.map(({ _id, instanceId, jid, updatedAt, ...msg }) => baileys_1.proto.WebMessageInfo.fromObject(msg)));
+                    .then(msgs => msgs.map(({ _id: _1, instanceId: _2, jid: _3, updatedAt: _4, ...msg }) => convertBinaryToBuffer(msg)));
             }
             return messages;
         },
@@ -438,6 +644,12 @@ const makeMongoDBStore = async (config) => {
             return messages[0];
         },
         async clearAll() {
+            const keys = binaryConversionCache.keys();
+            keys.forEach(key => {
+                if (key.startsWith(`msg_${instanceId}_`)) {
+                    binaryConversionCache.del(key);
+                }
+            });
             await Promise.all([
                 collections.chats.deleteMany({ instanceId }),
                 collections.contacts.deleteMany({ instanceId }),
@@ -448,7 +660,40 @@ const makeMongoDBStore = async (config) => {
                 collections.labelAssociations.deleteMany({ instanceId })
             ]);
         },
+        getPerformanceStats() {
+            const uptime = Date.now() - performanceMetrics.lastResetTime.getTime();
+            return {
+                ...performanceMetrics,
+                uptime
+            };
+        },
+        resetPerformanceStats() {
+            performanceMetrics.messagesProcessed = 0;
+            performanceMetrics.labelsProcessed = 0;
+            performanceMetrics.batchesProcessed = 0;
+            performanceMetrics.errors = 0;
+            performanceMetrics.lastResetTime = new Date();
+        },
         async close() {
+            await processBatchedLabelAssociations();
+            await processBatchedMessages();
+            if (labelAssociationBatch.timer) {
+                clearTimeout(labelAssociationBatch.timer);
+            }
+            if (messageBatch.timer) {
+                clearTimeout(messageBatch.timer);
+            }
+            await Promise.all([
+                messageQueue.onIdle(),
+                labelQueue.onIdle(),
+                generalQueue.onIdle()
+            ]);
+            const keys = binaryConversionCache.keys();
+            keys.forEach(key => {
+                if (key.startsWith(`msg_${instanceId}_`)) {
+                    binaryConversionCache.del(key);
+                }
+            });
             await client.close();
             activeConnections = activeConnections.filter(c => c.client !== client);
         }

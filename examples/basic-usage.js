@@ -7,6 +7,11 @@ const logger = pino({ level: 'info' })
 
 async function connectToWhatsApp() {
     // Create MongoDB store
+    // Note: The store automatically handles:
+    // - Batch processing for labels and messages
+    // - Connection pooling (100 connections max)
+    // - Smart caching with auto-invalidation
+    // - Queue management for concurrent operations
     const store = await makeMongoDBStore({
         uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
         database: 'whatsapp_bot',

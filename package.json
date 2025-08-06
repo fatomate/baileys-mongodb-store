@@ -22,8 +22,10 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
+    "baileys": "^6.7.18",
     "mongodb": "^6.3.0",
-    "baileys": "^6.7.18"
+    "node-cache": "^5.1.2",
+    "p-queue": "^8.1.0"
   },
   "peerDependencies": {
     "@adiwajshing/keyed-db": "*",
@@ -31,6 +33,8 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/node-cache": "^4.1.3",
+    "@types/p-queue": "^3.1.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
     "eslint": "^8.54.0",
