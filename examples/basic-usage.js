@@ -6,19 +6,39 @@ const pino = require('pino')
 const logger = pino({ level: 'info' })
 
 async function connectToWhatsApp() {
-    // Create MongoDB store
+    // Create MongoDB store with optional Redis/Bull queue integration
     // Note: The store automatically handles:
     // - Batch processing for labels and messages
     // - Connection pooling (100 connections max)
     // - Smart caching with auto-invalidation
     // - Queue management for concurrent operations
+    // - With Redis: Persistent job queues, auto-retry, and distributed processing
     const store = await makeMongoDBStore({
         uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
         database: 'whatsapp_bot',
         instanceId: 'instance_001',
         ttlDays: 30,
-        logger: logger.child({ module: 'mongodb-store' })
+        logger: logger.child({ module: 'mongodb-store' }),
+        
+        // Optional: Enable Redis/Bull for production-grade reliability
+        // All jobs are automatically removed after completion/failure
+        // Label associations use concurrency: 1 to maintain order
+        redis: process.env.REDIS_URL ? {
+            connection: process.env.REDIS_URL,
+            concurrency: 50  // For all queues except label associations
+        } : undefined
     })
+    
+    // Check if Bull queues are initialized
+    const stats = store.getPerformanceStats()
+    if (stats.bullStats?.initialized) {
+        logger.info('Redis/Bull queues initialized:', {
+            totalQueues: stats.bullStats.totalQueues,
+            redisConnected: stats.bullStats.redisConnected
+        })
+    } else {
+        logger.info('Using in-memory processing (Redis not configured)')
+    }
 
     logger.info('MongoDB store created successfully')
 

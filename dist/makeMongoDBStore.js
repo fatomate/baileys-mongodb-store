@@ -8,12 +8,25 @@ const mongodb_1 = require("mongodb");
 const baileys_1 = require("baileys");
 const node_cache_1 = __importDefault(require("node-cache"));
 const p_queue_1 = __importDefault(require("p-queue"));
+const bullmq_1 = require("bullmq");
+const ioredis_1 = __importDefault(require("ioredis"));
 const DEFAULT_TTL_DAYS = 30;
 let activeConnections = [];
 const binaryConversionCache = new node_cache_1.default({ stdTTL: 300, checkperiod: 60 });
 const QUEUE_CONCURRENCY = 50;
 const BATCH_SIZE = 100;
 const BATCH_DELAY = 50;
+var QueueType;
+(function (QueueType) {
+    QueueType["LABELS"] = "labels";
+    QueueType["LABEL_ASSOCIATIONS"] = "label-associations";
+    QueueType["MESSAGES"] = "messages";
+    QueueType["CHATS"] = "chats";
+    QueueType["CONTACTS"] = "contacts";
+    QueueType["GROUP_METADATA"] = "group-metadata";
+    QueueType["PRESENCES"] = "presences";
+    QueueType["STATE"] = "state";
+})(QueueType || (QueueType = {}));
 const performanceMetrics = {
     messagesProcessed: 0,
     labelsProcessed: 0,
@@ -45,7 +58,7 @@ const convertBinaryToBuffer = (obj) => {
     }
 };
 const makeMongoDBStore = async (config) => {
-    const { uri, database: dbName, instanceId, ttlDays = DEFAULT_TTL_DAYS, collectionPrefix = 'baileys_' } = config;
+    const { uri, database: dbName, instanceId, ttlDays = DEFAULT_TTL_DAYS, collectionPrefix = 'baileys_', redis } = config;
     let client;
     let db;
     let isConnected = false;
@@ -54,6 +67,23 @@ const makeMongoDBStore = async (config) => {
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
     const RECONNECT_DELAY_BASE = 1000;
+    const queues = new Map();
+    const workers = new Map();
+    let redisConnection = null;
+    let bullInitialized = false;
+    const defaultJobOptions = {
+        removeOnComplete: true,
+        removeOnFail: true,
+        attempts: 3,
+        backoff: {
+            type: 'exponential',
+            delay: 2000
+        }
+    };
+    let healthCheckInterval = null;
+    let lastHealthCheck = Date.now();
+    const HEALTH_CHECK_INTERVAL = 30000;
+    const QUEUE_STALE_THRESHOLD = 60000;
     const initializeConnection = async () => {
         try {
             client = new mongodb_1.MongoClient(uri, {
@@ -123,9 +153,288 @@ const makeMongoDBStore = async (config) => {
         }
     };
     await initializeConnection();
-    const messageQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
-    const labelQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
+    const pMessageQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
+    const pLabelQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
     const generalQueue = new p_queue_1.default({ concurrency: QUEUE_CONCURRENCY });
+    const initializeBullQueues = async () => {
+        if (!redis)
+            return;
+        try {
+            console.log(`🐂 Initializing Bull queues for instance ${instanceId}...`);
+            if (typeof redis.connection === 'string') {
+                redisConnection = new ioredis_1.default(redis.connection);
+            }
+            else {
+                redisConnection = new ioredis_1.default(redis.connection);
+            }
+            await redisConnection.ping();
+            const queuePrefix = redis.queuePrefix || 'baileys';
+            const redisOpts = { connection: redisConnection };
+            const createQueueAndWorker = (queueType, processor) => {
+                const queueName = `${queuePrefix}:${queueType}:${instanceId}`;
+                const queue = new bullmq_1.Queue(queueName, redisOpts);
+                queues.set(queueType, queue);
+                const concurrency = queueType === QueueType.LABEL_ASSOCIATIONS ? 1 : (redis.concurrency || 50);
+                const worker = new bullmq_1.Worker(queueName, processor, {
+                    ...redisOpts,
+                    concurrency,
+                    autorun: true
+                });
+                console.log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`);
+                worker.on('completed', (job) => {
+                    if (queueType !== QueueType.LABEL_ASSOCIATIONS) {
+                        console.log(`✅ ${queueType} job ${job.id} completed`);
+                    }
+                });
+                worker.on('failed', (job, err) => {
+                    console.error(`❌ ${queueType} job ${job?.id} failed:`, err.message);
+                    performanceMetrics.errors++;
+                });
+                worker.on('stalled', (jobId) => {
+                    console.warn(`⚠️ ${queueType} job ${jobId} stalled`);
+                });
+                workers.set(queueType, worker);
+                queue.obliterate({ force: true }).catch(() => { });
+            };
+            createQueueAndWorker(QueueType.LABEL_ASSOCIATIONS, async (job) => {
+                const { type, association } = job.data;
+                if (type === 'upsert') {
+                    await collections.labelAssociations.replaceOne({
+                        instanceId,
+                        chatId: association.chatId,
+                        labelId: association.labelId,
+                        messageId: 'messageId' in association ? association.messageId : ''
+                    }, {
+                        ...association,
+                        instanceId,
+                        updatedAt: new Date()
+                    }, { upsert: true });
+                }
+                else if (type === 'delete') {
+                    await collections.labelAssociations.deleteOne({
+                        instanceId,
+                        chatId: association.chatId,
+                        labelId: association.labelId,
+                        messageId: 'messageId' in association ? association.messageId : ''
+                    });
+                }
+                performanceMetrics.labelsProcessed++;
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.LABELS, async (job) => {
+                const { type, id, label } = job.data;
+                if (type === 'upsert' && label) {
+                    await collections.labels.replaceOne({ instanceId, id }, { ...label, instanceId, updatedAt: new Date() }, { upsert: true });
+                }
+                else if (type === 'delete') {
+                    await collections.labels.deleteOne({ instanceId, id });
+                }
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.MESSAGES, async (job) => {
+                const { type, jid, message, messageId, update, deleteIds } = job.data;
+                if (type === 'upsert' && message) {
+                    await collections.messages.replaceOne({
+                        instanceId,
+                        jid,
+                        'key.id': message.key?.id
+                    }, {
+                        ...message,
+                        instanceId,
+                        jid,
+                        updatedAt: new Date()
+                    }, { upsert: true });
+                    performanceMetrics.messagesProcessed++;
+                }
+                else if (type === 'update' && messageId && update) {
+                    await collections.messages.updateOne({
+                        instanceId,
+                        jid,
+                        'key.id': messageId
+                    }, {
+                        $set: { ...update, updatedAt: new Date() }
+                    });
+                }
+                else if (type === 'delete') {
+                    if (deleteIds && deleteIds.length > 0) {
+                        await collections.messages.deleteMany({
+                            instanceId,
+                            jid,
+                            'key.id': { $in: deleteIds }
+                        });
+                    }
+                    else {
+                        await collections.messages.deleteMany({ instanceId, jid });
+                    }
+                }
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.CHATS, async (job) => {
+                const { type, chats, chatId, update, deleteIds } = job.data;
+                if (type === 'upsert' && chats) {
+                    const bulkOps = chats.map(chat => ({
+                        replaceOne: {
+                            filter: { instanceId, id: chat.id },
+                            replacement: { ...chat, instanceId, updatedAt: new Date() },
+                            upsert: true
+                        }
+                    }));
+                    await collections.chats.bulkWrite(bulkOps);
+                }
+                else if (type === 'update' && chatId && update) {
+                    await collections.chats.updateOne({ instanceId, id: chatId }, { $set: { ...update, updatedAt: new Date() } });
+                }
+                else if (type === 'delete' && deleteIds) {
+                    await collections.chats.deleteMany({
+                        instanceId,
+                        id: { $in: deleteIds }
+                    });
+                }
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.CONTACTS, async (job) => {
+                const { type, contacts, contact } = job.data;
+                if (type === 'upsert' && contacts) {
+                    const bulkOps = contacts.map(contact => ({
+                        replaceOne: {
+                            filter: { instanceId, id: contact.id },
+                            replacement: { ...contact, instanceId, updatedAt: new Date() },
+                            upsert: true
+                        }
+                    }));
+                    await collections.contacts.bulkWrite(bulkOps, { ordered: false });
+                }
+                else if (type === 'update' && contact) {
+                    await collections.contacts.replaceOne({ instanceId, id: contact.id }, { ...contact, instanceId, updatedAt: new Date() }, { upsert: true });
+                }
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.GROUP_METADATA, async (job) => {
+                const { type, jid, metadata, update } = job.data;
+                if (type === 'upsert') {
+                    await collections.groupMetadata.replaceOne({ instanceId, id: jid }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
+                }
+                else if (type === 'update' && update) {
+                    await collections.groupMetadata.updateOne({ instanceId, id: jid }, { $set: { ...update, updatedAt: new Date() } });
+                }
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.PRESENCES, async (job) => {
+                const { id, presences } = job.data;
+                await collections.presences.updateOne({ instanceId, id }, {
+                    $set: { presences, updatedAt: new Date() }
+                }, { upsert: true });
+                return { success: true };
+            });
+            createQueueAndWorker(QueueType.STATE, async (job) => {
+                const { update } = job.data;
+                await collections.state.updateOne({ instanceId }, {
+                    $set: { ...update, instanceId, updatedAt: new Date() }
+                }, { upsert: true });
+                return { success: true };
+            });
+            const checkQueuesHealth = async () => {
+                try {
+                    if (redisConnection?.status !== 'ready') {
+                        console.error('⚠️ Redis connection lost, attempting to reconnect...');
+                        await restartQueues();
+                        return;
+                    }
+                    for (const [queueType, queue] of queues.entries()) {
+                        try {
+                            const counts = await queue.getJobCounts();
+                            const worker = workers.get(queueType);
+                            if (counts.waiting > 100) {
+                                console.warn(`⚠️ ${queueType} queue has ${counts.waiting} waiting jobs`);
+                            }
+                            if (worker && !worker.isRunning()) {
+                                console.error(`❌ ${queueType} worker stopped, restarting...`);
+                                await worker.run();
+                            }
+                            const activeJobs = await queue.getActive();
+                            const now = Date.now();
+                            for (const job of activeJobs) {
+                                const processingTime = now - job.processedOn;
+                                if (processingTime > QUEUE_STALE_THRESHOLD) {
+                                    console.warn(`⚠️ Stale job detected in ${queueType}: ${job.id} (${processingTime}ms)`);
+                                    await job.moveToFailed(new Error('Job stale, moving to failed'), false);
+                                }
+                            }
+                        }
+                        catch (error) {
+                            console.error(`Health check failed for ${queueType}:`, error);
+                        }
+                    }
+                    lastHealthCheck = Date.now();
+                }
+                catch (error) {
+                    console.error('Queue health check error:', error);
+                    if (Date.now() - lastHealthCheck > QUEUE_STALE_THRESHOLD * 2) {
+                        await restartQueues();
+                    }
+                }
+            };
+            const restartQueues = async () => {
+                console.log('🔄 Restarting Bull queues...');
+                try {
+                    for (const worker of workers.values()) {
+                        await worker.close();
+                    }
+                    for (const queue of queues.values()) {
+                        await queue.close();
+                    }
+                    workers.clear();
+                    queues.clear();
+                    if (redisConnection && redisConnection.status !== 'ready') {
+                        redisConnection.disconnect();
+                        if (typeof redis.connection === 'string') {
+                            redisConnection = new ioredis_1.default(redis.connection);
+                        }
+                        else {
+                            redisConnection = new ioredis_1.default(redis.connection);
+                        }
+                        await redisConnection.ping();
+                    }
+                    await initializeBullQueues();
+                    console.log('✅ Queues restarted successfully');
+                }
+                catch (error) {
+                    console.error('❌ Failed to restart queues:', error);
+                    bullInitialized = false;
+                }
+            };
+            healthCheckInterval = setInterval(checkQueuesHealth, HEALTH_CHECK_INTERVAL);
+            setInterval(async () => {
+                for (const [, queue] of queues.entries()) {
+                    try {
+                        await queue.clean(10000, 1000, 'completed');
+                        await queue.clean(10000, 1000, 'failed');
+                    }
+                    catch (error) {
+                    }
+                }
+            }, 60000);
+            bullInitialized = true;
+            console.log(`✅ Bull queues initialized successfully for instance ${instanceId}`);
+        }
+        catch (error) {
+            console.error(`❌ Failed to initialize Bull queues for instance ${instanceId}:`, error);
+            console.log('⚠️  Falling back to in-memory queue processing');
+            for (const worker of workers.values()) {
+                await worker.close();
+            }
+            for (const queue of queues.values()) {
+                await queue.close();
+            }
+            if (redisConnection)
+                redisConnection.disconnect();
+            queues.clear();
+            workers.clear();
+            redisConnection = null;
+            bullInitialized = false;
+        }
+    };
+    await initializeBullQueues();
     const labelAssociationBatch = {
         items: [],
         timer: null,
@@ -427,6 +736,21 @@ const makeMongoDBStore = async (config) => {
         async upsertChats(...chats) {
             if (chats.length === 0)
                 return;
+            if (bullInitialized && queues.has(QueueType.CHATS)) {
+                try {
+                    const queue = queues.get(QueueType.CHATS);
+                    await queue.add('upsert', {
+                        type: 'upsert',
+                        chats,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Chats] Failed to queue, falling back:', error);
+                }
+            }
             const bulkOps = chats.map(chat => ({
                 replaceOne: {
                     filter: { instanceId, id: chat.id },
@@ -437,12 +761,43 @@ const makeMongoDBStore = async (config) => {
             await collections.chats.bulkWrite(bulkOps);
         },
         async updateChat(jid, update) {
+            if (bullInitialized && queues.has(QueueType.CHATS)) {
+                try {
+                    const queue = queues.get(QueueType.CHATS);
+                    await queue.add('update', {
+                        type: 'update',
+                        chatId: jid,
+                        update,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return true;
+                }
+                catch (error) {
+                    console.error('[Bull Chats] Failed to queue update, falling back:', error);
+                }
+            }
             const result = await collections.chats.updateOne({ instanceId, id: jid }, {
                 $set: { ...update, updatedAt: new Date() }
             });
             return result.modifiedCount > 0;
         },
         async deleteChats(jids) {
+            if (bullInitialized && queues.has(QueueType.CHATS)) {
+                try {
+                    const queue = queues.get(QueueType.CHATS);
+                    await queue.add('delete', {
+                        type: 'delete',
+                        deleteIds: jids,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Chats] Failed to queue delete, falling back:', error);
+                }
+            }
             await collections.chats.deleteMany({
                 instanceId,
                 id: { $in: jids }
@@ -469,6 +824,24 @@ const makeMongoDBStore = async (config) => {
         async upsertContacts(contacts) {
             if (contacts.length === 0)
                 return;
+            if (bullInitialized && queues.has(QueueType.CONTACTS)) {
+                try {
+                    const queue = queues.get(QueueType.CONTACTS);
+                    for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+                        const batch = contacts.slice(i, i + BATCH_SIZE);
+                        await queue.add('upsert', {
+                            type: 'upsert',
+                            contacts: batch,
+                            instanceId,
+                            timestamp: Date.now()
+                        }, defaultJobOptions);
+                    }
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Contacts] Failed to queue, falling back:', error);
+                }
+            }
             const bulkOps = contacts.map(contact => ({
                 replaceOne: {
                     filter: { instanceId, id: contact.id },
@@ -511,6 +884,24 @@ const makeMongoDBStore = async (config) => {
             return converted;
         },
         async upsertMessage(jid, message, useBatch = false) {
+            if (bullInitialized && queues.has(QueueType.MESSAGES)) {
+                try {
+                    const queue = queues.get(QueueType.MESSAGES);
+                    await queue.add('upsert', {
+                        type: 'upsert',
+                        jid,
+                        message,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    const cacheKey = `msg_${instanceId}_${jid}_${message.key?.id}`;
+                    binaryConversionCache.del(cacheKey);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Messages] Failed to queue, falling back:', error);
+                }
+            }
             if (useBatch) {
                 messageBatch.items.push({ ...message, jid });
                 scheduleMessageBatch();
@@ -521,7 +912,7 @@ const makeMongoDBStore = async (config) => {
             else {
                 const cacheKey = `msg_${instanceId}_${jid}_${message.key?.id}`;
                 binaryConversionCache.del(cacheKey);
-                await messageQueue.add(async () => {
+                await pMessageQueue.add(async () => {
                     await collections.messages.replaceOne({
                         instanceId,
                         jid,
@@ -538,6 +929,23 @@ const makeMongoDBStore = async (config) => {
         async updateMessage(jid, id, update) {
             const cacheKey = `msg_${instanceId}_${jid}_${id}`;
             binaryConversionCache.del(cacheKey);
+            if (bullInitialized && queues.has(QueueType.MESSAGES)) {
+                try {
+                    const queue = queues.get(QueueType.MESSAGES);
+                    await queue.add('update', {
+                        type: 'update',
+                        jid,
+                        messageId: id,
+                        update: convertBinaryToBuffer(update),
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return true;
+                }
+                catch (error) {
+                    console.error('[Bull Messages] Failed to queue update, falling back:', error);
+                }
+            }
             const processedUpdate = convertBinaryToBuffer(update);
             const result = await collections.messages.updateOne({
                 instanceId,
@@ -563,6 +971,22 @@ const makeMongoDBStore = async (config) => {
                     }
                 });
             }
+            if (bullInitialized && queues.has(QueueType.MESSAGES)) {
+                try {
+                    const queue = queues.get(QueueType.MESSAGES);
+                    await queue.add('delete', {
+                        type: 'delete',
+                        jid,
+                        deleteIds: ids,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Messages] Failed to queue delete, falling back:', error);
+                }
+            }
             const filter = { instanceId, jid };
             if (ids && ids.length > 0) {
                 filter['key.id'] = { $in: ids };
@@ -577,6 +1001,22 @@ const makeMongoDBStore = async (config) => {
             return metadataData;
         },
         async upsertGroupMetadata(jid, metadata) {
+            if (bullInitialized && queues.has(QueueType.GROUP_METADATA)) {
+                try {
+                    const queue = queues.get(QueueType.GROUP_METADATA);
+                    await queue.add('upsert', {
+                        type: 'upsert',
+                        jid,
+                        metadata,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull GroupMetadata] Failed to queue, falling back:', error);
+                }
+            }
             await collections.groupMetadata.replaceOne({ instanceId, id: jid }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
         },
         async getState() {
@@ -587,6 +1027,21 @@ const makeMongoDBStore = async (config) => {
             return stateData;
         },
         async updateState(update) {
+            if (bullInitialized && queues.has(QueueType.STATE)) {
+                try {
+                    const queue = queues.get(QueueType.STATE);
+                    await queue.add('update', {
+                        type: 'update',
+                        update,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull State] Failed to queue, falling back:', error);
+                }
+            }
             await withConnection(() => collections.state.updateOne({ instanceId }, {
                 $set: { ...update, instanceId, updatedAt: new Date() }
             }, { upsert: true }));
@@ -602,6 +1057,22 @@ const makeMongoDBStore = async (config) => {
             return presencesMap;
         },
         async updatePresence(id, presences) {
+            if (bullInitialized && queues.has(QueueType.PRESENCES)) {
+                try {
+                    const queue = queues.get(QueueType.PRESENCES);
+                    await queue.add('update', {
+                        type: 'update',
+                        id,
+                        presences,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Presences] Failed to queue, falling back:', error);
+                }
+            }
             await collections.presences.updateOne({ instanceId, id }, {
                 $set: { presences, updatedAt: new Date() }
             }, { upsert: true });
@@ -618,9 +1089,40 @@ const makeMongoDBStore = async (config) => {
             return labelsMap;
         },
         async upsertLabel(id, label) {
+            if (bullInitialized && queues.has(QueueType.LABELS)) {
+                try {
+                    const queue = queues.get(QueueType.LABELS);
+                    await queue.add('upsert', {
+                        type: 'upsert',
+                        id,
+                        label,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Labels] Failed to queue, falling back:', error);
+                }
+            }
             await collections.labels.replaceOne({ instanceId, id }, { ...label, instanceId, updatedAt: new Date() }, { upsert: true });
         },
         async deleteLabel(id) {
+            if (bullInitialized && queues.has(QueueType.LABELS)) {
+                try {
+                    const queue = queues.get(QueueType.LABELS);
+                    await queue.add('delete', {
+                        type: 'delete',
+                        id,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Labels] Failed to queue delete, falling back:', error);
+                }
+            }
             await collections.labels.deleteOne({ instanceId, id });
         },
         async getLabelAssociations() {
@@ -642,6 +1144,23 @@ const makeMongoDBStore = async (config) => {
             return associations.map(assoc => assoc.labelId);
         },
         async upsertLabelAssociation(association) {
+            if (bullInitialized && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
+                try {
+                    const queue = queues.get(QueueType.LABEL_ASSOCIATIONS);
+                    const job = await queue.add('upsert', {
+                        type: 'upsert',
+                        association,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    labelAssociationBatch.totalReceived = (labelAssociationBatch.totalReceived || 0) + 1;
+                    console.log(`[Bull Label] Job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Label] Failed to queue job, falling back to in-memory:', error);
+                }
+            }
             return new Promise((resolve, reject) => {
                 labelAssociationBatch.totalReceived = (labelAssociationBatch.totalReceived || 0) + 1;
                 labelAssociationBatch.items.push(association);
@@ -666,6 +1185,22 @@ const makeMongoDBStore = async (config) => {
             });
         },
         async deleteLabelAssociation(association) {
+            if (bullInitialized && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
+                try {
+                    const queue = queues.get(QueueType.LABEL_ASSOCIATIONS);
+                    const job = await queue.add('delete', {
+                        type: 'delete',
+                        association,
+                        instanceId,
+                        timestamp: Date.now()
+                    }, defaultJobOptions);
+                    console.log(`[Bull Label] Delete job ${job.id} queued - chatId: ${association.chatId}, labelId: ${association.labelId}`);
+                    return;
+                }
+                catch (error) {
+                    console.error('[Bull Label] Failed to queue delete job, falling back to direct deletion:', error);
+                }
+            }
             await collections.labelAssociations.deleteOne({
                 instanceId,
                 chatId: association.chatId,
@@ -884,7 +1419,7 @@ const makeMongoDBStore = async (config) => {
         },
         getPerformanceStats() {
             const uptime = Date.now() - performanceMetrics.lastResetTime.getTime();
-            return {
+            const stats = {
                 ...performanceMetrics,
                 uptime,
                 labelStats: {
@@ -894,6 +1429,25 @@ const makeMongoDBStore = async (config) => {
                     isProcessing: labelAssociationBatch.processing
                 }
             };
+            if (bullInitialized) {
+                const queueStats = {};
+                for (const [queueType] of queues.entries()) {
+                    queueStats[queueType] = 'active';
+                }
+                stats.bullStats = {
+                    initialized: true,
+                    queues: queueStats,
+                    totalQueues: queues.size,
+                    redisConnected: redisConnection?.status === 'ready'
+                };
+            }
+            else {
+                stats.bullStats = {
+                    initialized: false,
+                    reason: redis ? 'initialization failed' : 'not configured'
+                };
+            }
+            return stats;
         },
         async flushLabelAssociations() {
             console.log(`[Label Flush] Forcing flush of ${labelAssociationBatch.items.length} pending label associations`);
@@ -976,9 +1530,29 @@ const makeMongoDBStore = async (config) => {
             if (messageBatch.timer) {
                 clearTimeout(messageBatch.timer);
             }
+            if (bullInitialized) {
+                console.log(`🛑 Closing Bull queues for instance ${instanceId}...`);
+                try {
+                    if (healthCheckInterval) {
+                        clearInterval(healthCheckInterval);
+                        healthCheckInterval = null;
+                    }
+                    for (const worker of workers.values()) {
+                        await worker.close();
+                    }
+                    for (const queue of queues.values()) {
+                        await queue.close();
+                    }
+                    if (redisConnection)
+                        redisConnection.disconnect();
+                }
+                catch (error) {
+                    console.error('Error closing Bull queues:', error);
+                }
+            }
             await Promise.all([
-                messageQueue.onIdle(),
-                labelQueue.onIdle(),
+                pMessageQueue.onIdle(),
+                pLabelQueue.onIdle(),
                 generalQueue.onIdle()
             ]);
             const keys = binaryConversionCache.keys();

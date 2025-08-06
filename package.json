@@ -23,6 +23,8 @@
   "license": "MIT",
   "dependencies": {
     "baileys": "^6.7.18",
+    "bullmq": "^5.56.9",
+    "ioredis": "^5.7.0",
     "mongodb": "^6.3.0",
     "node-cache": "^5.1.2",
     "p-queue": "^8.1.0"

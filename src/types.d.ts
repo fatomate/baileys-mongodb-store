@@ -4,6 +4,45 @@ import type { proto } from 'baileys'
 import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata, PresenceData, WAMessageCursor } from 'baileys'
 import type { Label } from 'baileys/lib/Types/Label'
 import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
+import type { RedisOptions } from 'ioredis'
+
+export interface RedisConfig {
+    /**
+     * Redis connection options for Bull queue
+     * Can be a connection string or RedisOptions object
+     */
+    connection: string | RedisOptions
+    
+    /**
+     * Optional queue name prefix (default: 'baileys')
+     */
+    queuePrefix?: string
+    
+    /**
+     * Enable Bull queue for label associations (default: true if Redis config provided)
+     */
+    enableLabelQueue?: boolean
+    
+    /**
+     * Enable Bull queue for messages (default: false)
+     */
+    enableMessageQueue?: boolean
+    
+    /**
+     * Max jobs to process concurrently (default: 50)
+     */
+    concurrency?: number
+    
+    /**
+     * Remove completed jobs after this many seconds (default: 3600)
+     */
+    removeOnComplete?: number
+    
+    /**
+     * Remove failed jobs after this many seconds (default: 86400)
+     */
+    removeOnFail?: number
+}
 
 export interface MongoDBStoreConfig {
     /**
@@ -46,6 +85,12 @@ export interface MongoDBStoreConfig {
      * Collection name prefix (default: 'baileys_')
      */
     collectionPrefix?: string
+    
+    /**
+     * Optional Redis configuration for Bull queue
+     * If provided, will use Bull for robust queue handling
+     */
+    redis?: RedisConfig
 }
 
 export interface MongoDBStore {
