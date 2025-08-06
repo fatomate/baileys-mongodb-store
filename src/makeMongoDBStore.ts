@@ -1963,6 +1963,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             ev.on('labels.edit', async (label) => {
                 if (label.deleted) {
                     await store.deleteLabel(label.id)
+                    // Also delete all associations for this label
+                    const deleteResult = await collections.labelAssociations.deleteMany({
+                        instanceId,
+                        labelId: label.id
+                    })
+                    if (deleteResult.deletedCount > 0) {
+                        log(`Deleted ${deleteResult.deletedCount} label associations for deleted label ${label.id}`)
+                    }
                 } else {
                     await store.upsertLabel(label.id, label)
                 }
