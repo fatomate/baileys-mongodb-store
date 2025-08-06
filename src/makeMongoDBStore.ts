@@ -1031,7 +1031,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             { collection: 'state', spec: { instanceId: 1 }, options: { unique: true }, name: 'state_primary' },
             { collection: 'presences', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'presences_primary' },
             { collection: 'labels', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'labels_primary' },
-            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1, messageId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
+            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
         ]
         
         const optimizationIndexes = [
