@@ -605,11 +605,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const { type, jid, metadata, update } = job.data
                 
                 if (type === 'upsert') {
-                    await collections.groupMetadata.replaceOne(
-                        { instanceId, id: jid },
+                    config.logger?.debug({ instanceId, groupId: metadata.id }, 'Processing group metadata upsert job')
+                    const result = await collections.groupMetadata.replaceOne(
+                        { instanceId, id: metadata.id },
                         { ...metadata, instanceId, updatedAt: new Date() },
                         { upsert: true }
                     )
+                    config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata processed by queue')
                 } else if (type === 'update' && update) {
                     await collections.groupMetadata.updateOne(
                         { instanceId, id: jid },
@@ -1589,6 +1591,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async upsertGroupMetadata(jid: string, metadata: GroupMetadata): Promise<void> {
+            config.logger?.debug({ instanceId, groupId: metadata.id, jid }, 'Upserting group metadata')
+            
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.GROUP_METADATA)) {
                 try {
@@ -1604,6 +1608,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         },
                         defaultJobOptions
                     )
+                    config.logger?.debug({ instanceId, groupId: metadata.id }, 'Group metadata queued for processing')
                     return
                 } catch (error) {
                     logError('[Bull GroupMetadata] Failed to queue, falling back:', error)
@@ -1611,11 +1616,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             }
             
             // Fallback to direct write
-            await collections.groupMetadata.replaceOne(
-                { instanceId, id: jid },
+            const result = await collections.groupMetadata.replaceOne(
+                { instanceId, id: metadata.id },
                 { ...metadata, instanceId, updatedAt: new Date() },
                 { upsert: true }
             )
+            config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata saved directly to MongoDB')
         },
 
         async getState(): Promise<ConnectionState> {
@@ -2048,8 +2054,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             })
 
             ev.on('groups.upsert', async groups => {
+                config.logger?.info({ instanceId, count: groups.length }, 'Processing groups.upsert event')
                 for (const group of groups) {
                     await store.upsertGroupMetadata(group.id, group)
+                    config.logger?.debug({ instanceId, groupId: group.id }, 'Group metadata upserted')
                 }
             })
 
