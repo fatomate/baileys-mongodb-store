@@ -9,7 +9,8 @@
       "Bash(npm run lint)",
       "Bash(npm install:*)",
       "Bash(npx eslint:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(mv:*)"
     ],
     "deny": []
   }

@@ -4,6 +4,60 @@
 
 The enhanced MongoDB store provides flexible control over which WhatsApp events are stored and how long they are retained. This allows for optimized storage usage, compliance with data retention policies, and improved performance.
 
+## Redis Bull Queue Integration
+
+The enhanced store includes full Redis Bull queue support for reliable background job processing:
+
+### Required Dependencies
+- **Redis Server**: Required for production use
+- **Bull MQ**: Handles job queuing and processing
+- **ioredis**: Redis client for Node.js
+
+### Queue Configuration
+```javascript
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_store',
+    instanceId: 'bot_001',
+    
+    // Redis configuration
+    redisOptions: {
+        host: 'localhost',
+        port: 6379,
+        password: 'your-redis-password',
+        db: 0,
+        maxRetriesPerRequest: 3,
+        enableOfflineQueue: true
+    },
+    
+    // Queue configuration (optional)
+    queueOptions: {
+        defaultJobOptions: {
+            removeOnComplete: true,
+            removeOnFail: false,
+            attempts: 3
+        }
+    }
+})
+```
+
+### Supported Queue Types
+- **labels**: Label management operations
+- **label-associations**: Label-chat associations
+- **messages**: Message storage and updates
+- **chats**: Chat metadata and state
+- **contacts**: Contact information
+- **group-metadata**: Group information and participants
+- **presences**: User presence updates
+- **state**: Connection and auth state
+
+### Benefits of Redis Queue
+- **Reliability**: Jobs are persisted in Redis and survive application restarts
+- **Performance**: Non-blocking background processing
+- **Scalability**: Can distribute workers across multiple instances
+- **Monitoring**: Built-in job status tracking and metrics
+- **Retry Logic**: Automatic retry with exponential backoff
+
 ## Key Features
 
 ### 1. Selective Event Storage

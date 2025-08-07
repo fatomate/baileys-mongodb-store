@@ -5,7 +5,7 @@
 
 const makeWASocket = require('@whiskeysockets/baileys').default
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const { makeEnhancedMongoDBStore } = require('../src/makeEnhancedMongoDBStore')
+const { makeEnhancedMongoDBStore } = require('@baileys/mongodb-store')
 const crypto = require('crypto')
 
 // Helper function to hash/anonymize sensitive data

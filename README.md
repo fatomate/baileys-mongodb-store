@@ -12,6 +12,7 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - **📊 Event Metrics**: Track what's being stored with detailed metrics
 - **🪝 Hooks System**: Add pre/post-processing logic for events
 - **🔧 Runtime Configuration**: Update storage settings without restarting
+- **🚀 Redis Bull Queue**: Full Redis Bull queue support for reliable background processing
 
 ### Existing Features
 - **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes
@@ -132,6 +133,15 @@ interface MongoDBStoreConfig {
 
 ```typescript
 interface EnhancedMongoDBStoreConfig extends MongoDBStoreConfig {
+    // Redis configuration for Bull queues
+    redisOptions?: {
+        host?: string         // Redis host (default: 'localhost')
+        port?: number         // Redis port (default: 6379)
+        password?: string     // Redis password
+        db?: number          // Redis database number
+        // ... other ioredis options
+    }
+    
     // Per-collection TTL configuration
     collectionTTL?: {
         messages?: number      // TTL for messages collection
