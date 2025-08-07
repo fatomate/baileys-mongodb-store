@@ -2,8 +2,18 @@
 
 A high-performance MongoDB store implementation for [Baileys](https://github.com/WhiskeySockets/Baileys) WhatsApp Web API with multi-instance support, automatic TTL (Time To Live) for data expiration, and optimized for handling thousands of concurrent operations.
 
-## 🆕 What's New
+## 🆕 What's New in v2.0
 
+### Enhanced Store Features
+- **🎯 Selective Event Storage**: Choose exactly which WhatsApp events to store
+- **⏱️ Flexible TTL Configuration**: Set different retention periods per event type or collection
+- **🔍 Event Filtering**: Filter events before storage with custom logic
+- **🔄 Data Transformation**: Transform data before storing (anonymize, redact, etc.)
+- **📊 Event Metrics**: Track what's being stored with detailed metrics
+- **🪝 Hooks System**: Add pre/post-processing logic for events
+- **🔧 Runtime Configuration**: Update storage settings without restarting
+
+### Existing Features
 - **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes
 - **Automatic Batch Processing**: Label associations and bulk messages are automatically batched
 - **Performance Monitoring**: New `getPerformanceStats()` and `resetPerformanceStats()` methods
@@ -94,6 +104,8 @@ connectToWhatsApp()
 
 ## Configuration Options
 
+### Basic Configuration (v1 - Still Supported)
+
 ```typescript
 interface MongoDBStoreConfig {
     // MongoDB connection URI
@@ -113,6 +125,46 @@ interface MongoDBStoreConfig {
     
     // Collection name prefix (default: 'baileys_')
     collectionPrefix?: string
+}
+```
+
+### Enhanced Configuration (v2 - New!)
+
+```typescript
+interface EnhancedMongoDBStoreConfig extends MongoDBStoreConfig {
+    // Per-collection TTL configuration
+    collectionTTL?: {
+        messages?: number      // TTL for messages collection
+        chats?: number        // TTL for chats collection
+        contacts?: number     // TTL for contacts collection
+        groupMetadata?: number // TTL for groups
+        presences?: number    // TTL for presence data
+        labels?: number       // TTL for labels
+    }
+    
+    // Event storage configuration
+    events?: {
+        'messages.upsert'?: {
+            enabled?: boolean     // Whether to store this event
+            ttlDays?: number     // Custom TTL for this event
+            filter?: (data) => boolean  // Filter function
+            transform?: (data) => any   // Transform function
+        },
+        // ... configure any Baileys event
+    }
+    
+    // Store all events by default? (default: true)
+    storeAllByDefault?: boolean
+    
+    // Enable event metrics tracking
+    enableMetrics?: boolean
+    
+    // Hooks for custom processing
+    hooks?: {
+        beforeStore?: (eventType, data) => boolean
+        afterStore?: (eventType, data) => void
+        onError?: (eventType, error, data) => void
+    }
 }
 ```
 
@@ -423,6 +475,116 @@ ev.on('messaging-history.set', async ({ messages }) => {
 })
 ```
 
+## Enhanced Store Examples (v2)
+
+### Example 1: Minimal Storage (Cost Optimization)
+
+```javascript
+const { makeEnhancedMongoDBStore } = require('@baileys/mongodb-store')
+
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_minimal',
+    instanceId: 'bot_001',
+    storeAllByDefault: false, // Only store explicitly enabled events
+    events: {
+        'connection.update': { enabled: true, ttlDays: 1 },
+        'messages.upsert': { 
+            enabled: true, 
+            ttlDays: 3,
+            filter: (data) => {
+                // Only store text messages
+                return data.messages?.some(msg => 
+                    msg.message?.conversation || 
+                    msg.message?.extendedTextMessage
+                )
+            }
+        },
+        'chats.upsert': { enabled: true, ttlDays: 7 }
+    }
+})
+```
+
+### Example 2: Compliance-Focused (GDPR)
+
+```javascript
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_gdpr',
+    instanceId: 'bot_002',
+    collectionTTL: {
+        messages: 30,      // 30-day retention
+        contacts: 365,     // 1-year retention
+        presences: 1       // 24-hour retention
+    },
+    events: {
+        'messages.upsert': {
+            enabled: true,
+            ttlDays: 30,
+            transform: (data) => {
+                // Anonymize phone numbers in message content
+                if (data.messages) {
+                    data.messages = data.messages.map(msg => {
+                        if (msg.message?.conversation) {
+                            msg.message.conversation = msg.message.conversation
+                                .replace(/\d{10,}/g, '[REDACTED]')
+                        }
+                        return msg
+                    })
+                }
+                return data
+            }
+        }
+    }
+})
+```
+
+### Example 3: Skip Presence Updates (High Performance)
+
+```javascript
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_performance',
+    instanceId: 'bot_003',
+    events: {
+        'presence.update': { enabled: false }, // Skip high-volume presence updates
+        'message-receipt.update': { enabled: false } // Skip receipts
+    },
+    enableMetrics: true // Track what's being stored
+})
+
+// Monitor metrics
+setInterval(() => {
+    const metrics = store.getEventMetrics()
+    console.log('Event metrics:', metrics)
+}, 60000)
+```
+
+### Example 4: Dynamic Configuration
+
+```javascript
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_dynamic',
+    instanceId: 'bot_004',
+    enableMetrics: true
+})
+
+// Adjust storage based on conditions
+const hour = new Date().getHours()
+if (hour >= 9 && hour <= 17) {
+    // Business hours - store everything
+    store.updateEventConfig('messages.upsert', { enabled: true, ttlDays: 30 })
+} else {
+    // After hours - minimal storage
+    store.updateEventConfig('messages.upsert', { 
+        enabled: true, 
+        ttlDays: 7,
+        filter: (data) => data.messages?.some(msg => msg.pushName === 'VIP')
+    })
+}
+```
+
 ## Performance Tips
 
 1. **Indexes**: The store automatically creates optimal indexes on first run
@@ -430,6 +592,8 @@ ev.on('messaging-history.set', async ({ messages }) => {
 3. **Batch Operations**: Automatic batching for labels and optional for messages
 4. **TTL**: Configure appropriate TTL to prevent unlimited data growth
 5. **Monitoring**: Use `getPerformanceStats()` to monitor performance
+6. **Event Filtering**: Filter out unnecessary events to reduce storage
+7. **Selective Storage**: Only store events you actually need
 
 ## Migration from In-Memory Store
 
