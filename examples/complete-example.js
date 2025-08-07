@@ -91,11 +91,15 @@ async function connectToWhatsApp() {
             const groups = await sock.groupFetchAllParticipating()
             logger.info(`Found ${Object.keys(groups).length} groups`)
             
-            // Store each group's metadata (store.bind() handles this automatically,
-            // but we can manually ensure all groups are saved)
-            for (const [groupId, metadata] of Object.entries(groups)) {
-                await store.upsertGroupMetadata(groupId, metadata)
-            }
+            // IMPORTANT: Groups are automatically saved via store.bind(sock.ev)
+            // The store listens for groups.upsert events that are triggered
+            // when groupFetchAllParticipating completes
+            
+            // Optional: Manually save if you need immediate persistence
+            // or if you're not using store.bind()
+            // for (const [groupId, metadata] of Object.entries(groups)) {
+            //     await store.upsertGroupMetadata(groupId, metadata)
+            // }
 
             // Example: Access store data
             const chats = await store.getChats()

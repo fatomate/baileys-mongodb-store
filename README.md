@@ -205,16 +205,21 @@ await store.upsertContacts([
 sock.ev.on('connection.update', async (update) => {
     if (update.connection === 'open') {
         const groups = await sock.groupFetchAllParticipating()
-        // Groups are automatically saved if store.bind() is active
-        // Or manually save each group:
-        for (const [groupId, metadata] of Object.entries(groups)) {
-            await store.upsertGroupMetadata(groupId, metadata)
-        }
+        // Groups are automatically saved via store.bind() when this completes
+        // It triggers groups.upsert events that the store captures
+        
+        // Optional: Only manually save if NOT using store.bind()
+        // for (const [groupId, metadata] of Object.entries(groups)) {
+        //     await store.upsertGroupMetadata(groupId, metadata)
+        // }
     }
 })
 
 // Get group metadata from store
 const groupInfo = await store.getGroupMetadata('123456789@g.us')
+
+// Get all groups for this instance
+const allGroups = await store.getAllGroupMetadata()
 
 // Manually update group metadata (usually handled automatically by events)
 await store.upsertGroupMetadata('123456789@g.us', {
@@ -225,7 +230,7 @@ await store.upsertGroupMetadata('123456789@g.us', {
     creation: 1234567890
 })
 
-// Group events are automatically handled:
+// Group events are automatically handled by store.bind():
 // - New groups (groups.upsert)
 // - Group info changes (groups.update) 
 // - Participant changes (group-participants.update)

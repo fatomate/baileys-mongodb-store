@@ -42,15 +42,23 @@ async function connectToWhatsApp() {
             console.log('📋 Fetching all group metadata...')
             const groups = await sock.groupFetchAllParticipating()
             
-            // Store each group's metadata
-            for (const [groupId, metadata] of Object.entries(groups)) {
-                // The store.bind() will automatically handle this through events,
-                // but you can also manually save if needed:
-                await store.upsertGroupMetadata(groupId, metadata)
-                console.log(`✅ Saved group: ${metadata.subject} (${groupId})`)
-            }
+            console.log(`📊 Found ${Object.keys(groups).length} groups`)
             
-            console.log(`📊 Total groups saved: ${Object.keys(groups).length}`)
+            // IMPORTANT: Groups are automatically saved via store.bind(sock.ev)
+            // When groupFetchAllParticipating completes, it triggers groups.upsert events
+            // which are captured by the store and saved to MongoDB
+            
+            // Optional: Only manually save if you're NOT using store.bind() or need immediate persistence
+            // for (const [groupId, metadata] of Object.entries(groups)) {
+            //     await store.upsertGroupMetadata(groupId, metadata)
+            //     console.log(`✅ Manually saved group: ${metadata.subject} (${groupId})`)
+            // }
+            
+            // Verify groups were saved by the store
+            setTimeout(async () => {
+                const allGroups = await store.getAllGroupMetadata()
+                console.log(`✅ Verified: ${allGroups.length} groups saved in MongoDB`)
+            }, 2000) // Wait 2 seconds for async processing
         }
     })
 
