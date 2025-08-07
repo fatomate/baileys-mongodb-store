@@ -150,9 +150,24 @@ const convertBinaryToBuffer = (obj: any): any => {
     try {
         if (!obj || typeof obj !== 'object') return obj
         
-        // Handle Binary objects
-        if (obj.buffer && obj._bsontype === 'Binary') {
-            return Buffer.from(obj.buffer)
+        // Handle MongoDB Binary objects
+        if (obj._bsontype === 'Binary') {
+            // For Binary objects, use the buffer property directly
+            if (obj.buffer instanceof Buffer) {
+                return Buffer.from(obj.buffer)
+            } else if (obj.buffer instanceof ArrayBuffer) {
+                return Buffer.from(obj.buffer)
+            } else if (obj.buffer instanceof Uint8Array) {
+                return Buffer.from(obj.buffer)
+            } else if (obj.buffer) {
+                // Fallback for other buffer types
+                return Buffer.from(obj.buffer)
+            }
+        }
+        
+        // Handle direct Buffer-like objects that might have been serialized
+        if (obj.type === 'Buffer' && Array.isArray(obj.data)) {
+            return Buffer.from(obj.data)
         }
         
         // Handle arrays
@@ -169,7 +184,7 @@ const convertBinaryToBuffer = (obj: any): any => {
         }
         return result
     } catch (error) {
-        // Error converting Binary to Buffer - return original object
+        console.error('Error converting binary to buffer:', error)
         return obj
     }
 }
@@ -1410,7 +1425,27 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 .toArray()
             
             // Convert Binary objects and preserve messageContextInfo
-            return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg))
+            return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => {
+                const converted = convertBinaryToBuffer(msg)
+                
+                // Special handling for messageSecret in poll messages
+                if (msg.message?.messageContextInfo?.messageSecret) {
+                    const secret = msg.message.messageContextInfo.messageSecret as any
+                    if (secret._bsontype === 'Binary' && secret.buffer) {
+                        converted.message.messageContextInfo.messageSecret = Buffer.from(secret.buffer)
+                    } else if (secret.type === 'Buffer' && Array.isArray(secret.data)) {
+                        converted.message.messageContextInfo.messageSecret = Buffer.from(secret.data)
+                    } else if (!Buffer.isBuffer(secret)) {
+                        try {
+                            converted.message.messageContextInfo.messageSecret = Buffer.from(secret)
+                        } catch (e) {
+                            console.error('Failed to convert messageSecret to Buffer:', e)
+                        }
+                    }
+                }
+                
+                return converted
+            })
         },
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
@@ -1431,6 +1466,24 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message
             // Convert all MongoDB Binary objects to Buffers and preserve messageContextInfo
             const converted = convertBinaryToBuffer(msg)
+            
+            // Special handling for messageSecret in poll messages
+            if (msg.message?.messageContextInfo?.messageSecret) {
+                const secret = msg.message.messageContextInfo.messageSecret as any
+                if (secret._bsontype === 'Binary' && secret.buffer) {
+                    // Ensure the messageSecret is properly converted to a Buffer
+                    converted.message.messageContextInfo.messageSecret = Buffer.from(secret.buffer)
+                } else if (secret.type === 'Buffer' && Array.isArray(secret.data)) {
+                    converted.message.messageContextInfo.messageSecret = Buffer.from(secret.data)
+                } else if (!Buffer.isBuffer(secret)) {
+                    // Try to convert to Buffer if it's not already
+                    try {
+                        converted.message.messageContextInfo.messageSecret = Buffer.from(secret)
+                    } catch (e) {
+                        console.error('Failed to convert messageSecret to Buffer:', e)
+                    }
+                }
+            }
             
             // Cache the converted message
             binaryConversionCache.set(cacheKey, converted)

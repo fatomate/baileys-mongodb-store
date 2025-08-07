@@ -38,8 +38,22 @@ const convertBinaryToBuffer = (obj) => {
     try {
         if (!obj || typeof obj !== 'object')
             return obj;
-        if (obj.buffer && obj._bsontype === 'Binary') {
-            return Buffer.from(obj.buffer);
+        if (obj._bsontype === 'Binary') {
+            if (obj.buffer instanceof Buffer) {
+                return Buffer.from(obj.buffer);
+            }
+            else if (obj.buffer instanceof ArrayBuffer) {
+                return Buffer.from(obj.buffer);
+            }
+            else if (obj.buffer instanceof Uint8Array) {
+                return Buffer.from(obj.buffer);
+            }
+            else if (obj.buffer) {
+                return Buffer.from(obj.buffer);
+            }
+        }
+        if (obj.type === 'Buffer' && Array.isArray(obj.data)) {
+            return Buffer.from(obj.data);
         }
         if (Array.isArray(obj)) {
             return obj.map(item => convertBinaryToBuffer(item));
@@ -53,6 +67,7 @@ const convertBinaryToBuffer = (obj) => {
         return result;
     }
     catch (error) {
+        console.error('Error converting binary to buffer:', error);
         return obj;
     }
 };
@@ -965,7 +980,27 @@ const makeMongoDBStore = async (config) => {
                 .find({ instanceId, jid })
                 .sort({ messageTimestamp: -1 })
                 .toArray();
-            return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg));
+            return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => {
+                const converted = convertBinaryToBuffer(msg);
+                if (msg.message?.messageContextInfo?.messageSecret) {
+                    const secret = msg.message.messageContextInfo.messageSecret;
+                    if (secret._bsontype === 'Binary' && secret.buffer) {
+                        converted.message.messageContextInfo.messageSecret = Buffer.from(secret.buffer);
+                    }
+                    else if (secret.type === 'Buffer' && Array.isArray(secret.data)) {
+                        converted.message.messageContextInfo.messageSecret = Buffer.from(secret.data);
+                    }
+                    else if (!Buffer.isBuffer(secret)) {
+                        try {
+                            converted.message.messageContextInfo.messageSecret = Buffer.from(secret);
+                        }
+                        catch (e) {
+                            console.error('Failed to convert messageSecret to Buffer:', e);
+                        }
+                    }
+                }
+                return converted;
+            });
         },
         async getMessage(jid, id) {
             const cacheKey = `msg_${instanceId}_${jid}_${id}`;
@@ -981,6 +1016,23 @@ const makeMongoDBStore = async (config) => {
                 return null;
             const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message;
             const converted = convertBinaryToBuffer(msg);
+            if (msg.message?.messageContextInfo?.messageSecret) {
+                const secret = msg.message.messageContextInfo.messageSecret;
+                if (secret._bsontype === 'Binary' && secret.buffer) {
+                    converted.message.messageContextInfo.messageSecret = Buffer.from(secret.buffer);
+                }
+                else if (secret.type === 'Buffer' && Array.isArray(secret.data)) {
+                    converted.message.messageContextInfo.messageSecret = Buffer.from(secret.data);
+                }
+                else if (!Buffer.isBuffer(secret)) {
+                    try {
+                        converted.message.messageContextInfo.messageSecret = Buffer.from(secret);
+                    }
+                    catch (e) {
+                        console.error('Failed to convert messageSecret to Buffer:', e);
+                    }
+                }
+            }
             binaryConversionCache.set(cacheKey, converted);
             return converted;
         },
