@@ -358,12 +358,22 @@ const makeMongoDBStore = async (config) => {
             });
             createQueueAndWorker(QueueType.GROUP_METADATA, async (job) => {
                 const { type, jid, metadata, update } = job.data;
+                console.log(`[${instanceId}] Bull worker processing job ${job.id} for group metadata`);
                 if (type === 'upsert') {
+                    console.log(`[${instanceId}] Processing upsert for group ${metadata.id}`);
                     config.logger?.debug({ instanceId, groupId: metadata.id }, 'Processing group metadata upsert job');
-                    const result = await collections.groupMetadata.replaceOne({ instanceId, id: metadata.id }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
-                    config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata processed by queue');
+                    try {
+                        const result = await collections.groupMetadata.replaceOne({ instanceId, id: metadata.id }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
+                        console.log(`[${instanceId}] Bull worker result for group ${metadata.id}: upserted=${result.upsertedCount}, modified=${result.modifiedCount}`);
+                        config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata processed by queue');
+                    }
+                    catch (error) {
+                        console.error(`[${instanceId}] Bull worker failed for group ${metadata.id}:`, error);
+                        throw error;
+                    }
                 }
                 else if (type === 'update' && update) {
+                    console.log(`[${instanceId}] Processing update for group ${jid}`);
                     await collections.groupMetadata.updateOne({ instanceId, id: jid }, { $set: { ...update, updatedAt: new Date() } });
                 }
                 return { success: true };
@@ -1100,26 +1110,39 @@ const makeMongoDBStore = async (config) => {
                 config.logger?.error({ instanceId, jid, metadata }, 'GroupMetadata missing id field');
                 throw new Error(`GroupMetadata missing id field for jid: ${jid}`);
             }
+            console.log(`[${instanceId}] upsertGroupMetadata called for group ${metadata.id}`);
+            console.log(`[${instanceId}] Bull initialized: ${bullInitialized}, Has queue: ${queues.has(QueueType.GROUP_METADATA)}`);
             config.logger?.debug({ instanceId, groupId: metadata.id, jid }, 'Upserting group metadata');
             if (bullInitialized && queues.has(QueueType.GROUP_METADATA)) {
                 try {
+                    console.log(`[${instanceId}] Using Bull queue for group ${metadata.id}`);
                     const queue = queues.get(QueueType.GROUP_METADATA);
-                    await queue.add('upsert', {
+                    const job = await queue.add('upsert', {
                         type: 'upsert',
                         jid,
                         metadata,
                         instanceId,
                         timestamp: Date.now()
                     }, defaultJobOptions);
+                    console.log(`[${instanceId}] Job queued with ID: ${job.id} for group ${metadata.id}`);
                     config.logger?.debug({ instanceId, groupId: metadata.id }, 'Group metadata queued for processing');
                     return;
                 }
                 catch (error) {
+                    console.error(`[${instanceId}] Bull queue failed for group ${metadata.id}:`, error);
                     logError('[Bull GroupMetadata] Failed to queue, falling back:', error);
                 }
             }
-            const result = await collections.groupMetadata.replaceOne({ instanceId, id: metadata.id }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
-            config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata saved directly to MongoDB');
+            console.log(`[${instanceId}] Using direct MongoDB write for group ${metadata.id}`);
+            try {
+                const result = await collections.groupMetadata.replaceOne({ instanceId, id: metadata.id }, { ...metadata, instanceId, updatedAt: new Date() }, { upsert: true });
+                console.log(`[${instanceId}] Direct write result for group ${metadata.id}: upserted=${result.upsertedCount}, modified=${result.modifiedCount}`);
+                config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata saved directly to MongoDB');
+            }
+            catch (error) {
+                console.error(`[${instanceId}] Direct MongoDB write failed for group ${metadata.id}:`, error);
+                throw error;
+            }
         },
         async getState() {
             const state = await collections.state.findOne({ instanceId });
@@ -1317,6 +1340,7 @@ const makeMongoDBStore = async (config) => {
             }
         },
         bind(ev) {
+            console.log(`[${instanceId}] store.bind() called - setting up event listeners`);
             ev.on('connection.update', async (update) => {
                 await store.updateState(update);
             });
@@ -1433,15 +1457,35 @@ const makeMongoDBStore = async (config) => {
                 }
             });
             ev.on('groups.update', async (updates) => {
+                console.log(`[${instanceId}] groups.update event received with ${updates.length} updates`);
+                config.logger?.info({ instanceId, count: updates.length }, 'Processing groups.update event');
                 for (const update of updates) {
-                    const metadata = await store.getGroupMetadata(update.id);
-                    if (metadata) {
-                        Object.assign(metadata, update);
-                        await store.upsertGroupMetadata(update.id, metadata);
+                    if (update.participants && Array.isArray(update.participants)) {
+                        config.logger?.debug({ instanceId, groupId: update.id }, 'Saving complete group metadata from groups.update');
+                        await store.upsertGroupMetadata(update.id, update);
+                    }
+                    else {
+                        const existingMetadata = await store.getGroupMetadata(update.id);
+                        if (existingMetadata) {
+                            config.logger?.debug({ instanceId, groupId: update.id }, 'Merging group update with existing metadata');
+                            Object.assign(existingMetadata, update);
+                            await store.upsertGroupMetadata(update.id, existingMetadata);
+                        }
+                        else {
+                            config.logger?.debug({ instanceId, groupId: update.id }, 'Creating new group metadata from update');
+                            const newMetadata = {
+                                id: update.id,
+                                subject: update.subject || '',
+                                participants: [],
+                                ...update
+                            };
+                            await store.upsertGroupMetadata(update.id, newMetadata);
+                        }
                     }
                 }
             });
             ev.on('groups.upsert', async (groups) => {
+                console.log(`[${instanceId}] groups.upsert event received with ${groups.length} groups`);
                 config.logger?.info({ instanceId, count: groups.length }, 'Processing groups.upsert event');
                 for (const group of groups) {
                     await store.upsertGroupMetadata(group.id, group);
