@@ -86,9 +86,23 @@ async function connectToWhatsApp() {
         } else if (connection === 'open') {
             logger.info('WhatsApp connection opened successfully')
 
+            // Fetch and store all group metadata on connection
+            logger.info('Fetching all group metadata...')
+            const groups = await sock.groupFetchAllParticipating()
+            logger.info(`Found ${Object.keys(groups).length} groups`)
+            
+            // Store each group's metadata (store.bind() handles this automatically,
+            // but we can manually ensure all groups are saved)
+            for (const [groupId, metadata] of Object.entries(groups)) {
+                await store.upsertGroupMetadata(groupId, metadata)
+            }
+
             // Example: Access store data
             const chats = await store.getChats()
+            const contacts = await store.getContacts()
             logger.info(`Loaded ${chats.length} chats from MongoDB`)
+            logger.info(`Loaded ${Object.keys(contacts).length} contacts`)
+            logger.info(`Loaded ${Object.keys(groups).length} groups`)
             
             // Log queue statistics
             const currentStats = store.getPerformanceStats()
@@ -142,6 +156,27 @@ async function connectToWhatsApp() {
                     `• Uptime: ${Math.floor(storeStats.uptime / 1000 / 60)}m`
                 
                 await sock.sendMessage(msg.key.remoteJid, { text: statsText })
+            }
+
+            // Show group info if in a group
+            if (messageContent.toLowerCase() === '!groupinfo' && msg.key.remoteJid.endsWith('@g.us')) {
+                const groupId = msg.key.remoteJid
+                const metadata = await store.getGroupMetadata(groupId)
+                
+                if (metadata) {
+                    const groupInfo = `👥 Group Information:\n\n` +
+                        `• Name: ${metadata.subject}\n` +
+                        `• ID: ${groupId}\n` +
+                        `• Owner: ${metadata.owner || 'Unknown'}\n` +
+                        `• Participants: ${metadata.participants.length}\n` +
+                        `• Admins: ${metadata.participants.filter(p => p.isAdmin).length}\n` +
+                        `• Created: ${metadata.creation ? new Date(metadata.creation * 1000).toLocaleString() : 'Unknown'}\n` +
+                        `• Description: ${metadata.desc || 'No description'}`
+                    
+                    await sock.sendMessage(msg.key.remoteJid, { text: groupInfo })
+                } else {
+                    await sock.sendMessage(msg.key.remoteJid, { text: '❌ Group metadata not found' })
+                }
             }
 
             if (messageContent.toLowerCase() === '!queues') {

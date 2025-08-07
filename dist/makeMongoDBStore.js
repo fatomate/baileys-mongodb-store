@@ -1428,6 +1428,11 @@ const makeMongoDBStore = async (config) => {
                     }
                 }
             });
+            ev.on('groups.upsert', async (groups) => {
+                for (const group of groups) {
+                    await store.upsertGroupMetadata(group.id, group);
+                }
+            });
             ev.on('group-participants.update', async ({ id, participants, action }) => {
                 const metadata = await store.getGroupMetadata(id);
                 if (metadata) {

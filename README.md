@@ -198,15 +198,37 @@ await store.upsertContacts([
 ### Group Management
 
 ```typescript
-// Get group metadata
+// IMPORTANT: Group metadata is automatically captured when store.bind(sock.ev) is called
+// The store listens for: groups.upsert, groups.update, group-participants.update
+
+// Fetch all groups on connection (recommended for initial sync)
+sock.ev.on('connection.update', async (update) => {
+    if (update.connection === 'open') {
+        const groups = await sock.groupFetchAllParticipating()
+        // Groups are automatically saved if store.bind() is active
+        // Or manually save each group:
+        for (const [groupId, metadata] of Object.entries(groups)) {
+            await store.upsertGroupMetadata(groupId, metadata)
+        }
+    }
+})
+
+// Get group metadata from store
 const groupInfo = await store.getGroupMetadata('123456789@g.us')
 
-// Update group metadata
+// Manually update group metadata (usually handled automatically by events)
 await store.upsertGroupMetadata('123456789@g.us', {
     id: '123456789@g.us',
     subject: 'Family Group',
-    participants: [...]
+    participants: [...],
+    owner: '1234567890@s.whatsapp.net',
+    creation: 1234567890
 })
+
+// Group events are automatically handled:
+// - New groups (groups.upsert)
+// - Group info changes (groups.update) 
+// - Participant changes (group-participants.update)
 ```
 
 ### Label Management
