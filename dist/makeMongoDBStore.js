@@ -1091,7 +1091,15 @@ const makeMongoDBStore = async (config) => {
             const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadataData } = metadata;
             return metadataData;
         },
+        async getAllGroupMetadata() {
+            const groups = await collections.groupMetadata.find({ instanceId }).toArray();
+            return groups.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadata }) => metadata);
+        },
         async upsertGroupMetadata(jid, metadata) {
+            if (!metadata.id) {
+                config.logger?.error({ instanceId, jid, metadata }, 'GroupMetadata missing id field');
+                throw new Error(`GroupMetadata missing id field for jid: ${jid}`);
+            }
             config.logger?.debug({ instanceId, groupId: metadata.id, jid }, 'Upserting group metadata');
             if (bullInitialized && queues.has(QueueType.GROUP_METADATA)) {
                 try {

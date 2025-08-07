@@ -1589,8 +1589,19 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             const { _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadataData } = metadata
             return metadataData as GroupMetadata
         },
+        
+        async getAllGroupMetadata(): Promise<GroupMetadata[]> {
+            const groups = await collections.groupMetadata.find({ instanceId }).toArray()
+            return groups.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadata }) => metadata as GroupMetadata)
+        },
 
         async upsertGroupMetadata(jid: string, metadata: GroupMetadata): Promise<void> {
+            // Ensure metadata has an id field
+            if (!metadata.id) {
+                config.logger?.error({ instanceId, jid, metadata }, 'GroupMetadata missing id field')
+                throw new Error(`GroupMetadata missing id field for jid: ${jid}`)
+            }
+            
             config.logger?.debug({ instanceId, groupId: metadata.id, jid }, 'Upserting group metadata')
             
             // Use Bull queue if available
