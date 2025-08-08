@@ -161,11 +161,66 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
  */
 function getExtension(mimetype?: string, mediaType?: MediaType): string {
     if (mimetype) {
-        const ext = mimetype.split('/')[1]?.split(';')[0]
-        if (ext) return `.${ext}`
+        // Map common mimetypes to proper extensions
+        const mimeToExt: Record<string, string> = {
+            // Microsoft Office
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+            'application/vnd.ms-excel': '.xls',
+            'application/msword': '.doc',
+            'application/vnd.ms-powerpoint': '.ppt',
+            
+            // Images
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'image/svg+xml': '.svg',
+            
+            // Videos
+            'video/mp4': '.mp4',
+            'video/mpeg': '.mpeg',
+            'video/quicktime': '.mov',
+            'video/x-msvideo': '.avi',
+            'video/webm': '.webm',
+            
+            // Audio
+            'audio/mpeg': '.mp3',
+            'audio/wav': '.wav',
+            'audio/ogg': '.ogg',
+            'audio/opus': '.opus',
+            'audio/aac': '.aac',
+            
+            // Documents
+            'application/pdf': '.pdf',
+            'text/plain': '.txt',
+            'text/csv': '.csv',
+            'application/zip': '.zip',
+            'application/x-rar-compressed': '.rar',
+            'application/x-7z-compressed': '.7z',
+            'application/json': '.json',
+            'application/xml': '.xml',
+            'text/html': '.html'
+        }
+        
+        // Check if we have a known mapping
+        if (mimeToExt[mimetype]) {
+            return mimeToExt[mimetype]
+        }
+        
+        // For unknown mimetypes, try to extract a reasonable extension
+        const parts = mimetype.split('/')
+        if (parts.length === 2) {
+            const subtype = parts[1].split(';')[0]
+            // Avoid long extensions from complex mimetypes
+            if (subtype && subtype.length <= 10 && !subtype.includes('.')) {
+                return `.${subtype}`
+            }
+        }
     }
     
-    // Fallback extensions
+    // Fallback extensions based on media type
     switch (mediaType) {
         case 'image': return '.jpg'
         case 'video': return '.mp4'
@@ -189,8 +244,22 @@ function generateFileName(
     const sanitizedId = messageId.replace(/[^a-zA-Z0-9]/g, '_')
     
     if (originalFilename && mediaType === 'document') {
-        // Keep original filename for documents
-        const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '')
+        // Keep original filename for documents but ensure proper extension
+        let nameWithoutExt = originalFilename
+        
+        // Remove any existing extension from the original filename
+        const lastDotIndex = originalFilename.lastIndexOf('.')
+        if (lastDotIndex > 0) {
+            const existingExt = originalFilename.substring(lastDotIndex)
+            // Only remove if it looks like a valid extension (not too long)
+            if (existingExt.length <= 10) {
+                nameWithoutExt = originalFilename.substring(0, lastDotIndex)
+            }
+        }
+        
+        // Sanitize the filename to avoid path traversal issues
+        nameWithoutExt = nameWithoutExt.replace(/[^a-zA-Z0-9_\-]/g, '_')
+        
         return `${timestamp}_${sanitizedId}_${nameWithoutExt}${extension}`
     }
     
