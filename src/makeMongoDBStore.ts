@@ -37,6 +37,7 @@ interface ActiveConnection {
     database: string
     instanceId: string
     collectionPrefix: string
+    uri?: string
 }
 
 let activeConnections: ActiveConnection[] = []
@@ -2759,7 +2760,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
  * @param instanceId - The instance ID to cleanup. If not provided, closes all connections.
  * @param deleteData - Whether to delete all data for the instance (default: false)
  */
-export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boolean = false): Promise<void> => {
+export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boolean = false, mongoUri?: string, database?: string): Promise<void> => {
     if (!instanceId) {
         // Just close all connections
         const connections = [...activeConnections]
@@ -2790,10 +2791,30 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
     }
 
     // Find connections for the specific instance
-    const instanceConnections = activeConnections.filter(c => c.instanceId === instanceId)
+    let instanceConnections = activeConnections.filter(c => c.instanceId === instanceId)
     
-    if (instanceConnections.length === 0) {
-        console.warn(`No active connections found for instance: ${instanceId}`)
+    // If no active connections and deleteData is requested, create a temporary connection
+    if (instanceConnections.length === 0 && deleteData && mongoUri && database) {
+        console.log(`No active connection found for instance ${instanceId}, creating temporary connection for cleanup`)
+        try {
+            const tempClient = new MongoClient(mongoUri)
+            await tempClient.connect()
+            
+            instanceConnections = [{
+                instanceId,
+                client: tempClient,
+                database,
+                collectionPrefix: 'baileys_',
+                uri: mongoUri
+            }]
+            
+            // Don't add to activeConnections since this is temporary
+        } catch (error) {
+            console.error(`Failed to create temporary connection for cleanup of instance ${instanceId}:`, error)
+            return
+        }
+    } else if (instanceConnections.length === 0) {
+        console.warn(`No active connections found for instance: ${instanceId} and no connection info provided`)
         return
     }
 
