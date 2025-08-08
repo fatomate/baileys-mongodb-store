@@ -90,10 +90,20 @@ export const isValidMessageId = (id: string): boolean => {
  * @returns The validated message ID
  */
 export const validateMessageId = (id: string): string => {
-    if (!isValidMessageId(id)) {
-        throw new ValidationError('Invalid message ID format')
+    // Ensure id is a string and trim it first
+    const trimmedId = id?.toString().trim()
+    
+    if (!trimmedId || !isValidMessageId(trimmedId)) {
+        console.error('Message ID validation failed:', {
+            original: id,
+            trimmed: trimmedId,
+            type: typeof id,
+            length: trimmedId?.length,
+            regex: MESSAGE_ID_REGEX.source
+        })
+        throw new ValidationError(`Invalid message ID format: ${trimmedId?.substring(0, 50)}`)
     }
-    return id.trim()
+    return trimmedId
 }
 
 /**
