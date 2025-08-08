@@ -5,6 +5,9 @@ import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata
 import type { Label } from 'baileys/lib/Types/Label'
 import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 import type { RedisOptions } from 'ioredis'
+import type { AuthConfig } from './utils/auth'
+import type { MemoryConfig } from './utils/memory'
+import type { TTLConfig } from './utils/ttl'
 
 export interface RedisConfig {
     /**
@@ -101,6 +104,24 @@ export interface MongoDBStoreConfig {
      * Default: 'none'
      */
     logLevel?: 'none' | 'error' | 'warn' | 'all'
+    
+    /**
+     * Optional authentication configuration
+     * If provided, will enable authentication and access control
+     */
+    auth?: AuthConfig
+    
+    /**
+     * Optional memory management configuration
+     * Controls batch processing memory limits and backpressure
+     */
+    memory?: MemoryConfig
+    
+    /**
+     * Optional TTL monitoring configuration
+     * Enables verification and monitoring of TTL indexes
+     */
+    ttlMonitoring?: Omit<TTLConfig, 'days'>
 }
 
 export interface MongoDBStore {
@@ -307,6 +328,24 @@ export interface MongoDBStore {
      * Get current index status for all collections
      */
     getIndexStatus(): Promise<{ collection: string; indexes: any[] }[]>
+    
+    /**
+     * Get TTL monitoring status and metrics
+     */
+    getTTLStatus(): Promise<{
+        enabled: boolean
+        ttlDays?: number
+        summary?: {
+            totalCollections: number
+            collectionsWithTTL: number
+            collectionsWithExpiredDocs: number
+            totalExpiredDocuments: number
+        }
+        details?: any[]
+        metrics?: any
+        error?: string
+        message?: string
+    }>
     
     /**
      * Close the MongoDB connection

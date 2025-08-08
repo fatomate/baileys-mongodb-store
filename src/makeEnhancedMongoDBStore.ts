@@ -21,6 +21,18 @@ import type {
 import NodeCache from 'node-cache'
 import { Queue, Worker, Job } from 'bullmq'
 import Redis from 'ioredis'
+import { 
+    validateJID, 
+    validateMessageId, 
+    validateInstanceId,
+    ValidationError,
+    AuthorizationError,
+    createSafeErrorMessage,
+    hashForLogging
+} from './utils/security'
+import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
+import { MemoryMonitor, BackpressureController } from './utils/memory'
+import { TTLMonitor } from './utils/ttl'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -159,7 +171,7 @@ const convertBinaryToBuffer = (obj: any): any => {
         }
         return result
     } catch (error) {
-        console.error('Error converting binary to buffer:', error)
+        console.error('Binary conversion error:', error)
         return obj
     }
 }
@@ -177,8 +189,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         redis,
         logLevel = 'none',
         enableMetrics = false,
-        hooks = {}
+        hooks = {},
+        auth,
+        memory,
+        ttlMonitoring
     } = config
+    
+    // Validate instance ID
+    const validatedInstanceId = validateInstanceId(instanceId)
+    
+    // Create access context for this instance
+    const accessContext = new InstanceAccessContext(
+        validatedInstanceId,
+        auth?.enableApiKey ? DEFAULT_PERMISSIONS : ['read:all', 'write:all', 'delete:all'],
+        auth
+    )
     
     // Helper functions for conditional logging
     const log = (...args: any[]) => {
@@ -198,6 +223,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             console.warn(...args)
         }
     }
+    
+    // Initialize memory monitor if configured
+    const memoryMonitor = memory ? new MemoryMonitor(memory) : null
+    const backpressureController = memory ? new BackpressureController(memory) : null
+    
+    // TTL monitor will be initialized after DB connection
+    let ttlMonitor: TTLMonitor | null = null
 
     // MongoDB connection
     const client: MongoClient = new MongoClient(uri, {
@@ -208,6 +240,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     })
     await client.connect()
     const db = client.db(dbName)
+    
+    // Initialize TTL monitor after DB connection
+    if (ttlMonitoring) {
+        const globalTTL = ttlDays || DEFAULT_TTL_DAYS
+        ttlMonitor = new TTLMonitor(db, { days: globalTTL, ...ttlMonitoring })
+        ttlMonitor.startMonitoring((message) => {
+            logWarn(`[TTL Monitor] ${message}`)
+        })
+    }
     
     // Get collections
     const getCollections = (): MongoCollections => {
@@ -720,6 +761,27 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         await Promise.all(indexPromises)
         log(`✅ Indexes created with custom TTL settings for instance ${instanceId}`)
+        
+        // Verify TTL indexes if monitoring is enabled
+        if (ttlMonitor) {
+            log('[TTL Monitor] Verifying TTL indexes...')
+            const verificationResults = await Promise.all([
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}chats`),
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}groupMetadata`),
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`),
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`),
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labelAssociations`)
+            ])
+            
+            const invalidTTL = verificationResults.filter(r => !r.isValid)
+            if (invalidTTL.length > 0) {
+                logWarn(`[TTL Monitor] Found ${invalidTTL.length} invalid TTL indexes:`, invalidTTL.map(r => r.collection))
+            } else {
+                log('[TTL Monitor] All TTL indexes verified successfully')
+            }
+        }
     }
     
     // Initialize indexes
@@ -770,12 +832,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getChat(jid: string): Promise<Chat | null> {
-            const chat = await collections.chats.findOne({ instanceId, id: jid })
-            if (!chat) return null
-            
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { _id, instanceId: _instanceId, updatedAt, ...chatData } = chat
-            return chatData as Chat
+            try {
+                const validJid = validateJID(jid)
+                
+                const chat = await collections.chats.findOne({ instanceId: validatedInstanceId, id: validJid })
+                if (!chat) return null
+                
+                // Check access permissions
+                accessContext.validateAccess(chat.instanceId, 'read')
+                
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { _id, instanceId: _instanceId, updatedAt, ...chatData } = chat
+                return chatData as Chat
+            } catch (error) {
+                if (error instanceof ValidationError || error instanceof AuthorizationError) {
+                    throw error
+                }
+                logError(createSafeErrorMessage(error as Error, 'getChat'))
+                throw new Error(createSafeErrorMessage(error as Error, 'getChat'))
+            }
         },
 
         async upsertChats(...chats: Chat[]): Promise<void> {
@@ -950,29 +1025,54 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
-            const cacheKey = `msg_${instanceId}_${jid}_${id}`
-            const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
-            if (cached) return cached
-            
-            const message = await collections.messages.findOne({
-                instanceId,
-                jid,
-                'key.id': id
-            })
-            
-            if (!message) return null
-            
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message
-            const converted = convertBinaryToBuffer(msg)
+            try {
+                const validJid = validateJID(jid)
+                const validId = validateMessageId(id)
+                
+                const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
+                const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
+                if (cached) return cached
+                
+                const message = await collections.messages.findOne({
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
+                    'key.id': validId
+                })
+                
+                if (!message) return null
+                
+                // Check access permissions
+                accessContext.validateAccess(message.instanceId, 'read')
+                
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message
+                const converted = convertBinaryToBuffer(msg)
             
             binaryConversionCache.set(cacheKey, converted)
             
             return converted
+            } catch (error) {
+                if (error instanceof ValidationError || error instanceof AuthorizationError) {
+                    throw error
+                }
+                logError(createSafeErrorMessage(error as Error, 'getMessage'))
+                throw new Error(createSafeErrorMessage(error as Error, 'getMessage'))
+            }
         },
 
         async upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void> {
-            const cacheKey = `msg_${instanceId}_${jid}_${message.key?.id}`
+            try {
+                const validJid = validateJID(jid)
+                
+                // Validate message ID if present
+                if (message.key?.id) {
+                    validateMessageId(message.key.id)
+                }
+                
+                // Check write permissions
+                accessContext.validateAccess(validatedInstanceId, 'write')
+                
+                const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${message.key?.id ? hashForLogging(message.key.id) : ''}`
             binaryConversionCache.del(cacheKey)
             
             // Use Bull queue if available
@@ -983,9 +1083,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         'upsert',
                         {
                             type: 'upsert',
-                            jid,
+                            jid: validJid,
                             message,
-                            instanceId,
+                            instanceId: validatedInstanceId,
                             timestamp: Date.now()
                         },
                         defaultJobOptions
@@ -999,18 +1099,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Fallback to direct database operation
             await collections.messages.replaceOne(
                 {
-                    instanceId,
-                    jid,
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
                     'key.id': message.key?.id
                 },
                 {
                     ...message,
-                    instanceId,
-                    jid,
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
                     updatedAt: new Date()
                 },
                 { upsert: true }
             )
+            } catch (error) {
+                if (error instanceof ValidationError || error instanceof AuthorizationError) {
+                    throw error
+                }
+                logError(createSafeErrorMessage(error as Error, 'upsertMessage'))
+                throw new Error(createSafeErrorMessage(error as Error, 'upsertMessage'))
+            }
         },
 
         async updateMessage(jid: string, id: string, update: Partial<proto.IWebMessageInfo>): Promise<boolean> {
@@ -1055,20 +1162,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async deleteMessages(jid: string, ids?: string[]): Promise<void> {
-            // Clear cache
-            if (ids && ids.length > 0) {
-                ids.forEach(id => {
-                    const cacheKey = `msg_${instanceId}_${jid}_${id}`
-                    binaryConversionCache.del(cacheKey)
-                })
-            } else {
-                const keys = binaryConversionCache.keys()
-                keys.forEach(key => {
-                    if (key.startsWith(`msg_${instanceId}_${jid}_`)) {
-                        binaryConversionCache.del(key)
-                    }
-                })
-            }
+            try {
+                const validJid = validateJID(jid)
+                
+                // Validate message IDs if provided
+                const validIds = ids?.map(id => validateMessageId(id))
+                
+                // Check delete permissions
+                accessContext.validateAccess(validatedInstanceId, 'delete')
+                
+                // Clear cache
+                if (validIds && validIds.length > 0) {
+                    validIds.forEach(id => {
+                        const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(id)}`
+                        binaryConversionCache.del(cacheKey)
+                    })
+                } else {
+                    const keys = binaryConversionCache.keys()
+                    const jidHash = hashForLogging(validJid)
+                    keys.forEach(key => {
+                        if (key.startsWith(`msg_${validatedInstanceId}_${jidHash}_`)) {
+                            binaryConversionCache.del(key)
+                        }
+                    })
+                }
             
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.MESSAGES)) {
@@ -1078,9 +1195,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         'delete',
                         {
                             type: 'delete',
-                            jid,
-                            deleteIds: ids,
-                            instanceId,
+                            jid: validJid,
+                            deleteIds: validIds,
+                            instanceId: validatedInstanceId,
                             timestamp: Date.now()
                         },
                         defaultJobOptions
@@ -1092,13 +1209,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct delete
-            const filter: any = { instanceId, jid }
+            const filter: any = { instanceId: validatedInstanceId, jid: validJid }
             
-            if (ids && ids.length > 0) {
-                filter['key.id'] = { $in: ids }
+            if (validIds && validIds.length > 0) {
+                filter['key.id'] = { $in: validIds }
             }
             
             await collections.messages.deleteMany(filter)
+            } catch (error) {
+                if (error instanceof ValidationError || error instanceof AuthorizationError) {
+                    throw error
+                }
+                logError(createSafeErrorMessage(error as Error, 'deleteMessages'))
+                throw new Error(createSafeErrorMessage(error as Error, 'deleteMessages'))
+            }
         },
 
         async getGroupMetadata(jid: string): Promise<GroupMetadata | null> {
@@ -1503,6 +1627,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 bullStats.reason = redis ? 'initialization failed' : 'not configured'
             }
             
+            // Add memory stats if memory monitor is available
+            let memoryStats = undefined
+            if (memoryMonitor) {
+                const memoryMetrics = memoryMonitor.getCurrentMemory()
+                memoryStats = {
+                    heapUsedMB: Math.round(memoryMetrics.heapUsed / 1024 / 1024),
+                    heapTotalMB: Math.round(memoryMetrics.heapTotal / 1024 / 1024),
+                    rssMB: Math.round(memoryMetrics.rss / 1024 / 1024),
+                    memoryPressure: backpressureController ? backpressureController.getPressure() : 0
+                }
+            }
+            
             return {
                 messagesProcessed: 0,
                 labelsProcessed: 0,
@@ -1511,7 +1647,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 lastResetTime: new Date(),
                 uptime: 0,
                 eventMetrics: enableMetrics ? eventMetrics : undefined,
-                bullStats
+                bullStats,
+                memoryStats
             }
         },
         
@@ -1563,6 +1700,33 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return indexStatus
         },
 
+        async getTTLStatus(): Promise<any> {
+            if (!ttlMonitor) {
+                return {
+                    enabled: false,
+                    message: 'TTL monitoring not configured'
+                }
+            }
+            
+            try {
+                const report = await ttlMonitor.getTTLStatusReport()
+                return {
+                    enabled: true,
+                    ttlDays: ttlDays || DEFAULT_TTL_DAYS,
+                    collectionTTL: collectionTTL,
+                    summary: report.summary,
+                    details: report.details,
+                    metrics: ttlMonitor.getMetrics()
+                }
+            } catch (error) {
+                logError('[TTL Status] Error getting TTL status:', error)
+                return {
+                    enabled: true,
+                    error: 'Failed to get TTL status'
+                }
+            }
+        },
+        
         async close(): Promise<void> {
             // Close Bull queues if initialized
             if (bullInitialized) {
@@ -1595,6 +1759,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     binaryConversionCache.del(key)
                 }
             })
+            
+            // Stop TTL monitor if running
+            if (ttlMonitor) {
+                ttlMonitor.stopMonitoring()
+                ttlMonitor = null
+            }
             
             if (client) {
                 await client.close()

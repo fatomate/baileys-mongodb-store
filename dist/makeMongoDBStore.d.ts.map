@@ -1,1 +1,0 @@
-{"version":3,"file":"makeMongoDBStore.d.ts","sourceRoot":"","sources":["../src/makeMongoDBStore.ts"],"names":[],"mappings":"AAcA,OAAO,KAAK,EAAE,kBAAkB,EAAE,YAAY,EAAE,MAAM,SAAS,CAAA;AA6L/D,eAAO,MAAM,gBAAgB,GAAU,QAAQ,kBAAkB,KAAG,OAAO,CAAC,YAAY,CAstEvF,CAAA;AAOD,eAAO,MAAM,mBAAmB,GAAU,aAAa,MAAM,EAAE,aAAY,OAAe,KAAG,OAAO,CAAC,IAAI,CA0ExG,CAAA"}
