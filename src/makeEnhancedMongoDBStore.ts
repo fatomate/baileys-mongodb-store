@@ -727,7 +727,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         indexPromises.push(
             collections.messages.createIndex({ instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true }).then(() => {}),
             collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 }).then(() => {}),
-            collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: messagesTTL }).then(() => {})
+            collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: messagesTTL }).then(() => {}),
+            // Index for media deduplication
+            collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true }).then(() => {})
         )
         
         const groupsTTL = getTTLForCollection('groupMetadata') * 24 * 60 * 60
@@ -1620,7 +1622,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             
                             // Handle media download if configured
                             if (config.media?.enabled) {
-                                const mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger)
+                                // Function to check for existing media by hash
+                                const checkExistingMedia = async (hash: string): Promise<string | null> => {
+                                    const existing = await collections.messages.findOne({
+                                        instanceId,
+                                        mediaHash: hash,
+                                        mediaUrl: { $exists: true }
+                                    }) as any
+                                    return existing?.mediaUrl || null
+                                }
+                                
+                                const mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
                                 
                                 if (mediaResult.success && mediaResult.localPath) {
                                     // Update message with media URL
@@ -1636,12 +1648,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                 mediaType: mediaResult.mediaType,
                                                 mediaFileName: mediaResult.fileName,
                                                 mediaFileSize: mediaResult.fileSize,
+                                                mediaHash: mediaResult.mediaHash,
+                                                mediaReused: mediaResult.reused || false,
                                                 mediaDownloadedAt: new Date()
                                             } 
                                         }
                                     )
                                     
-                                    log(`✅ Media downloaded for message ${msg.key.id}: ${mediaResult.localPath}`)
+                                    if (mediaResult.reused) {
+                                        log(`♻️  Media reused for message ${msg.key.id}: ${mediaResult.localPath} (saved storage space)`)
+                                    } else {
+                                        log(`✅ Media downloaded for message ${msg.key.id}: ${mediaResult.localPath}`)
+                                    }
                                     log(`📝 MongoDB update result: matched=${updateResult.matchedCount}, modified=${updateResult.modifiedCount}`)
                                     
                                     if (updateResult.matchedCount === 0) {
@@ -2145,8 +2163,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     return { success: true, localPath: (message as any).mediaUrl }
                 }
                 
+                // Function to check for existing media by hash
+                const checkExistingMedia = async (hash: string): Promise<string | null> => {
+                    const existing = await collections.messages.findOne({
+                        instanceId,
+                        mediaHash: hash,
+                        mediaUrl: { $exists: true }
+                    }) as any
+                    return existing?.mediaUrl || null
+                }
+                
                 // Download the media
-                const mediaResult = await downloadMedia(message, instanceId, config.media, config.logger)
+                const mediaResult = await downloadMedia(message, instanceId, config.media, config.logger, checkExistingMedia)
                 
                 if (mediaResult.success && mediaResult.localPath) {
                     // Update message with media URL
@@ -2162,6 +2190,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 mediaType: mediaResult.mediaType,
                                 mediaFileName: mediaResult.fileName,
                                 mediaFileSize: mediaResult.fileSize,
+                                mediaHash: mediaResult.mediaHash,
+                                mediaReused: mediaResult.reused || false,
                                 mediaDownloadedAt: new Date()
                             } 
                         }

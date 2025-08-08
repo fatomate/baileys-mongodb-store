@@ -57,6 +57,8 @@ export interface MediaDownloadResult {
     fileSize?: number
     error?: string
     retries?: number
+    mediaHash?: string
+    reused?: boolean
 }
 
 export interface MediaInfo {
@@ -325,13 +327,22 @@ async function downloadWithRetry(
 }
 
 /**
+ * Get media SHA256 hash from message
+ */
+function getMediaHash(mediaInfo: MediaInfo): string | undefined {
+    const message = mediaInfo.message as any
+    return message.fileSha256 ? Buffer.from(message.fileSha256).toString('base64') : undefined
+}
+
+/**
  * Main function to download and save media from a WhatsApp message
  */
 export async function downloadMedia(
     message: proto.IWebMessageInfo,
     instanceId: string,
     config: MediaConfig,
-    logger?: Logger
+    logger?: Logger,
+    checkExisting?: (hash: string) => Promise<string | null>
 ): Promise<MediaDownloadResult> {
     try {
         // Check if media download is enabled
@@ -348,6 +359,29 @@ export async function downloadMedia(
         const mediaInfo = extractMediaInfo(message)
         if (!mediaInfo) {
             return { success: false, error: 'No media found in message' }
+        }
+        
+        // Check if we already have this media file by hash
+        const mediaHash = getMediaHash(mediaInfo)
+        if (mediaHash && checkExisting) {
+            const existingPath = await checkExisting(mediaHash)
+            if (existingPath) {
+                logger?.info({
+                    messageId: message.key.id,
+                    hash: mediaHash,
+                    existingPath
+                }, 'Media already exists, reusing file')
+                
+                // Return the existing path without downloading
+                return {
+                    success: true,
+                    localPath: existingPath,
+                    mediaType: mediaInfo.type,
+                    fileName: existingPath.split('/').pop(),
+                    fileSize: 0, // We don't need to check size for existing files
+                    reused: true
+                }
+            }
         }
         
         // Check allowed types
@@ -403,7 +437,8 @@ export async function downloadMedia(
             localPath: relativePath,
             mediaType: mediaInfo.type,
             fileName,
-            fileSize: stats.size
+            fileSize: stats.size,
+            mediaHash: mediaHash
         }
     } catch (error) {
         logger?.error({
