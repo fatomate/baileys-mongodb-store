@@ -13,6 +13,11 @@ async function connectToWhatsApp() {
     // - Smart caching with auto-invalidation
     // - Queue management for concurrent operations
     // - With Redis: Persistent job queues, auto-retry, and distributed processing
+    // 
+    // NEW FEATURES:
+    // - Security: Input validation, API key auth, instance isolation
+    // - Memory: Backpressure control, dynamic batch sizing
+    // - TTL: Automatic monitoring and verification
     const store = await makeMongoDBStore({
         uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
         database: 'whatsapp_bot',
