@@ -13,7 +13,10 @@ const CONTACT_JID_REGEX = /^[0-9]+@c\.us$/ // Contacts
 const STATUS_JID = 'status@broadcast' // Status updates
 
 // Message ID validation
-const MESSAGE_ID_REGEX = /^[A-Z0-9]{16,32}$/
+// WhatsApp message IDs can be:
+// - Classic format: 16-32 uppercase alphanumeric (e.g., "3EB0ABC123DEF456")
+// - Numeric format: 10+ digit strings (e.g., "1679765488")
+const MESSAGE_ID_REGEX = /^([A-Z0-9]{16,32}|[0-9]{10,})$/
 
 // Custom error classes for security
 export class ValidationError extends Error {
