@@ -236,10 +236,10 @@ export const getRateLimitKey = (instanceId: string, operation: string): string =
  * @param query - The query object to validate
  * @throws SecurityError if dangerous operators found
  */
-export const validateMongoQuery = (query: any): void => {
+export const validateMongoQuery = (query: Record<string, unknown>): void => {
     const dangerousOperators = ['$where', '$expr', '$function', '$accumulator', '$regex']
     
-    const checkObject = (obj: any): void => {
+    const checkObject = (obj: Record<string, unknown>): void => {
         if (!obj || typeof obj !== 'object') return
         
         for (const key in obj) {
@@ -247,8 +247,8 @@ export const validateMongoQuery = (query: any): void => {
                 throw new SecurityError(`Dangerous operator not allowed: ${key}`)
             }
             
-            if (typeof obj[key] === 'object') {
-                checkObject(obj[key])
+            if (typeof obj[key] === 'object' && obj[key] !== null) {
+                checkObject(obj[key] as Record<string, unknown>)
             }
         }
     }
@@ -290,7 +290,7 @@ export const createSafeErrorMessage = (error: Error, operation: string): string 
  * @param data - The event data
  * @throws ValidationError if invalid
  */
-export const validateEventData = (eventType: string, data: any): void => {
+export const validateEventData = (eventType: string, data: Record<string, unknown>): void => {
     const allowedEventTypes = [
         'messages.upsert', 'messages.update', 'messages.delete',
         'chats.upsert', 'chats.update', 'chats.delete',

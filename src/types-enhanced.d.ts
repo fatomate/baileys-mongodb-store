@@ -8,6 +8,7 @@ import type { RedisOptions } from 'ioredis'
 import type { AuthConfig } from './utils/auth'
 import type { MemoryConfig } from './utils/memory'
 import type { TTLConfig } from './utils/ttl'
+import type { MediaConfig } from './utils/media'
 
 /**
  * Event types that can be stored in MongoDB
@@ -270,6 +271,12 @@ export interface EnhancedMongoDBStoreConfig {
          */
         onError?: (eventType: string, error: Error, data: any) => void
     }
+    
+    /**
+     * Media download configuration
+     * Enables automatic download and storage of media files
+     */
+    media?: MediaConfig
 }
 
 /**
@@ -379,5 +386,32 @@ export interface EnhancedMongoDBStore {
         error?: string
         message?: string
     }>
+    
+    /**
+     * Clean up old media files for this instance
+     * @param daysToKeep Number of days to keep media files (default: 30)
+     */
+    cleanupOldMedia(daysToKeep?: number): Promise<{ deleted: number; errors: number }>
+    
+    /**
+     * Get media statistics for this instance
+     */
+    getMediaStats(): Promise<{
+        totalFiles: number
+        totalSize: number
+        byType: Record<string, { count: number; size: number }>
+    }>
+    
+    /**
+     * Download media for a specific message
+     * @param jid Chat JID
+     * @param messageId Message ID
+     */
+    downloadMessageMedia(jid: string, messageId: string): Promise<{
+        success: boolean
+        localPath?: string
+        error?: string
+    }>
+    
     close(): Promise<void>
 }

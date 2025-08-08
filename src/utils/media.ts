@@ -1,0 +1,454 @@
+import { downloadContentFromMessage } from 'baileys'
+import type { proto } from 'baileys'
+import { createWriteStream, promises as fs } from 'fs'
+import { join } from 'path'
+import { pipeline } from 'stream/promises'
+import type { Logger } from 'pino'
+
+export interface MediaConfig {
+    /**
+     * Enable media download functionality
+     */
+    enabled: boolean
+    
+    /**
+     * Base directory for storing media files
+     */
+    baseDir: string
+    
+    /**
+     * Maximum file size in MB (0 = unlimited)
+     */
+    maxSizeInMB?: number
+    
+    /**
+     * File types to download (empty = all types)
+     */
+    allowedTypes?: MediaType[]
+    
+    /**
+     * Skip group messages
+     */
+    skipGroupMessages?: boolean
+    
+    /**
+     * Number of retry attempts for failed downloads
+     */
+    maxRetries?: number
+    
+    /**
+     * Delay between retries in milliseconds
+     */
+    retryDelay?: number
+    
+    /**
+     * Timeout for download operations in milliseconds
+     */
+    downloadTimeout?: number
+}
+
+export type MediaType = 'image' | 'video' | 'audio' | 'document' | 'sticker'
+
+export interface MediaDownloadResult {
+    success: boolean
+    localPath?: string
+    mediaType?: MediaType
+    fileName?: string
+    fileSize?: number
+    error?: string
+    retries?: number
+}
+
+export interface MediaInfo {
+    type: MediaType
+    message: proto.Message.IImageMessage | proto.Message.IVideoMessage | proto.Message.IAudioMessage | proto.Message.IDocumentMessage | proto.Message.IStickerMessage
+    mimetype?: string
+    filename?: string
+    caption?: string
+}
+
+/**
+ * Extract media information from a WhatsApp message
+ */
+export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | null {
+    const msg = message.message
+    if (!msg) return null
+    
+    if (msg.imageMessage) {
+        return {
+            type: 'image',
+            message: msg.imageMessage,
+            mimetype: msg.imageMessage.mimetype || undefined,
+            caption: msg.imageMessage.caption || undefined
+        }
+    }
+    
+    if (msg.videoMessage) {
+        return {
+            type: 'video',
+            message: msg.videoMessage,
+            mimetype: msg.videoMessage.mimetype || undefined,
+            caption: msg.videoMessage.caption || undefined
+        }
+    }
+    
+    if (msg.audioMessage) {
+        return {
+            type: 'audio',
+            message: msg.audioMessage,
+            mimetype: msg.audioMessage.mimetype || undefined
+        }
+    }
+    
+    if (msg.documentMessage) {
+        return {
+            type: 'document',
+            message: msg.documentMessage,
+            mimetype: msg.documentMessage.mimetype || undefined,
+            filename: msg.documentMessage.fileName || undefined
+        }
+    }
+    
+    if (msg.stickerMessage) {
+        return {
+            type: 'sticker',
+            message: msg.stickerMessage,
+            mimetype: msg.stickerMessage.mimetype || undefined
+        }
+    }
+    
+    return null
+}
+
+/**
+ * Get file extension based on mimetype
+ */
+function getExtension(mimetype?: string, mediaType?: MediaType): string {
+    if (mimetype) {
+        const ext = mimetype.split('/')[1]?.split(';')[0]
+        if (ext) return `.${ext}`
+    }
+    
+    // Fallback extensions
+    switch (mediaType) {
+        case 'image': return '.jpg'
+        case 'video': return '.mp4'
+        case 'audio': return '.mp3'
+        case 'document': return '.pdf'
+        case 'sticker': return '.webp'
+        default: return '.bin'
+    }
+}
+
+/**
+ * Generate unique filename for media
+ */
+function generateFileName(
+    messageId: string,
+    mediaType: MediaType,
+    extension: string,
+    originalFilename?: string
+): string {
+    const timestamp = Date.now()
+    const sanitizedId = messageId.replace(/[^a-zA-Z0-9]/g, '_')
+    
+    if (originalFilename && mediaType === 'document') {
+        // Keep original filename for documents
+        const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '')
+        return `${timestamp}_${sanitizedId}_${nameWithoutExt}${extension}`
+    }
+    
+    return `${timestamp}_${sanitizedId}_${mediaType}${extension}`
+}
+
+/**
+ * Ensure directory exists
+ */
+async function ensureDir(dirPath: string): Promise<void> {
+    try {
+        await fs.access(dirPath)
+    } catch {
+        await fs.mkdir(dirPath, { recursive: true })
+    }
+}
+
+/**
+ * Download media with retry logic
+ */
+async function downloadWithRetry(
+    mediaMessage: proto.Message.IImageMessage | proto.Message.IVideoMessage | proto.Message.IAudioMessage | proto.Message.IDocumentMessage | proto.Message.IStickerMessage,
+    mediaType: MediaType,
+    outputPath: string,
+    config: MediaConfig,
+    logger?: Logger
+): Promise<void> {
+    const maxRetries = config.maxRetries || 3
+    const retryDelay = config.retryDelay || 1000
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const stream = await downloadContentFromMessage(mediaMessage, mediaType)
+            const writeStream = createWriteStream(outputPath)
+            
+            // Set timeout if configured
+            if (config.downloadTimeout) {
+                const timeout = setTimeout(() => {
+                    writeStream.destroy(new Error('Download timeout'))
+                }, config.downloadTimeout)
+                
+                writeStream.on('finish', () => clearTimeout(timeout))
+                writeStream.on('error', () => clearTimeout(timeout))
+            }
+            
+            await pipeline(stream, writeStream)
+            return
+        } catch (error) {
+            if (attempt === maxRetries) {
+                throw error
+            }
+            
+            logger?.warn({
+                error: error instanceof Error ? error.message : 'Unknown error',
+                attempt,
+                maxRetries,
+                mediaType
+            }, 'Media download failed, retrying...')
+            
+            await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
+        }
+    }
+}
+
+/**
+ * Main function to download and save media from a WhatsApp message
+ */
+export async function downloadMedia(
+    message: proto.IWebMessageInfo,
+    instanceId: string,
+    config: MediaConfig,
+    logger?: Logger
+): Promise<MediaDownloadResult> {
+    try {
+        // Check if media download is enabled
+        if (!config.enabled) {
+            return { success: false, error: 'Media download disabled' }
+        }
+        
+        // Skip group messages if configured
+        if (config.skipGroupMessages && message.key.remoteJid?.includes('@g.us')) {
+            return { success: false, error: 'Group message skipped' }
+        }
+        
+        // Extract media info
+        const mediaInfo = extractMediaInfo(message)
+        if (!mediaInfo) {
+            return { success: false, error: 'No media found in message' }
+        }
+        
+        // Check allowed types
+        if (config.allowedTypes && config.allowedTypes.length > 0) {
+            if (!config.allowedTypes.includes(mediaInfo.type)) {
+                return { success: false, error: `Media type ${mediaInfo.type} not allowed` }
+            }
+        }
+        
+        // Check file size if available
+        if (config.maxSizeInMB && mediaInfo.message.fileLength) {
+            const fileSizeMB = Number(mediaInfo.message.fileLength) / (1024 * 1024)
+            if (fileSizeMB > config.maxSizeInMB) {
+                return { 
+                    success: false, 
+                    error: `File size ${fileSizeMB.toFixed(2)}MB exceeds limit of ${config.maxSizeInMB}MB` 
+                }
+            }
+        }
+        
+        // Prepare directory structure
+        const instanceDir = join(config.baseDir, instanceId)
+        const typeDir = join(instanceDir, mediaInfo.type)
+        await ensureDir(typeDir)
+        
+        // Generate filename
+        const extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
+        const fileName = generateFileName(
+            message.key.id || 'unknown',
+            mediaInfo.type,
+            extension,
+            mediaInfo.filename
+        )
+        const filePath = join(typeDir, fileName)
+        
+        // Download media
+        await downloadWithRetry(
+            mediaInfo.message,
+            mediaInfo.type,
+            filePath,
+            config,
+            logger
+        )
+        
+        // Get file stats
+        const stats = await fs.stat(filePath)
+        
+        // Return relative path from base directory
+        const relativePath = join(instanceId, mediaInfo.type, fileName)
+        
+        return {
+            success: true,
+            localPath: relativePath,
+            mediaType: mediaInfo.type,
+            fileName,
+            fileSize: stats.size
+        }
+    } catch (error) {
+        logger?.error({
+            error: error instanceof Error ? error.message : 'Unknown error',
+            messageId: message.key.id,
+            instanceId
+        }, 'Failed to download media')
+        
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error occurred'
+        }
+    }
+}
+
+/**
+ * Clean up old media files
+ */
+export async function cleanupOldMedia(
+    instanceId: string,
+    config: MediaConfig,
+    daysToKeep: number = 30,
+    logger?: Logger
+): Promise<{ deleted: number; errors: number }> {
+    const result = { deleted: 0, errors: 0 }
+    
+    try {
+        const instanceDir = join(config.baseDir, instanceId)
+        const cutoffTime = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000)
+        
+        // Process each media type directory
+        const mediaTypes: MediaType[] = ['image', 'video', 'audio', 'document', 'sticker']
+        
+        for (const mediaType of mediaTypes) {
+            const typeDir = join(instanceDir, mediaType)
+            
+            try {
+                const files = await fs.readdir(typeDir)
+                
+                for (const file of files) {
+                    const filePath = join(typeDir, file)
+                    
+                    try {
+                        const stats = await fs.stat(filePath)
+                        
+                        if (stats.mtimeMs < cutoffTime) {
+                            await fs.unlink(filePath)
+                            result.deleted++
+                        }
+                    } catch (err) {
+                        logger?.warn({
+                            error: err instanceof Error ? err.message : 'Unknown error',
+                            file: filePath
+                        }, 'Failed to process media file')
+                        result.errors++
+                    }
+                }
+            } catch (err) {
+                // Directory might not exist
+                if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                    logger?.warn({
+                        error: err instanceof Error ? err.message : 'Unknown error',
+                        directory: typeDir
+                    }, 'Failed to read media directory')
+                }
+            }
+        }
+        
+        logger?.info({
+            instanceId,
+            deleted: result.deleted,
+            errors: result.errors,
+            daysToKeep
+        }, 'Media cleanup completed')
+        
+    } catch (error) {
+        logger?.error({
+            error: error instanceof Error ? error.message : 'Unknown error',
+            instanceId
+        }, 'Failed to cleanup media')
+    }
+    
+    return result
+}
+
+/**
+ * Get media statistics for an instance
+ */
+export async function getMediaStats(
+    instanceId: string,
+    config: MediaConfig,
+    logger?: Logger
+): Promise<{
+    totalFiles: number
+    totalSize: number
+    byType: Record<MediaType, { count: number; size: number }>
+}> {
+    const stats = {
+        totalFiles: 0,
+        totalSize: 0,
+        byType: {} as Record<MediaType, { count: number; size: number }>
+    }
+    
+    try {
+        const instanceDir = join(config.baseDir, instanceId)
+        const mediaTypes: MediaType[] = ['image', 'video', 'audio', 'document', 'sticker']
+        
+        for (const mediaType of mediaTypes) {
+            stats.byType[mediaType] = { count: 0, size: 0 }
+            
+            const typeDir = join(instanceDir, mediaType)
+            
+            try {
+                const files = await fs.readdir(typeDir)
+                
+                for (const file of files) {
+                    const filePath = join(typeDir, file)
+                    
+                    try {
+                        const fileStat = await fs.stat(filePath)
+                        
+                        if (fileStat.isFile()) {
+                            stats.totalFiles++
+                            stats.totalSize += fileStat.size
+                            stats.byType[mediaType].count++
+                            stats.byType[mediaType].size += fileStat.size
+                        }
+                    } catch (err) {
+                        logger?.warn({
+                            error: err instanceof Error ? err.message : 'Unknown error',
+                            file: filePath
+                        }, 'Failed to stat media file')
+                    }
+                }
+            } catch (err) {
+                // Directory might not exist, which is fine
+                if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                    logger?.warn({
+                        error: err instanceof Error ? err.message : 'Unknown error',
+                        directory: typeDir
+                    }, 'Failed to read media directory')
+                }
+            }
+        }
+    } catch (error) {
+        logger?.error({
+            error: error instanceof Error ? error.message : 'Unknown error',
+            instanceId
+        }, 'Failed to get media stats')
+    }
+    
+    return stats
+}

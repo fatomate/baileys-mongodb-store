@@ -33,6 +33,7 @@ import {
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
+import { downloadMedia, cleanupOldMedia, getMediaStats } from './utils/media'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -1614,7 +1615,38 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {
+                            // Store the message first
                             await storeImpl.upsertMessage(jid, msg)
+                            
+                            // Handle media download if configured
+                            if (config.media?.enabled) {
+                                const mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger)
+                                
+                                if (mediaResult.success && mediaResult.localPath) {
+                                    // Update message with media URL
+                                    await collections.messages.updateOne(
+                                        { 
+                                            instanceId, 
+                                            remoteJid: jid, 
+                                            'key.id': msg.key.id 
+                                        },
+                                        { 
+                                            $set: { 
+                                                mediaUrl: mediaResult.localPath,
+                                                mediaType: mediaResult.mediaType,
+                                                mediaFileName: mediaResult.fileName,
+                                                mediaFileSize: mediaResult.fileSize,
+                                                mediaDownloadedAt: new Date()
+                                            } 
+                                        }
+                                    )
+                                    
+                                    log(`✅ Media downloaded for message ${msg.key.id}: ${mediaResult.localPath}`)
+                                } else if (!mediaResult.success && mediaResult.error) {
+                                    log(`⚠️ Media download failed for message ${msg.key.id}: ${mediaResult.error}`)
+                                }
+                            }
+                            
                             if (enableMetrics) updateEventMetrics('messages.upsert', 'stored')
                             if (hooks.afterStore) await hooks.afterStore('messages.upsert', msg)
                         } catch (error) {
@@ -2055,6 +2087,89 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     enabled: true,
                     error: 'Failed to get TTL status'
                 }
+            }
+        },
+        
+        async cleanupOldMedia(daysToKeep: number = 30): Promise<{ deleted: number; errors: number }> {
+            if (!config.media?.enabled) {
+                return { deleted: 0, errors: 0 }
+            }
+            
+            return await cleanupOldMedia(instanceId, config.media, daysToKeep, config.logger)
+        },
+        
+        async getMediaStats(): Promise<{
+            totalFiles: number
+            totalSize: number
+            byType: Record<string, { count: number; size: number }>
+        }> {
+            if (!config.media?.enabled) {
+                return {
+                    totalFiles: 0,
+                    totalSize: 0,
+                    byType: {}
+                }
+            }
+            
+            return await getMediaStats(instanceId, config.media, config.logger)
+        },
+        
+        async downloadMessageMedia(jid: string, messageId: string): Promise<{
+            success: boolean
+            localPath?: string
+            error?: string
+        }> {
+            if (!config.media?.enabled) {
+                return { success: false, error: 'Media download not enabled' }
+            }
+            
+            try {
+                // Fetch the message from database
+                const message = await collections.messages.findOne({
+                    instanceId,
+                    remoteJid: jid,
+                    'key.id': messageId
+                })
+                
+                if (!message) {
+                    return { success: false, error: 'Message not found' }
+                }
+                
+                // Check if media already downloaded
+                if ((message as any).mediaUrl) {
+                    return { success: true, localPath: (message as any).mediaUrl }
+                }
+                
+                // Download the media
+                const mediaResult = await downloadMedia(message, instanceId, config.media, config.logger)
+                
+                if (mediaResult.success && mediaResult.localPath) {
+                    // Update message with media URL
+                    await collections.messages.updateOne(
+                        { 
+                            instanceId, 
+                            remoteJid: jid, 
+                            'key.id': messageId 
+                        },
+                        { 
+                            $set: { 
+                                mediaUrl: mediaResult.localPath,
+                                mediaType: mediaResult.mediaType,
+                                mediaFileName: mediaResult.fileName,
+                                mediaFileSize: mediaResult.fileSize,
+                                mediaDownloadedAt: new Date()
+                            } 
+                        }
+                    )
+                    
+                    return { success: true, localPath: mediaResult.localPath }
+                }
+                
+                return { success: false, error: mediaResult.error }
+            } catch (error) {
+                const errorMsg = error instanceof Error ? error.message : 'Unknown error'
+                logError(`Failed to download media for message ${messageId}:`, error)
+                return { success: false, error: errorMsg }
             }
         },
         

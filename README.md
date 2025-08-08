@@ -13,6 +13,7 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - **🪝 Hooks System**: Add pre/post-processing logic for events
 - **🔧 Runtime Configuration**: Update storage settings without restarting
 - **🚀 Redis Bull Queue**: Full Redis Bull queue support for reliable background processing
+- **📸 Media Download**: Automatic download and storage of media files with URL tracking
 
 ### Existing Features
 - **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes
@@ -175,6 +176,18 @@ interface EnhancedMongoDBStoreConfig extends MongoDBStoreConfig {
         afterStore?: (eventType, data) => void
         onError?: (eventType, error, data) => void
     }
+    
+    // Media download configuration
+    media?: {
+        enabled: boolean           // Enable media download
+        baseDir: string           // Base directory for media storage
+        maxSizeInMB?: number      // Max file size to download
+        allowedTypes?: string[]   // Media types to download
+        skipGroupMessages?: boolean // Skip group media
+        maxRetries?: number       // Retry attempts
+        retryDelay?: number       // Delay between retries
+        downloadTimeout?: number  // Download timeout in ms
+    }
 }
 ```
 
@@ -316,6 +329,39 @@ await store.upsertLabelAssociation({
     chatId: '123456789@s.whatsapp.net',
     labelId: 'label-1'
 })
+```
+
+### Media Handling (New!)
+
+```typescript
+// Configure automatic media download
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_bot',
+    instanceId: 'media_instance',
+    media: {
+        enabled: true,
+        baseDir: '/var/whatsapp/media',
+        maxSizeInMB: 50,
+        allowedTypes: ['image', 'video', 'document']
+    }
+})
+
+// Media is automatically downloaded on message receive
+// Access downloaded media URL
+const result = await store.downloadMessageMedia('user@s.whatsapp.net', 'MSG_ID')
+if (result.success) {
+    console.log('Media path:', result.localPath)
+}
+
+// Get media statistics
+const stats = await store.getMediaStats()
+console.log('Total media files:', stats.totalFiles)
+console.log('Total size:', stats.totalSize)
+
+// Cleanup old media (older than 30 days)
+const cleanup = await store.cleanupOldMedia(30)
+console.log('Deleted:', cleanup.deleted)
 ```
 
 ## MongoDB Collections
