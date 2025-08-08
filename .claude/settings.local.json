@@ -18,7 +18,9 @@
       "Bash(cd:*)",
       "Bash(cd:*)",
       "Bash(cd:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(npm test:*)",
+      "Bash(node:*)"
     ],
     "deny": []
   }

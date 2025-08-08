@@ -29,6 +29,8 @@ describe('Security Utilities', () => {
             test('should accept valid group JID', () => {
                 expect(isValidJID('1234567890-1234567890@g.us')).toBe(true)
                 expect(isValidJID('120363999999999999-1609999999@g.us')).toBe(true)
+                expect(isValidJID('120363322411650683@g.us')).toBe(true) // Groups without hyphen
+                expect(isValidJID('1234567890@g.us')).toBe(true) // Simple group format
             })
 
             test('should accept valid broadcast JID', () => {

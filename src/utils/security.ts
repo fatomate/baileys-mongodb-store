@@ -6,7 +6,7 @@ import { createHash } from 'crypto'
 
 // JID validation regex patterns for WhatsApp
 const WHATSAPP_JID_REGEX = /^[0-9]+@s\.whatsapp\.net$/ // Individual users
-const GROUP_JID_REGEX = /^[0-9]+-[0-9]+@g\.us$/ // Groups
+const GROUP_JID_REGEX = /^[0-9]+(-[0-9]+)?@g\.us$/ // Groups (with optional hyphen segment)
 const BROADCAST_JID_REGEX = /^[0-9]+@broadcast$/ // Broadcast lists
 const LID_JID_REGEX = /^[0-9]+@lid$/ // Linked devices
 const CONTACT_JID_REGEX = /^[0-9]+@c\.us$/ // Contacts
