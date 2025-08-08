@@ -1029,17 +1029,77 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const validJid = validateJID(jid)
                 const validId = validateMessageId(id)
                 
+                log(`getMessage called with ${jid} and ${id}`)
+                log(`getMessage validJid ${validJid}`)
+                log(`getMessage validId ${validId}`)
+                
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
+                log(`getMessage cacheKey ${cacheKey}`)
+                
                 const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
+                log(`getMessage cached ${cached ? 'found' : 'undefined'}`)
                 if (cached) return cached
                 
-                const message = await collections.messages.findOne({
+                // First try the standard query
+                let message = await collections.messages.findOne({
                     instanceId: validatedInstanceId,
                     jid: validJid,
                     'key.id': validId
                 })
                 
-                if (!message) return null
+                log(`getMessage message ${message ? 'found' : 'null'}`)
+                
+                // If not found, try alternative queries for poll messages and other edge cases
+                if (!message) {
+                    log(`Trying alternative query for poll message`)
+                    
+                    // Try with key.remoteJid instead of jid field
+                    message = await collections.messages.findOne({
+                        instanceId: validatedInstanceId,
+                        'key.remoteJid': validJid,
+                        'key.id': validId
+                    })
+                    
+                    if (!message) {
+                        // Try without the jid constraint at all (just instanceId and key.id)
+                        log(`Trying query with just instanceId and key.id`)
+                        message = await collections.messages.findOne({
+                            instanceId: validatedInstanceId,
+                            'key.id': validId
+                        })
+                        
+                        // Verify the jid matches if we found something
+                        if (message && message.key?.remoteJid !== validJid) {
+                            log(`Found message but JID mismatch: ${message.key?.remoteJid} !== ${validJid}`)
+                            message = null
+                        }
+                    }
+                    
+                    if (message) {
+                        log(`Found message with alternative query`)
+                    } else {
+                        // Log more details to help debug
+                        const count = await collections.messages.countDocuments({
+                            instanceId: validatedInstanceId
+                        })
+                        log(`Total messages for instance: ${count}`)
+                        
+                        // Try to find similar message IDs
+                        const similarMessages = await collections.messages.find({
+                            instanceId: validatedInstanceId,
+                            'key.id': { $regex: validId.substring(0, 10) }
+                        }).limit(5).toArray()
+                        
+                        if (similarMessages.length > 0) {
+                            log(`Found ${similarMessages.length} messages with similar IDs:`)
+                            similarMessages.forEach(msg => {
+                                log(`  - ID: ${msg.key?.id}, JID: ${msg.key?.remoteJid || msg.jid}`)
+                            })
+                        }
+                        
+                        return null
+                    }
+                }
                 
                 // Check access permissions
                 accessContext.validateAccess(message.instanceId, 'read')
@@ -1544,11 +1604,280 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             })
 
-            // Continue with all other event handlers...
-            // [Rest of the bind method implementation remains the same as in the original enhanced store]
-        },
+            // Messages upsert - CRITICAL for storing messages including polls
+            ev.on('messages.upsert', async ({ messages }) => {
+                if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
+                
+                for (const msg of messages) {
+                    const jid = msg.key.remoteJid
+                    if (!jid) continue
+                    
+                    if (await shouldStoreEvent('messages.upsert', msg)) {
+                        try {
+                            await storeImpl.upsertMessage(jid, msg)
+                            if (enableMetrics) updateEventMetrics('messages.upsert', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('messages.upsert', msg)
+                        } catch (error) {
+                            logError(`Failed to upsert message for ${jid}:`, error)
+                            if (enableMetrics) updateEventMetrics('messages.upsert', 'error')
+                        }
+                    }
+                }
+            })
 
-        // ... rest of the methods remain the same ...
+            // Messages update
+            ev.on('messages.update', async (updates) => {
+                if (enableMetrics) updateEventMetrics('messages.update', 'received')
+                
+                for (const update of updates) {
+                    const jid = update.key.remoteJid
+                    if (!jid) continue
+                    
+                    if (await shouldStoreEvent('messages.update', update)) {
+                        try {
+                            await storeImpl.updateMessage(jid, update.key.id!, update.update!)
+                            if (enableMetrics) updateEventMetrics('messages.update', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('messages.update', update)
+                        } catch (error) {
+                            logError(`Failed to update message for ${jid}:`, error)
+                            if (enableMetrics) updateEventMetrics('messages.update', 'error')
+                        }
+                    }
+                }
+            })
+
+            // Messages delete
+            ev.on('messages.delete', async (item) => {
+                if (enableMetrics) updateEventMetrics('messages.delete', 'received')
+                
+                if ('keys' in item) {
+                    const jid = item.keys[0].remoteJid
+                    if (!jid) return
+                    
+                    const ids = item.keys.map(k => k.id).filter(id => id) as string[]
+                    if (await shouldStoreEvent('messages.delete', item)) {
+                        try {
+                            await storeImpl.deleteMessages(jid, ids)
+                            if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
+                        } catch (error) {
+                            logError(`Failed to delete messages for ${jid}:`, error)
+                            if (enableMetrics) updateEventMetrics('messages.delete', 'error')
+                        }
+                    }
+                } else if ('jid' in item && item.jid) {
+                    // Delete all messages for JID
+                    if (await shouldStoreEvent('messages.delete', item)) {
+                        try {
+                            await storeImpl.deleteMessages(item.jid)
+                            if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
+                        } catch (error) {
+                            logError(`Failed to delete all messages for ${item.jid}:`, error)
+                            if (enableMetrics) updateEventMetrics('messages.delete', 'error')
+                        }
+                    }
+                }
+            })
+
+            // Chats upsert
+            ev.on('chats.upsert', async (chats) => {
+                if (enableMetrics) updateEventMetrics('chats.upsert', 'received')
+                
+                const chatsToStore = []
+                for (const chat of chats) {
+                    if (await shouldStoreEvent('chats.upsert', chat)) {
+                        chatsToStore.push(chat)
+                    }
+                }
+                
+                if (chatsToStore.length > 0) {
+                    try {
+                        await storeImpl.upsertChats(...chatsToStore)
+                        if (enableMetrics) updateEventMetrics('chats.upsert', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('chats.upsert', chatsToStore)
+                    } catch (error) {
+                        logError('Failed to upsert chats:', error)
+                        if (enableMetrics) updateEventMetrics('chats.upsert', 'error')
+                    }
+                }
+            })
+
+            // Chats update
+            ev.on('chats.update', async (updates) => {
+                if (enableMetrics) updateEventMetrics('chats.update', 'received')
+                
+                for (const update of updates) {
+                    if (await shouldStoreEvent('chats.update', update)) {
+                        try {
+                            await storeImpl.updateChat(update.id!, update)
+                            if (enableMetrics) updateEventMetrics('chats.update', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('chats.update', update)
+                        } catch (error) {
+                            logError(`Failed to update chat ${update.id}:`, error)
+                            if (enableMetrics) updateEventMetrics('chats.update', 'error')
+                        }
+                    }
+                }
+            })
+
+            // Chats delete
+            ev.on('chats.delete', async (deletions) => {
+                if (enableMetrics) updateEventMetrics('chats.delete', 'received')
+                
+                if (await shouldStoreEvent('chats.delete', deletions)) {
+                    try {
+                        await storeImpl.deleteChats(deletions)
+                        if (enableMetrics) updateEventMetrics('chats.delete', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('chats.delete', deletions)
+                    } catch (error) {
+                        logError('Failed to delete chats:', error)
+                        if (enableMetrics) updateEventMetrics('chats.delete', 'error')
+                    }
+                }
+            })
+
+            // Contacts upsert
+            ev.on('contacts.upsert', async (contacts) => {
+                if (enableMetrics) updateEventMetrics('contacts.upsert', 'received')
+                
+                const contactsToStore = []
+                for (const contact of contacts) {
+                    if (await shouldStoreEvent('contacts.upsert', contact)) {
+                        contactsToStore.push(contact)
+                    }
+                }
+                
+                if (contactsToStore.length > 0) {
+                    try {
+                        await storeImpl.upsertContacts(contactsToStore)
+                        if (enableMetrics) updateEventMetrics('contacts.upsert', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('contacts.upsert', contactsToStore)
+                    } catch (error) {
+                        logError('Failed to upsert contacts:', error)
+                        if (enableMetrics) updateEventMetrics('contacts.upsert', 'error')
+                    }
+                }
+            })
+
+            // Contacts update
+            ev.on('contacts.update', async (updates) => {
+                if (enableMetrics) updateEventMetrics('contacts.update', 'received')
+                
+                const contactsToUpdate = []
+                for (const update of updates) {
+                    if (await shouldStoreEvent('contacts.update', update)) {
+                        contactsToUpdate.push(update)
+                    }
+                }
+                
+                if (contactsToUpdate.length > 0) {
+                    try {
+                        await storeImpl.upsertContacts(contactsToUpdate as Contact[])
+                        if (enableMetrics) updateEventMetrics('contacts.update', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('contacts.update', contactsToUpdate)
+                    } catch (error) {
+                        logError('Failed to update contacts:', error)
+                        if (enableMetrics) updateEventMetrics('contacts.update', 'error')
+                    }
+                }
+            })
+
+            // Group participants update
+            ev.on('group-participants.update', async ({ id, participants, action }) => {
+                if (enableMetrics) updateEventMetrics('group-participants.update', 'received')
+                
+                const updateData = { id, participants, action }
+                if (await shouldStoreEvent('group-participants.update', updateData)) {
+                    try {
+                        const metadata = await storeImpl.getGroupMetadata(id)
+                        if (metadata) {
+                            if (action === 'add') {
+                                metadata.participants.push(...participants.map(id => ({ id, admin: null })))
+                            } else if (action === 'remove') {
+                                metadata.participants = metadata.participants.filter(p => !participants.includes(p.id))
+                            } else if (action === 'promote') {
+                                metadata.participants.forEach(p => {
+                                    if (participants.includes(p.id)) p.admin = 'admin'
+                                })
+                            } else if (action === 'demote') {
+                                metadata.participants.forEach(p => {
+                                    if (participants.includes(p.id)) p.admin = null
+                                })
+                            }
+                            await storeImpl.upsertGroupMetadata(id, metadata)
+                            if (enableMetrics) updateEventMetrics('group-participants.update', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('group-participants.update', updateData)
+                        }
+                    } catch (error) {
+                        logError(`Failed to update group participants for ${id}:`, error)
+                        if (enableMetrics) updateEventMetrics('group-participants.update', 'error')
+                    }
+                }
+            })
+
+            // Groups upsert
+            ev.on('groups.upsert', async (groups) => {
+                if (enableMetrics) updateEventMetrics('groups.upsert', 'received')
+                
+                for (const group of groups) {
+                    if (await shouldStoreEvent('groups.upsert', group)) {
+                        try {
+                            await storeImpl.upsertGroupMetadata(group.id, group)
+                            if (enableMetrics) updateEventMetrics('groups.upsert', 'stored')
+                            if (hooks.afterStore) await hooks.afterStore('groups.upsert', group)
+                        } catch (error) {
+                            logError(`Failed to upsert group ${group.id}:`, error)
+                            if (enableMetrics) updateEventMetrics('groups.upsert', 'error')
+                        }
+                    }
+                }
+            })
+
+            // Groups update
+            ev.on('groups.update', async (updates) => {
+                if (enableMetrics) updateEventMetrics('groups.update', 'received')
+                
+                for (const update of updates) {
+                    if (!update.id) continue
+                    
+                    if (await shouldStoreEvent('groups.update', update)) {
+                        try {
+                            const existing = await storeImpl.getGroupMetadata(update.id)
+                            if (existing) {
+                                const merged = { ...existing, ...update }
+                                await storeImpl.upsertGroupMetadata(update.id, merged)
+                                if (enableMetrics) updateEventMetrics('groups.update', 'stored')
+                                if (hooks.afterStore) await hooks.afterStore('groups.update', update)
+                            }
+                        } catch (error) {
+                            logError(`Failed to update group ${update.id}:`, error)
+                            if (enableMetrics) updateEventMetrics('groups.update', 'error')
+                        }
+                    }
+                }
+            })
+
+            // Presence update
+            ev.on('presence.update', async ({ id, presences }) => {
+                if (enableMetrics) updateEventMetrics('presence.update', 'received')
+                
+                const updateData = { id, presences }
+                if (await shouldStoreEvent('presence.update', updateData)) {
+                    try {
+                        await storeImpl.updatePresence(id, presences)
+                        if (enableMetrics) updateEventMetrics('presence.update', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('presence.update', updateData)
+                    } catch (error) {
+                        logError(`Failed to update presence for ${id}:`, error)
+                        if (enableMetrics) updateEventMetrics('presence.update', 'error')
+                    }
+                }
+            })
+
+            // Note: Labels and label-associations events are not part of the standard Baileys events
+            // They would need to be implemented separately if needed
+        },
 
         async loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]> {
             const mode = !cursor || 'before' in cursor ? 'before' : 'after'
@@ -1578,7 +1907,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async loadMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | undefined> {
+            log(`loadMessage called with ${jid} and ${id}`)
             const msg = await storeImpl.getMessage(jid, id)
+            log(`loadMessage result ${msg ? 'found' : 'null'}`)
             return msg || undefined
         },
 
