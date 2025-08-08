@@ -74,6 +74,19 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
     const msg = message.message
     if (!msg) return null
     
+    // Handle documentWithCaptionMessage (nested structure)
+    if (msg.documentWithCaptionMessage?.message?.documentMessage) {
+        const docMsg = msg.documentWithCaptionMessage.message.documentMessage
+        return {
+            type: 'document',
+            message: docMsg,
+            mimetype: docMsg.mimetype || undefined,
+            filename: docMsg.fileName || undefined,
+            caption: docMsg.caption || undefined
+        }
+    }
+    
+    // Handle regular image message
     if (msg.imageMessage) {
         return {
             type: 'image',
@@ -83,12 +96,35 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
         }
     }
     
+    // Handle quoted image message
+    if (msg.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) {
+        const imgMsg = msg.extendedTextMessage.contextInfo.quotedMessage.imageMessage
+        return {
+            type: 'image',
+            message: imgMsg,
+            mimetype: imgMsg.mimetype || undefined,
+            caption: imgMsg.caption || undefined
+        }
+    }
+    
+    // Handle regular video message
     if (msg.videoMessage) {
         return {
             type: 'video',
             message: msg.videoMessage,
             mimetype: msg.videoMessage.mimetype || undefined,
             caption: msg.videoMessage.caption || undefined
+        }
+    }
+    
+    // Handle quoted video message
+    if (msg.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage) {
+        const vidMsg = msg.extendedTextMessage.contextInfo.quotedMessage.videoMessage
+        return {
+            type: 'video',
+            message: vidMsg,
+            mimetype: vidMsg.mimetype || undefined,
+            caption: vidMsg.caption || undefined
         }
     }
     

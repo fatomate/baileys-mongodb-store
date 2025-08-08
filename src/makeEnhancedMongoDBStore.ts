@@ -1624,10 +1624,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 if (mediaResult.success && mediaResult.localPath) {
                                     // Update message with media URL
-                                    await collections.messages.updateOne(
+                                    const updateResult = await collections.messages.updateOne(
                                         { 
                                             instanceId, 
-                                            remoteJid: jid, 
+                                            jid, 
                                             'key.id': msg.key.id 
                                         },
                                         { 
@@ -1642,6 +1642,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     )
                                     
                                     log(`✅ Media downloaded for message ${msg.key.id}: ${mediaResult.localPath}`)
+                                    log(`📝 MongoDB update result: matched=${updateResult.matchedCount}, modified=${updateResult.modifiedCount}`)
+                                    
+                                    if (updateResult.matchedCount === 0) {
+                                        log(`⚠️ No document found to update for message ${msg.key.id} in chat ${jid}`)
+                                    }
                                 } else if (!mediaResult.success && mediaResult.error) {
                                     log(`⚠️ Media download failed for message ${msg.key.id}: ${mediaResult.error}`)
                                 }
@@ -2127,7 +2132,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Fetch the message from database
                 const message = await collections.messages.findOne({
                     instanceId,
-                    remoteJid: jid,
+                    jid,
                     'key.id': messageId
                 })
                 
@@ -2148,7 +2153,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     await collections.messages.updateOne(
                         { 
                             instanceId, 
-                            remoteJid: jid, 
+                            jid, 
                             'key.id': messageId 
                         },
                         { 
