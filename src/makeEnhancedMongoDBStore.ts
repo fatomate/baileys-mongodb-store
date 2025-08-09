@@ -33,7 +33,7 @@ import {
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
-import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats } from './utils/media'
+import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -1644,10 +1644,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 // Check if this is an Official API message
-                                const isOfficialAPI = (msg as any).official_api === true
+                                const isOfficialAPI = !!(msg as any).official_api
+                                
+                                // Debug logging for Official API media detection
+                                if (config.logger) {
+                                    config.logger.info({
+                                        messageId: msg.key?.id,
+                                        officialApiFlag: (msg as any).official_api,
+                                        isOfficialAPI,
+                                        hasMedia: !!extractMediaInfo(msg),
+                                        messageType: msg.message ? Object.keys(msg.message)[0] : 'unknown'
+                                    }, '🔍 DEBUG: Media download detection')
+                                }
                                 
                                 let mediaResult
                                 if (isOfficialAPI) {
+                                    config.logger?.info({ 
+                                        messageId: msg.key?.id,
+                                        jid
+                                    }, '📥 Attempting Official API media download')
                                     // Use Official API download method
                                     mediaResult = await downloadOfficialAPIMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
                                 } else {

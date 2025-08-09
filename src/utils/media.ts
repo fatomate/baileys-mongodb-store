@@ -584,6 +584,11 @@ export async function downloadOfficialAPIMedia(
         // Extract media info
         const mediaInfo = extractMediaInfo(message)
         if (!mediaInfo) {
+            logger?.warn({
+                messageId: message.key?.id,
+                messageKeys: message.message ? Object.keys(message.message) : [],
+                messageStructure: JSON.stringify(message.message, null, 2).substring(0, 500)
+            }, '❌ No media info extracted from Official API message')
             return { success: false, error: 'No media found in message' }
         }
         
@@ -592,7 +597,20 @@ export async function downloadOfficialAPIMedia(
         const mediaMessage = mediaInfo.message as any
         const mediaId = mediaMessage.id
         
+        logger?.info({
+            messageId: message.key?.id,
+            mediaType: mediaInfo.type,
+            extractedMediaId: mediaId,
+            mediaMessageKeys: Object.keys(mediaMessage),
+            mediaMessageStructure: JSON.stringify(mediaMessage, null, 2).substring(0, 500)
+        }, '🔍 DEBUG: Official API media ID extraction')
+        
         if (!mediaId) {
+            logger?.error({
+                messageId: message.key?.id,
+                mediaType: mediaInfo.type,
+                mediaMessage: JSON.stringify(mediaMessage, null, 2)
+            }, '❌ No media ID found in Official API message')
             return { success: false, error: 'No media ID found in Official API message' }
         }
         
