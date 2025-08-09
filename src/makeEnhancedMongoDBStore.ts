@@ -33,7 +33,7 @@ import {
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
-import { downloadMedia, cleanupOldMedia, getMediaStats } from './utils/media'
+import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats } from './utils/media'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -1632,7 +1632,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     return existing?.mediaUrl || null
                                 }
                                 
-                                const mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
+                                // Check if this is an Official API message
+                                const isOfficialAPI = (msg as any).official_api === true
+                                
+                                let mediaResult
+                                if (isOfficialAPI) {
+                                    // Use Official API download method
+                                    mediaResult = await downloadOfficialAPIMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
+                                } else {
+                                    // Use regular Baileys download method
+                                    mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
+                                }
                                 
                                 if (mediaResult.success && mediaResult.localPath) {
                                     // Update message with media URL

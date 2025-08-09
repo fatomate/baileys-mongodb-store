@@ -4,6 +4,7 @@ import { createWriteStream, promises as fs } from 'fs'
 import { join } from 'path'
 import { pipeline } from 'stream/promises'
 import type { Logger } from 'pino'
+import axios from 'axios'
 
 export interface MediaConfig {
     /**
@@ -45,6 +46,23 @@ export interface MediaConfig {
      * Timeout for download operations in milliseconds
      */
     downloadTimeout?: number
+    
+    /**
+     * Official WhatsApp API configuration
+     */
+    officialAPI?: {
+        /**
+         * Function to get account data for a given instance
+         */
+        getAccountData?: (instanceId: string) => Promise<OfficialAPIAccountData | null>
+    }
+}
+
+export interface OfficialAPIAccountData {
+    loginType: number
+    status: number
+    tmp: string
+    data: string
 }
 
 export type MediaType = 'image' | 'video' | 'audio' | 'document' | 'sticker'
@@ -260,7 +278,7 @@ function generateFileName(
         }
         
         // Sanitize the filename to avoid path traversal issues
-        nameWithoutExt = nameWithoutExt.replace(/[^a-zA-Z0-9_\-]/g, '_')
+        nameWithoutExt = nameWithoutExt.replace(/[^a-zA-Z0-9_-]/g, '_')
         
         return `${timestamp}_${sanitizedId}_${nameWithoutExt}${extension}`
     }
@@ -330,6 +348,7 @@ async function downloadWithRetry(
  * Get media SHA256 hash from message
  */
 function getMediaHash(mediaInfo: MediaInfo): string | undefined {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const message = mediaInfo.message as any
     return message.fileSha256 ? Buffer.from(message.fileSha256).toString('base64') : undefined
 }
@@ -446,6 +465,207 @@ export async function downloadMedia(
             messageId: message.key.id,
             instanceId
         }, 'Failed to download media')
+        
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error occurred'
+        }
+    }
+}
+
+/**
+ * Download media from Official WhatsApp API
+ */
+async function downloadFromOfficialAPI(
+    mediaId: string,
+    accountData: OfficialAPIAccountData,
+    filePath: string,
+    logger?: Logger
+): Promise<void> {
+    try {
+        const { access_token, phone_number_id } = JSON.parse(accountData.tmp)
+        const isWabotPro = accountData.data === 'wabot_pro'
+        
+        // Step 1: Get media URL from WhatsApp API
+        const apiUrl = isWabotPro
+            ? `https://crm.wabot.pro/api/meta/v19.0/${mediaId}?phone_number_id=${phone_number_id}`
+            : `https://graph.facebook.com/v23.0/${mediaId}?phone_number_id=${phone_number_id}`
+        
+        const mediaUrlResponse = await axios.get(
+            apiUrl,
+            {
+                headers: {
+                    'Authorization': `Bearer ${access_token}`
+                },
+                timeout: 10000
+            }
+        )
+        
+        if (!mediaUrlResponse.data?.url) {
+            throw new Error('No media URL returned from WhatsApp API')
+        }
+        
+        // Step 2: Download the actual media file
+        const mediaResponse = await axios.get(
+            mediaUrlResponse.data.url,
+            {
+                headers: {
+                    'Authorization': `Bearer ${access_token}`
+                },
+                responseType: 'stream',
+                timeout: 60000
+            }
+        )
+        
+        // Write to file
+        const writeStream = createWriteStream(filePath)
+        await pipeline(mediaResponse.data, writeStream)
+        
+        logger?.info({
+            mediaId,
+            filePath
+        }, 'Successfully downloaded Official API media')
+        
+    } catch (error) {
+        logger?.error({
+            error: error instanceof Error ? error.message : 'Unknown error',
+            mediaId
+        }, 'Failed to download Official API media')
+        throw error
+    }
+}
+
+/**
+ * Download and save media from an Official WhatsApp API message
+ */
+export async function downloadOfficialAPIMedia(
+    message: proto.IWebMessageInfo,
+    instanceId: string,
+    config: MediaConfig,
+    logger?: Logger,
+    checkExisting?: (hash: string) => Promise<string | null>
+): Promise<MediaDownloadResult> {
+    try {
+        // Check if media download is enabled
+        if (!config.enabled) {
+            return { success: false, error: 'Media download disabled' }
+        }
+        
+        // Check if Official API is configured
+        if (!config.officialAPI?.getAccountData) {
+            return { success: false, error: 'Official API not configured' }
+        }
+        
+        // Skip group messages if configured
+        if (config.skipGroupMessages && message.key.remoteJid?.includes('@g.us')) {
+            return { success: false, error: 'Group message skipped' }
+        }
+        
+        // Extract media info
+        const mediaInfo = extractMediaInfo(message)
+        if (!mediaInfo) {
+            return { success: false, error: 'No media found in message' }
+        }
+        
+        // Get the media ID from the message
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const mediaMessage = mediaInfo.message as any
+        const mediaId = mediaMessage.id
+        
+        if (!mediaId) {
+            return { success: false, error: 'No media ID found in Official API message' }
+        }
+        
+        // Check if we already have this media file by ID (using ID as hash for Official API)
+        if (checkExisting) {
+            const existingPath = await checkExisting(mediaId)
+            if (existingPath) {
+                logger?.info({
+                    messageId: message.key.id,
+                    mediaId,
+                    existingPath
+                }, 'Official API media already exists, reusing file')
+                
+                return {
+                    success: true,
+                    localPath: existingPath,
+                    mediaType: mediaInfo.type,
+                    fileName: existingPath.split('/').pop(),
+                    fileSize: 0,
+                    mediaHash: mediaId,
+                    reused: true
+                }
+            }
+        }
+        
+        // Get account data for this instance
+        const accountData = await config.officialAPI.getAccountData(instanceId)
+        if (!accountData || accountData.loginType !== 1 || accountData.status !== 1) {
+            return { success: false, error: 'Invalid account for Official API' }
+        }
+        
+        // Check allowed types
+        if (config.allowedTypes && config.allowedTypes.length > 0) {
+            if (!config.allowedTypes.includes(mediaInfo.type)) {
+                return { success: false, error: `Media type ${mediaInfo.type} not allowed` }
+            }
+        }
+        
+        // Prepare directory structure
+        const instanceDir = join(config.baseDir, instanceId)
+        const typeDir = join(instanceDir, mediaInfo.type)
+        await ensureDir(typeDir)
+        
+        // Generate filename
+        const timestamp = Date.now()
+        const extension = getExtension(mediaInfo.mimetype || 'application/octet-stream', mediaInfo.type)
+        const fileName = mediaInfo.filename || `${timestamp}.${extension}`
+        const filePath = join(typeDir, fileName)
+        
+        // Download the media with retry logic
+        const maxRetries = config.maxRetries || 3
+        const retryDelay = config.retryDelay || 1000
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await downloadFromOfficialAPI(mediaId, accountData, filePath, logger)
+                break
+            } catch (error) {
+                if (attempt === maxRetries) {
+                    throw error
+                }
+                
+                logger?.warn({
+                    error: error instanceof Error ? error.message : 'Unknown error',
+                    attempt,
+                    maxRetries,
+                    mediaId
+                }, 'Official API media download failed, retrying...')
+                
+                await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
+            }
+        }
+        
+        // Get file stats
+        const stats = await fs.stat(filePath)
+        
+        // Return relative path from base directory
+        const relativePath = join(instanceId, mediaInfo.type, fileName)
+        
+        return {
+            success: true,
+            localPath: relativePath,
+            mediaType: mediaInfo.type,
+            fileName,
+            fileSize: stats.size,
+            mediaHash: mediaId
+        }
+    } catch (error) {
+        logger?.error({
+            error: error instanceof Error ? error.message : 'Unknown error',
+            messageId: message.key.id,
+            instanceId
+        }, 'Failed to download Official API media')
         
         return {
             success: false,
