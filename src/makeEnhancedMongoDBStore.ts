@@ -1180,12 +1180,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Handle media download for Official API messages
             if (config.media?.enabled && isOfficialAPI) {
+                log(`🔍 Checking for Official API media in message ${message.key?.id}`)
                 const mediaInfo = extractMediaInfo(message)
+                log(`📋 Media extraction result: ${mediaInfo ? `Found ${mediaInfo.type} media` : 'No media found'}`)
+                
                 if (mediaInfo) {
+                    const mediaMessage = mediaInfo.message as any
+                    log(`🆔 Media ID: ${mediaMessage.id}, Type: ${mediaInfo.type}, Mimetype: ${mediaInfo.mimetype}`)
+                    
                     config.logger?.info({
                         messageId: message.key?.id,
                         jid: validJid,
                         mediaType: mediaInfo.type,
+                        mediaId: mediaMessage.id,
                         isOfficialAPI
                     }, '📥 Triggering Official API media download from upsertMessage')
                     
@@ -1218,11 +1225,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         } 
                                     }
                                 )
+                                log(`✅ Official API media downloaded successfully: ${mediaResult.localPath}`)
                                 config.logger?.info({
                                     messageId: message.key?.id,
                                     mediaUrl: mediaResult.localPath
                                 }, '✅ Official API media downloaded and URL updated')
                             } else {
+                                log(`❌ Failed to download Official API media: ${mediaResult.error}`)
                                 config.logger?.warn({
                                     messageId: message.key?.id,
                                     error: mediaResult.error
@@ -1230,11 +1239,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             }
                         })
                         .catch(error => {
+                            log(`❌ Error downloading Official API media: ${error instanceof Error ? error.message : 'Unknown error'}`)
                             config.logger?.error({
                                 messageId: message.key?.id,
                                 error: error instanceof Error ? error.message : 'Unknown error'
                             }, '❌ Error downloading Official API media')
                         })
+                } else {
+                    log(`⚠️ No media info extracted from Official API message ${message.key?.id}`)
                 }
             }
             

@@ -94,6 +94,9 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
     const msg = message.message
     if (!msg) return null
     
+    // Check if this is an Official API message
+    const isOfficialAPI = (message as any).official_api === true
+    
     // Handle documentWithCaptionMessage (nested structure)
     if (msg.documentWithCaptionMessage?.message?.documentMessage) {
         const docMsg = msg.documentWithCaptionMessage.message.documentMessage
@@ -106,8 +109,20 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
         }
     }
     
-    // Handle regular image message
+    // Handle regular image message (including Official API)
     if (msg.imageMessage) {
+        // For Official API, check if it has an 'id' field which indicates it needs special handling
+        const imgMsg = msg.imageMessage as any
+        if (isOfficialAPI && imgMsg.id && !imgMsg.url && !imgMsg.directPath) {
+            // This is an Official API message with media ID
+            return {
+                type: 'image',
+                message: msg.imageMessage,
+                mimetype: imgMsg.mimetype || undefined,
+                caption: imgMsg.caption || undefined
+            }
+        }
+        // Regular Baileys message
         return {
             type: 'image',
             message: msg.imageMessage,
@@ -127,8 +142,19 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
         }
     }
     
-    // Handle regular video message
+    // Handle regular video message (including Official API)
     if (msg.videoMessage) {
+        const vidMsg = msg.videoMessage as any
+        if (isOfficialAPI && vidMsg.id && !vidMsg.url && !vidMsg.directPath) {
+            // This is an Official API message with media ID
+            return {
+                type: 'video',
+                message: msg.videoMessage,
+                mimetype: vidMsg.mimetype || undefined,
+                caption: vidMsg.caption || undefined
+            }
+        }
+        // Regular Baileys message
         return {
             type: 'video',
             message: msg.videoMessage,
@@ -148,7 +174,18 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
         }
     }
     
+    // Handle audio message (including Official API)
     if (msg.audioMessage) {
+        const audMsg = msg.audioMessage as any
+        if (isOfficialAPI && audMsg.id && !audMsg.url && !audMsg.directPath) {
+            // This is an Official API message with media ID
+            return {
+                type: 'audio',
+                message: msg.audioMessage,
+                mimetype: audMsg.mimetype || undefined
+            }
+        }
+        // Regular Baileys message
         return {
             type: 'audio',
             message: msg.audioMessage,
@@ -156,7 +193,19 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
         }
     }
     
+    // Handle document message (including Official API)
     if (msg.documentMessage) {
+        const docMsg = msg.documentMessage as any
+        if (isOfficialAPI && docMsg.id && !docMsg.url && !docMsg.directPath) {
+            // This is an Official API message with media ID
+            return {
+                type: 'document',
+                message: msg.documentMessage,
+                mimetype: docMsg.mimetype || undefined,
+                filename: docMsg.fileName || undefined
+            }
+        }
+        // Regular Baileys message
         return {
             type: 'document',
             message: msg.documentMessage,
@@ -165,7 +214,18 @@ export function extractMediaInfo(message: proto.IWebMessageInfo): MediaInfo | nu
         }
     }
     
+    // Handle sticker message (including Official API)
     if (msg.stickerMessage) {
+        const stkMsg = msg.stickerMessage as any
+        if (isOfficialAPI && stkMsg.id && !stkMsg.url && !stkMsg.directPath) {
+            // This is an Official API message with media ID
+            return {
+                type: 'sticker',
+                message: msg.stickerMessage,
+                mimetype: stkMsg.mimetype || undefined
+            }
+        }
+        // Regular Baileys message
         return {
             type: 'sticker',
             message: msg.stickerMessage,
@@ -597,6 +657,15 @@ export async function downloadOfficialAPIMedia(
         const mediaMessage = mediaInfo.message as any
         const mediaId = mediaMessage.id
         
+        console.log(`[downloadOfficialAPIMedia] Processing message:`, {
+            messageId: message.key?.id,
+            officialApiFlag: (message as any).official_api,
+            mediaType: mediaInfo.type,
+            extractedMediaId: mediaId,
+            messageKeys: Object.keys(message.message || {}),
+            mediaMessageKeys: Object.keys(mediaMessage)
+        })
+        
         logger?.info({
             messageId: message.key?.id,
             mediaType: mediaInfo.type,
@@ -606,6 +675,7 @@ export async function downloadOfficialAPIMedia(
         }, '🔍 DEBUG: Official API media ID extraction')
         
         if (!mediaId) {
+            console.log(`[downloadOfficialAPIMedia] ERROR: No media ID found in message`)
             logger?.error({
                 messageId: message.key?.id,
                 mediaType: mediaInfo.type,
