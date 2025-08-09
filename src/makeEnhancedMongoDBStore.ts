@@ -1177,6 +1177,67 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 },
                 { upsert: true }
             )
+            
+            // Handle media download for Official API messages
+            if (config.media?.enabled && isOfficialAPI) {
+                const mediaInfo = extractMediaInfo(message)
+                if (mediaInfo) {
+                    config.logger?.info({
+                        messageId: message.key?.id,
+                        jid: validJid,
+                        mediaType: mediaInfo.type,
+                        isOfficialAPI
+                    }, '📥 Triggering Official API media download from upsertMessage')
+                    
+                    // Function to check for existing media by hash
+                    const checkExistingMedia = async (hash: string): Promise<string | null> => {
+                        const existing = await collections.messages.findOne({
+                            instanceId: validatedInstanceId,
+                            mediaHash: hash,
+                            mediaUrl: { $exists: true }
+                        }) as any
+                        return existing?.mediaUrl || null
+                    }
+                    
+                    // Download media asynchronously
+                    downloadOfficialAPIMedia(message, validatedInstanceId, config.media, config.logger, checkExistingMedia)
+                        .then(async (mediaResult) => {
+                            if (mediaResult.success && mediaResult.localPath) {
+                                // Update message with media URL
+                                await collections.messages.updateOne(
+                                    { 
+                                        instanceId: validatedInstanceId, 
+                                        jid: validJid, 
+                                        'key.id': message.key?.id 
+                                    },
+                                    { 
+                                        $set: { 
+                                            mediaUrl: mediaResult.localPath,
+                                            mediaType: mediaResult.mediaType,
+                                            mediaHash: mediaResult.mediaHash
+                                        } 
+                                    }
+                                )
+                                config.logger?.info({
+                                    messageId: message.key?.id,
+                                    mediaUrl: mediaResult.localPath
+                                }, '✅ Official API media downloaded and URL updated')
+                            } else {
+                                config.logger?.warn({
+                                    messageId: message.key?.id,
+                                    error: mediaResult.error
+                                }, '❌ Failed to download Official API media')
+                            }
+                        })
+                        .catch(error => {
+                            config.logger?.error({
+                                messageId: message.key?.id,
+                                error: error instanceof Error ? error.message : 'Unknown error'
+                            }, '❌ Error downloading Official API media')
+                        })
+                }
+            }
+            
             } catch (error) {
                 if (error instanceof ValidationError || error instanceof AuthorizationError) {
                     throw error
