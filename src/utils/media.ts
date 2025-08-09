@@ -491,39 +491,59 @@ async function downloadFromOfficialAPI(
             ? `https://crm.wabot.pro/api/meta/v19.0/${mediaId}?phone_number_id=${phone_number_id}`
             : `https://graph.facebook.com/v23.0/${mediaId}?phone_number_id=${phone_number_id}`
         
-        const mediaUrlResponse = await axios.get(
+        const firstResponse = await axios.get(
             apiUrl,
             {
                 headers: {
                     'Authorization': `Bearer ${access_token}`
                 },
+                responseType: 'stream',
                 timeout: 10000
             }
         )
         
-        if (!mediaUrlResponse.data?.url) {
-            throw new Error('No media URL returned from WhatsApp API')
-        }
+        // Check if the response is JSON (contains URL) or direct media
+        const contentType = firstResponse.headers['content-type'] || ''
         
-        // Step 2: Download the actual media file
-        const mediaResponse = await axios.get(
-            mediaUrlResponse.data.url,
-            {
-                headers: {
-                    'Authorization': `Bearer ${access_token}`
-                },
-                responseType: 'stream',
-                timeout: 60000
+        if (contentType.includes('application/json')) {
+            // This is a JSON response with URL - need second request
+            // Convert stream to JSON
+            let data = ''
+            for await (const chunk of firstResponse.data) {
+                data += chunk.toString()
             }
-        )
-        
-        // Write to file
-        const writeStream = createWriteStream(filePath)
-        await pipeline(mediaResponse.data, writeStream)
+            const jsonResponse = JSON.parse(data)
+            
+            if (!jsonResponse?.url) {
+                throw new Error('No media URL returned from WhatsApp API')
+            }
+            
+            // Step 2: Download the actual media file
+            const mediaResponse = await axios.get(
+                jsonResponse.url,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${access_token}`
+                    },
+                    responseType: 'stream',
+                    timeout: 60000
+                }
+            )
+            
+            // Write to file
+            const writeStream = createWriteStream(filePath)
+            await pipeline(mediaResponse.data, writeStream)
+        } else {
+            // This is the direct media response (wabot_pro proxy behavior)
+            // Write directly to file
+            const writeStream = createWriteStream(filePath)
+            await pipeline(firstResponse.data, writeStream)
+        }
         
         logger?.info({
             mediaId,
-            filePath
+            filePath,
+            contentType
         }, 'Successfully downloaded Official API media')
         
     } catch (error) {
