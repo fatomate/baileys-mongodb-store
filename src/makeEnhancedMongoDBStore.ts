@@ -1127,9 +1127,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             try {
                 const validJid = validateJID(jid)
                 
-                // Validate message ID if present
+                // Check if this is an Official API message
+                const isOfficialAPI = (message as any).official_api === true
+                
+                // Validate message ID if present (with special handling for Official API)
                 if (message.key?.id) {
-                    validateMessageId(message.key.id)
+                    validateMessageId(message.key.id, isOfficialAPI)
                 }
                 
                 // Check write permissions
@@ -1228,8 +1231,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             try {
                 const validJid = validateJID(jid)
                 
-                // Validate message IDs if provided
-                const validIds = ids?.map(id => validateMessageId(id))
+                // For deletion, we can't easily determine if these are Official API IDs,
+                // so we'll be more lenient with validation
+                const validIds = ids?.map(id => {
+                    try {
+                        return validateMessageId(id, false)
+                    } catch {
+                        // If regular validation fails, try as Official API ID
+                        return validateMessageId(id, true)
+                    }
+                })
                 
                 // Check delete permissions
                 accessContext.validateAccess(validatedInstanceId, 'delete')

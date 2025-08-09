@@ -16,7 +16,8 @@ const STATUS_JID = 'status@broadcast' // Status updates
 // WhatsApp message IDs can be:
 // - Classic format: 16-32 uppercase alphanumeric (e.g., "3EB0ABC123DEF456")
 // - Numeric format: 10+ digit strings (e.g., "1679765488")
-const MESSAGE_ID_REGEX = /^([A-Z0-9]{16,32}|[0-9]{10,})$/
+// - Official API format: Base64-like strings with = and + (e.g., "wamid.HBgL...AA==")
+const MESSAGE_ID_REGEX = /^([A-Z0-9]{16,32}|[0-9]{10,}|[A-Za-z0-9+/=]{10,})$/
 
 // Custom error classes for security
 export class ValidationError extends Error {
@@ -86,12 +87,22 @@ export const isValidMessageId = (id: string): boolean => {
 /**
  * Validates and sanitizes a message ID
  * @param id - The message ID to validate
+ * @param isOfficialAPI - Whether this is an Official API message
  * @throws ValidationError if invalid
  * @returns The validated message ID
  */
-export const validateMessageId = (id: string): string => {
+export const validateMessageId = (id: string, isOfficialAPI: boolean = false): string => {
     // Ensure id is a string and trim it first
     const trimmedId = id?.toString().trim()
+    
+    // For Official API messages, we're more lenient as they use different ID formats
+    if (isOfficialAPI && trimmedId) {
+        // Official API IDs can contain Base64 characters including =, +, /
+        // and can be of various lengths after slicing
+        if (trimmedId.length >= 10) {
+            return trimmedId // Accept any Official API ID with reasonable length
+        }
+    }
     
     if (!trimmedId || !isValidMessageId(trimmedId)) {
         console.error('Message ID validation failed:', {
@@ -99,7 +110,8 @@ export const validateMessageId = (id: string): string => {
             trimmed: trimmedId,
             type: typeof id,
             length: trimmedId?.length,
-            regex: MESSAGE_ID_REGEX.source
+            regex: MESSAGE_ID_REGEX.source,
+            isOfficialAPI
         })
         throw new ValidationError(`Invalid message ID format: ${trimmedId?.substring(0, 50)}`)
     }
