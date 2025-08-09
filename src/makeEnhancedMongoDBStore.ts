@@ -402,6 +402,57 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         },
                         { upsert: true }
                     )
+                    
+                    // Handle media download for Official API messages in Bull queue
+                    const isOfficialAPI = (message as any).official_api === true
+                    if (config.media?.enabled && isOfficialAPI) {
+                        log(`🔍 [Bull Queue] Checking for Official API media in message ${message.key?.id}`)
+                        const mediaInfo = extractMediaInfo(message)
+                        log(`📋 [Bull Queue] Media extraction result: ${mediaInfo ? `Found ${mediaInfo.type} media` : 'No media found'}`)
+                        
+                        if (mediaInfo) {
+                            const mediaMessage = mediaInfo.message as any
+                            log(`🆔 [Bull Queue] Media ID: ${mediaMessage.id}, Type: ${mediaInfo.type}, Mimetype: ${mediaInfo.mimetype}`)
+                            
+                            // Function to check for existing media by hash
+                            const checkExistingMedia = async (hash: string): Promise<string | null> => {
+                                const existing = await collections.messages.findOne({
+                                    instanceId,
+                                    mediaHash: hash,
+                                    mediaUrl: { $exists: true }
+                                }) as any
+                                return existing?.mediaUrl || null
+                            }
+                            
+                            try {
+                                const mediaResult = await downloadOfficialAPIMedia(message, instanceId, config.media, config.logger, checkExistingMedia)
+                                
+                                if (mediaResult.success && mediaResult.localPath) {
+                                    await collections.messages.updateOne(
+                                        { 
+                                            instanceId, 
+                                            jid, 
+                                            'key.id': message.key?.id 
+                                        },
+                                        { 
+                                            $set: { 
+                                                mediaUrl: mediaResult.localPath,
+                                                mediaType: mediaResult.mediaType,
+                                                mediaHash: mediaResult.mediaHash
+                                            } 
+                                        }
+                                    )
+                                    log(`✅ [Bull Queue] Official API media downloaded successfully: ${mediaResult.localPath}`)
+                                } else {
+                                    log(`❌ [Bull Queue] Failed to download Official API media: ${mediaResult.error}`)
+                                }
+                            } catch (error) {
+                                log(`❌ [Bull Queue] Error downloading Official API media: ${error instanceof Error ? error.message : 'Unknown error'}`)
+                            }
+                        } else {
+                            log(`⚠️ [Bull Queue] No media info extracted from Official API message ${message.key?.id}`)
+                        }
+                    }
                 } else if (type === 'update' && messageId && update) {
                     await collections.messages.updateOne(
                         {
