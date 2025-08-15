@@ -15,9 +15,11 @@ const STATUS_JID = 'status@broadcast' // Status updates
 // Message ID validation
 // WhatsApp message IDs can be:
 // - Classic format: 16-32 uppercase alphanumeric (e.g., "3EB0ABC123DEF456")
-// - Numeric format: 10+ digit strings (e.g., "1679765488")
+// - Numeric format: Any digit strings (e.g., "1679765488", "58384821")
+// - Numeric with hyphen: Digits with optional hyphen (e.g., "1688785978376286-1")
 // - Official API format: Base64-like strings with = and + (e.g., "wamid.HBgL...AA==")
-const MESSAGE_ID_REGEX = /^([A-Z0-9]{16,32}|[0-9]{10,}|[A-Za-z0-9+/=]{10,})$/
+// - Mixed format: Alphanumeric with special chars (various lengths)
+const MESSAGE_ID_REGEX = /^([A-Z0-9]{16,32}|[0-9]+(-[0-9]+)?|[A-Za-z0-9+/=._-]{3,})$/
 
 // Custom error classes for security
 export class ValidationError extends Error {
@@ -81,7 +83,9 @@ export const validateJID = (jid: string): string => {
  */
 export const isValidMessageId = (id: string): boolean => {
     if (!id || typeof id !== 'string') return false
-    return MESSAGE_ID_REGEX.test(id)
+    const trimmedId = id.trim()
+    // Very lenient validation - just check for basic safety
+    return trimmedId.length >= 3 && !trimmedId.includes('$') && !trimmedId.includes('{') && !trimmedId.includes('}')
 }
 
 /**
@@ -95,27 +99,32 @@ export const validateMessageId = (id: string, isOfficialAPI: boolean = false): s
     // Ensure id is a string and trim it first
     const trimmedId = id?.toString().trim()
     
-    // For Official API messages, we're more lenient as they use different ID formats
-    if (isOfficialAPI && trimmedId) {
-        // Official API IDs can contain Base64 characters including =, +, /
-        // and can be of various lengths after slicing
-        if (trimmedId.length >= 10) {
-            return trimmedId // Accept any Official API ID with reasonable length
-        }
+    // Basic validation - must have some content
+    if (!trimmedId || trimmedId.length === 0) {
+        throw new ValidationError('Message ID cannot be empty')
     }
     
-    if (!trimmedId || !isValidMessageId(trimmedId)) {
-        console.error('Message ID validation failed:', {
-            original: id,
-            trimmed: trimmedId,
-            type: typeof id,
-            length: trimmedId?.length,
-            regex: MESSAGE_ID_REGEX.source,
-            isOfficialAPI
-        })
-        throw new ValidationError(`Invalid message ID format: ${trimmedId?.substring(0, 50)}`)
+    // For Official API messages, we're more lenient as they use different ID formats
+    if (isOfficialAPI && trimmedId.length >= 3) {
+        return trimmedId // Accept any Official API ID with reasonable length
     }
-    return trimmedId
+    
+    // For regular messages, be very lenient
+    // Accept any ID that's at least 3 characters and doesn't contain obvious injection attempts
+    if (trimmedId.length >= 3 && !trimmedId.includes('$') && !trimmedId.includes('{') && !trimmedId.includes('}')) {
+        return trimmedId
+    }
+    
+    // If it still doesn't pass our lenient check, log and reject
+    console.error('Message ID validation failed:', {
+        original: id,
+        trimmed: trimmedId,
+        type: typeof id,
+        length: trimmedId?.length,
+        regex: MESSAGE_ID_REGEX.source,
+        isOfficialAPI
+    })
+    throw new ValidationError(`Invalid message ID format: ${trimmedId?.substring(0, 50)}`)
 }
 
 /**
