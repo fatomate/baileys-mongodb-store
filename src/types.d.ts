@@ -8,6 +8,7 @@ import type { RedisOptions } from 'ioredis'
 import type { AuthConfig } from './utils/auth'
 import type { MemoryConfig } from './utils/memory'
 import type { TTLConfig } from './utils/ttl'
+import type { LidHandlerConfig } from './utils/lidHandler'
 
 export interface RedisConfig {
     /**
@@ -122,6 +123,12 @@ export interface MongoDBStoreConfig {
      * Enables verification and monitoring of TTL indexes
      */
     ttlMonitoring?: Omit<TTLConfig, 'days'>
+    
+    /**
+     * Optional LID (LinkedIn ID) handler configuration
+     * Enables automatic @lid to phone number mapping
+     */
+    lidHandler?: LidHandlerConfig
 }
 
 export interface MongoDBStore {

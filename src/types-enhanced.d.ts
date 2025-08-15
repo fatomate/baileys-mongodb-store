@@ -9,6 +9,7 @@ import type { AuthConfig } from './utils/auth'
 import type { MemoryConfig } from './utils/memory'
 import type { TTLConfig } from './utils/ttl'
 import type { MediaConfig } from './utils/media'
+import type { LidHandlerConfig } from './utils/lidHandler'
 
 /**
  * Event types that can be stored in MongoDB
@@ -283,6 +284,12 @@ export interface EnhancedMongoDBStoreConfig {
      * Enables automatic download and storage of media files
      */
     media?: MediaConfig
+    
+    /**
+     * Optional LID (LinkedIn ID) handler configuration
+     * Enables automatic @lid to phone number mapping
+     */
+    lidHandler?: LidHandlerConfig
 }
 
 /**

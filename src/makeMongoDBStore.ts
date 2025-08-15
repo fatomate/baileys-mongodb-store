@@ -29,6 +29,7 @@ import {
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController, MemoryAwareBatchProcessor, calculateOptimalBatchSize } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
+import { LidHandler } from './utils/lidHandler'
 
 const DEFAULT_TTL_DAYS = 30
 
@@ -225,7 +226,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         logLevel = 'none',
         auth,
         memory,
-        ttlMonitoring
+        ttlMonitoring,
+        lidHandler: lidHandlerConfig
     } = config
     
     // Validate instance ID
@@ -263,6 +265,9 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     
     // TTL monitor will be initialized after DB connection
     let ttlMonitor: TTLMonitor | null = null
+    
+    // LID handler will be initialized after DB connection
+    let lidHandler: LidHandler | null = null
 
     let client: MongoClient
     let db: Db
@@ -325,6 +330,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 ttlMonitor.startMonitoring((message) => {
                     logWarn(`[TTL Monitor] ${message}`)
                 })
+            }
+            
+            // Initialize LID handler after DB connection
+            if (lidHandlerConfig && !lidHandler) {
+                lidHandler = new LidHandler(validatedInstanceId, lidHandlerConfig)
+                await lidHandler.initialize(db, collectionPrefix)
+                log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
             }
             
             // Update active connections
@@ -1589,8 +1601,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async getMessages(jid: string): Promise<proto.IWebMessageInfo[]> {
+            // Normalize JID if it's a LID
+            let normalizedJid = jid
+            if (lidHandler) {
+                normalizedJid = await lidHandler.normalizeJid(jid) || jid
+            }
+            
             const messages = await collections.messages
-                .find({ instanceId, jid })
+                .find({ instanceId, jid: normalizedJid })
                 .sort({ messageTimestamp: -1 })
                 .toArray()
             
@@ -1620,7 +1638,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
             try {
-                const validJid = validateJID(jid)
+                // Normalize JID if it's a LID
+                let normalizedJid = jid
+                if (lidHandler) {
+                    normalizedJid = await lidHandler.normalizeJid(jid) || jid
+                }
+                
+                const validJid = validateJID(normalizedJid)
                 const validId = validateMessageId(id)
                 
                 // Check cache first
@@ -2326,7 +2350,30 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
             ev.on('messages.upsert', async ({ messages: newMessages, type }) => {
                 for (const msg of newMessages) {
-                    const jid = jidNormalizedUser(msg.key.remoteJid!)
+                    let jid = jidNormalizedUser(msg.key.remoteJid!)
+                    
+                    // Process LID if handler is available
+                    if (lidHandler) {
+                        const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
+                        
+                        // Use normalized JID (phone number) for storage
+                        jid = jidNormalizedUser(normalizedJid)
+                        
+                        // Store LID info in the message for reference
+                        if (lidInfo.lid || lidInfo.phoneNumber) {
+                            (msg as any).lidMapping = {
+                                lid: lidInfo.lid,
+                                phoneNumber: lidInfo.phoneNumber,
+                                originalJid: msg.key.remoteJid
+                            }
+                        }
+                        
+                        // Log LID mapping if discovered
+                        if (lidInfo.mappingStored) {
+                            log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                        }
+                    }
+                    
                     await store.upsertMessage(jid, msg)
                     
                     if (type === 'notify' && !(await store.getChat(jid))) {
@@ -2733,6 +2780,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 ttlMonitor = null
             }
             
+            // Clear LID handler cache if running
+            if (lidHandler) {
+                lidHandler.clearCache()
+                lidHandler = null
+            }
+            
             // Flush and clean up memory-aware processors
             if (labelAssociationProcessor) {
                 await labelAssociationProcessor.flush()
@@ -2831,7 +2884,8 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
                     `${conn.collectionPrefix}state`,
                     `${conn.collectionPrefix}presences`,
                     `${conn.collectionPrefix}labels`,
-                    `${conn.collectionPrefix}labelAssociations`
+                    `${conn.collectionPrefix}labelAssociations`,
+                    `${conn.collectionPrefix}lidMappings`
                 ]
 
                 for (const collName of collections) {

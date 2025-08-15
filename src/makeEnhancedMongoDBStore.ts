@@ -35,6 +35,7 @@ import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
+import { LidHandler } from './utils/lidHandler'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -481,7 +482,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         auth,
         memory,
         ttlMonitoring,
-        meId
+        meId,
+        lidHandler: lidHandlerConfig
     } = config
     
     // Validate instance ID
@@ -519,6 +521,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // TTL monitor will be initialized after DB connection
     let ttlMonitor: TTLMonitor | null = null
+    
+    // LID handler will be initialized after DB connection
+    let lidHandler: LidHandler | null = null
 
     // MongoDB connection
     const client: MongoClient = new MongoClient(uri, {
@@ -537,6 +542,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         ttlMonitor.startMonitoring((message) => {
             logWarn(`[TTL Monitor] ${message}`)
         })
+    }
+    
+    // Initialize LID handler after DB connection
+    if (lidHandlerConfig) {
+        lidHandler = new LidHandler(validatedInstanceId, lidHandlerConfig)
+        await lidHandler.initialize(db, collectionPrefix)
+        log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
     }
     
     // Get collections
@@ -2152,8 +2164,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
                 
                 for (const msg of messages) {
-                    const jid = msg.key.remoteJid
+                    let jid = msg.key.remoteJid
                     if (!jid) continue
+                    
+                    // Process LID if handler is available
+                    if (lidHandler) {
+                        const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
+                        
+                        // Use normalized JID (phone number) for storage
+                        jid = normalizedJid
+                        
+                        // Store LID info in the message for reference
+                        if (lidInfo.lid || lidInfo.phoneNumber) {
+                            (msg as any).lidMapping = {
+                                lid: lidInfo.lid,
+                                phoneNumber: lidInfo.phoneNumber,
+                                originalJid: msg.key.remoteJid
+                            }
+                        }
+                        
+                        // Log LID mapping if discovered
+                        if (lidInfo.mappingStored) {
+                            log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                        }
+                    }
                     
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {

@@ -1,0 +1,374 @@
+import { MongoClient, Db } from 'mongodb'
+import { MongoMemoryServer } from 'mongodb-memory-server'
+import { LidHandler } from '../lidHandler'
+import { proto } from 'baileys'
+
+describe('LidHandler', () => {
+    let mongoServer: MongoMemoryServer
+    let client: MongoClient
+    let db: Db
+    let lidHandler: LidHandler
+
+    beforeAll(async () => {
+        // Start in-memory MongoDB
+        mongoServer = await MongoMemoryServer.create()
+        const uri = mongoServer.getUri()
+        
+        // Connect to MongoDB
+        client = new MongoClient(uri)
+        await client.connect()
+        db = client.db('test')
+    })
+
+    afterAll(async () => {
+        await client.close()
+        await mongoServer.stop()
+    })
+
+    beforeEach(async () => {
+        // Clear any existing data first
+        await db.collection('test_lidMappings').deleteMany({})
+        
+        // Create new LID handler for each test
+        lidHandler = new LidHandler('test-instance', {
+            cacheTTL: 60,
+            enableCache: true
+        })
+        await lidHandler.initialize(db, 'test_')
+    })
+
+    describe('isLidFormat', () => {
+        it('should identify @lid format correctly', () => {
+            expect(lidHandler.isLidFormat('114194640801953@lid')).toBe(true)
+            expect(lidHandler.isLidFormat('60196953307@s.whatsapp.net')).toBe(false)
+            expect(lidHandler.isLidFormat(null)).toBe(false)
+            expect(lidHandler.isLidFormat(undefined)).toBe(false)
+            expect(lidHandler.isLidFormat('')).toBe(false)
+        })
+    })
+
+    describe('extractLidInfo', () => {
+        it('should extract LID and phone number from message with senderPn', () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    senderPn: '60196953307@s.whatsapp.net'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            expect(info.lid).toBe('114194640801953@lid')
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+        })
+
+        it('should extract phone number when remoteJid is not @lid', () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    fromMe: true
+                },
+                messageTimestamp: 1755232223
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            expect(info.lid).toBeUndefined()
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+        })
+
+        it('should extract senderLid when present', () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    senderLid: '114194640801953@lid'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            expect(info.lid).toBe('114194640801953@lid')
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+        })
+    })
+
+    describe('storeLidMapping', () => {
+        it('should store LID to phone number mapping', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // Check if mapping was stored in database
+            const mapping = await db.collection('test_lidMappings').findOne({
+                instanceId: 'test-instance',
+                lid
+            })
+
+            expect(mapping).toBeTruthy()
+            expect(mapping?.phoneNumber).toBe(phoneNumber)
+            expect(mapping?.firstSeen).toBeInstanceOf(Date)
+            expect(mapping?.lastSeen).toBeInstanceOf(Date)
+        })
+
+        it('should not store invalid mappings', async () => {
+            // Try to store non-LID format
+            await lidHandler.storeLidMapping('60196953307@s.whatsapp.net', '60196953307@s.whatsapp.net')
+
+            const count = await db.collection('test_lidMappings').countDocuments()
+            expect(count).toBe(0)
+        })
+
+        it('should update lastSeen on duplicate mapping', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Store first time
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+            
+            // Get original timestamp
+            const original = await db.collection('test_lidMappings').findOne({
+                instanceId: 'test-instance',
+                lid
+            })
+            const originalLastSeen = original?.lastSeen
+
+            // Wait a bit and store again
+            await new Promise(resolve => setTimeout(resolve, 10))
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // Check if lastSeen was updated
+            const updated = await db.collection('test_lidMappings').findOne({
+                instanceId: 'test-instance',
+                lid
+            })
+
+            expect(updated?.lastSeen.getTime()).toBeGreaterThan(originalLastSeen.getTime())
+            expect(updated?.firstSeen.getTime()).toBe(original?.firstSeen.getTime())
+        })
+    })
+
+    describe('getPhoneNumberFromLid', () => {
+        it('should retrieve phone number from LID', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Store mapping first
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // Retrieve it
+            const retrieved = await lidHandler.getPhoneNumberFromLid(lid)
+            expect(retrieved).toBe(phoneNumber)
+        })
+
+        it('should return null for unknown LID', async () => {
+            const retrieved = await lidHandler.getPhoneNumberFromLid('unknown@lid')
+            expect(retrieved).toBeNull()
+        })
+
+        it('should return input if not LID format', async () => {
+            const phoneNumber = '60196953307@s.whatsapp.net'
+            const retrieved = await lidHandler.getPhoneNumberFromLid(phoneNumber)
+            expect(retrieved).toBe(phoneNumber)
+        })
+
+        it('should use cache when available', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Store mapping
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // First retrieval (from DB)
+            const retrieved1 = await lidHandler.getPhoneNumberFromLid(lid)
+            expect(retrieved1).toBe(phoneNumber)
+
+            // Delete from DB to test cache
+            await db.collection('test_lidMappings').deleteMany({})
+
+            // Second retrieval should still work (from cache)
+            const retrieved2 = await lidHandler.getPhoneNumberFromLid(lid)
+            expect(retrieved2).toBe(phoneNumber)
+        })
+    })
+
+    describe('getLidFromPhoneNumber', () => {
+        it('should retrieve LID from phone number', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Store mapping first
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // Retrieve it
+            const retrieved = await lidHandler.getLidFromPhoneNumber(phoneNumber)
+            expect(retrieved).toBe(lid)
+        })
+
+        it('should return null for unknown phone number', async () => {
+            const retrieved = await lidHandler.getLidFromPhoneNumber('unknown@s.whatsapp.net')
+            expect(retrieved).toBeNull()
+        })
+    })
+
+    describe('normalizeJid', () => {
+        it('should normalize LID to phone number', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Store mapping
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // Normalize
+            const normalized = await lidHandler.normalizeJid(lid)
+            expect(normalized).toBe(phoneNumber)
+        })
+
+        it('should return original JID if no mapping found', async () => {
+            const lid = '999999999@lid' // Use a different LID that won't conflict
+            const normalized = await lidHandler.normalizeJid(lid)
+            expect(normalized).toBe(lid)
+        })
+
+        it('should return phone number as-is', async () => {
+            const phoneNumber = '60196953307@s.whatsapp.net'
+            const normalized = await lidHandler.normalizeJid(phoneNumber)
+            expect(normalized).toBe(phoneNumber)
+        })
+
+        it('should handle null/undefined', async () => {
+            expect(await lidHandler.normalizeJid(null)).toBeNull()
+            expect(await lidHandler.normalizeJid(undefined)).toBeNull()
+        })
+    })
+
+    describe('processMessage', () => {
+        it('should process message with LID and phone number', async () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    senderPn: '60196953307@s.whatsapp.net'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(message)
+            
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBe('114194640801953@lid')
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.mappingStored).toBe(true)
+
+            // Verify mapping was stored
+            const mapping = await db.collection('test_lidMappings').findOne({
+                instanceId: 'test-instance',
+                lid: '114194640801953@lid'
+            })
+            expect(mapping?.phoneNumber).toBe('60196953307@s.whatsapp.net')
+        })
+
+        it('should process message with only LID', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Pre-store mapping
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: lid
+                },
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(message)
+            
+            expect(result.normalizedJid).toBe(phoneNumber)
+            expect(result.lidInfo.lid).toBe(lid)
+            expect(result.lidInfo.phoneNumber).toBeUndefined()
+            expect(result.lidInfo.mappingStored).toBe(false)
+        })
+
+        it('should process message with only phone number', async () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net'
+                },
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(message)
+            
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBeUndefined()
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.mappingStored).toBe(false)
+        })
+    })
+
+    describe('clearCache', () => {
+        it('should clear cache for instance', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+
+            // Store mapping (will be cached)
+            await lidHandler.storeLidMapping(lid, phoneNumber)
+
+            // Clear cache
+            lidHandler.clearCache()
+
+            // Delete from DB
+            await db.collection('test_lidMappings').deleteMany({})
+
+            // Should not find in cache anymore
+            const retrieved = await lidHandler.getPhoneNumberFromLid(lid)
+            expect(retrieved).toBeNull()
+        })
+    })
+
+    describe('getAllMappings', () => {
+        it('should retrieve all mappings for instance', async () => {
+            // Store multiple mappings
+            await lidHandler.storeLidMapping('111@lid', '601111@s.whatsapp.net')
+            await lidHandler.storeLidMapping('222@lid', '602222@s.whatsapp.net')
+            await lidHandler.storeLidMapping('333@lid', '603333@s.whatsapp.net')
+
+            const mappings = await lidHandler.getAllMappings()
+            
+            expect(mappings).toHaveLength(3)
+            expect(mappings.map(m => m.lid).sort()).toEqual(['111@lid', '222@lid', '333@lid'])
+        })
+    })
+
+    describe('cleanupOldMappings', () => {
+        it('should delete old mappings', async () => {
+            const lid1 = '111@lid'
+            const lid2 = '222@lid'
+            
+            // Insert old mapping (90+ days old)
+            const oldDate = new Date()
+            oldDate.setDate(oldDate.getDate() - 100)
+            
+            await db.collection('test_lidMappings').insertOne({
+                instanceId: 'test-instance',
+                lid: lid1,
+                phoneNumber: '601111@s.whatsapp.net',
+                firstSeen: oldDate,
+                lastSeen: oldDate,
+                updatedAt: oldDate
+            })
+
+            // Insert recent mapping
+            await lidHandler.storeLidMapping(lid2, '602222@s.whatsapp.net')
+
+            // Cleanup old mappings
+            const deletedCount = await lidHandler.cleanupOldMappings(90)
+            
+            expect(deletedCount).toBe(1)
+
+            // Verify only recent mapping remains
+            const remaining = await lidHandler.getAllMappings()
+            expect(remaining).toHaveLength(1)
+            expect(remaining[0].lid).toBe(lid2)
+        })
+    })
+})
