@@ -8,7 +8,7 @@ import { createHash } from 'crypto'
 const WHATSAPP_JID_REGEX = /^[0-9]+(:[0-9]+)?@s\.whatsapp\.net$/ // Individual users (with optional :XX suffix)
 const GROUP_JID_REGEX = /^[0-9]+(-[0-9]+)?@g\.us$/ // Groups (with optional hyphen segment)
 const BROADCAST_JID_REGEX = /^[0-9]+@broadcast$/ // Broadcast lists
-const LID_JID_REGEX = /^[0-9]+@lid$/ // Linked devices
+const LID_JID_REGEX = /^[0-9]+(:[0-9]+)?@lid$/ // Linked devices (with optional :XX suffix)
 const CONTACT_JID_REGEX = /^[0-9]+@c\.us$/ // Contacts
 const STATUS_JID = 'status@broadcast' // Status updates
 
@@ -275,6 +275,42 @@ export const validateMongoQuery = (query: Record<string, unknown>): void => {
     }
     
     checkObject(query)
+}
+
+/**
+ * Safe validation wrapper for JIDs that logs warnings instead of throwing
+ * @param jid - The JID to validate
+ * @returns The JID (validated or not)
+ */
+export const safeValidateJID = (jid: string): string => {
+    const trimmedJid = jid?.trim()
+    if (!isValidJID(trimmedJid)) {
+        console.warn(`Invalid JID format (processing anyway): ${trimmedJid?.substring(0, 30)}`)
+    }
+    return trimmedJid || ''
+}
+
+/**
+ * Safe validation wrapper for message IDs that logs warnings instead of throwing
+ * @param id - The message ID to validate
+ * @param isOfficialAPI - Whether this is an Official API message
+ * @returns The message ID (validated or not)
+ */
+export const safeValidateMessageId = (id: string, _isOfficialAPI: boolean = false): string => {
+    // Handle undefined/null/empty IDs gracefully
+    if (!id || id === 'undefined' || id === 'null') {
+        console.warn('Empty or invalid message ID encountered (processing with placeholder)')
+        return 'PLACEHOLDER_' + Date.now()
+    }
+    
+    const trimmedId = id.toString().trim()
+    
+    // Basic validation - just warn if suspicious
+    if (trimmedId.length < 3 || trimmedId.includes('$') || trimmedId.includes('{') || trimmedId.includes('}')) {
+        console.warn(`Suspicious message ID format (processing anyway): ${trimmedId?.substring(0, 30)}`)
+    }
+    
+    return trimmedId
 }
 
 /**

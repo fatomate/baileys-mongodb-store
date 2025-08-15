@@ -22,8 +22,9 @@ import NodeCache from 'node-cache'
 import { Queue, Worker, Job } from 'bullmq'
 import Redis from 'ioredis'
 import { 
-    validateJID, 
-    validateMessageId, 
+    validateJID,
+    safeValidateJID,
+    safeValidateMessageId, 
     validateInstanceId,
     ValidationError,
     AuthorizationError,
@@ -1437,8 +1438,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
             try {
-                const validJid = validateJID(jid)
-                const validId = validateMessageId(id)
+                const validJid = safeValidateJID(jid)
+                const validId = safeValidateMessageId(id)
                 
                 log(`getMessage called with ${jid} and ${id}`)
                 log(`getMessage validJid ${validJid}`)
@@ -1533,14 +1534,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         async upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void> {
             try {
-                const validJid = validateJID(jid)
+                const validJid = safeValidateJID(jid)
                 
                 // Check if this is an Official API message
                 const isOfficialAPI = (message as any).official_api === true
                 
                 // Validate message ID if present (with special handling for Official API)
                 if (message.key?.id) {
-                    validateMessageId(message.key.id, isOfficialAPI)
+                    safeValidateMessageId(message.key.id, isOfficialAPI)
                 }
                 
                 // Check write permissions
@@ -1765,18 +1766,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         async deleteMessages(jid: string, ids?: string[]): Promise<void> {
             try {
-                const validJid = validateJID(jid)
+                const validJid = safeValidateJID(jid)
                 
-                // For deletion, we can't easily determine if these are Official API IDs,
-                // so we'll be more lenient with validation
-                const validIds = ids?.map(id => {
-                    try {
-                        return validateMessageId(id, false)
-                    } catch {
-                        // If regular validation fails, try as Official API ID
-                        return validateMessageId(id, true)
-                    }
-                })
+                // For deletion, use safe validation for message IDs
+                const validIds = ids?.map(id => safeValidateMessageId(id, false))
                 
                 // Check delete permissions
                 accessContext.validateAccess(validatedInstanceId, 'delete')
