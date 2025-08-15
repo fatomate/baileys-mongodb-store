@@ -246,6 +246,12 @@ export interface EnhancedMongoDBStoreConfig {
     ttlMonitoring?: Omit<TTLConfig, 'days'>
     
     /**
+     * Bot's WhatsApp JID for poll vote decryption
+     * Required for decrypting poll votes where the bot is the poll creator
+     */
+    meId?: string
+    
+    /**
      * Enable performance monitoring
      * Tracks metrics for each event type
      */

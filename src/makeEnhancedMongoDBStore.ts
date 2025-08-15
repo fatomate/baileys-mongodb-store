@@ -1,5 +1,5 @@
 import { MongoClient, Collection } from 'mongodb'
-import { proto } from 'baileys'
+import { proto, getAggregateVotesInPollMessage } from 'baileys'
 import type { 
     BaileysEventEmitter, 
     Chat, 
@@ -177,6 +177,237 @@ const convertBinaryToBuffer = (obj: any): any => {
     }
 }
 
+// Helper function to resolve quoted messages
+const resolveQuotedMessage = async (
+    message: proto.IWebMessageInfo,
+    jid: string,
+    collections: MongoCollections,
+    instanceId: string,
+    log: (...args: any[]) => void
+): Promise<proto.IWebMessageInfo | null> => {
+    try {
+        const extendedText = message.message?.extendedTextMessage
+        if (!extendedText?.contextInfo?.stanzaId) {
+            return null
+        }
+        
+        const stanzaId = extendedText.contextInfo.stanzaId
+        const participant = extendedText.contextInfo.participant || jid
+        
+        log(`🔍 Resolving quoted message with stanzaId: ${stanzaId} from participant: ${participant}`)
+        
+        // Fetch the quoted message from the database
+        const quotedMsg = await collections.messages.findOne({
+            instanceId,
+            'key.id': stanzaId,
+            $or: [
+                { jid: participant },
+                { 'key.remoteJid': participant },
+                { jid: jid },
+                { 'key.remoteJid': jid }
+            ]
+        }) as any
+        
+        if (!quotedMsg) {
+            log(`⚠️ Quoted message not found for stanzaId: ${stanzaId}`)
+            return null
+        }
+        
+        // Extract the relevant message content
+        const quotedMessage: any = {}
+        
+        // Handle different message types
+        if (quotedMsg.message?.conversation) {
+            quotedMessage.conversation = quotedMsg.message.conversation
+        } else if (quotedMsg.message?.extendedTextMessage?.text) {
+            quotedMessage.conversation = quotedMsg.message.extendedTextMessage.text
+        } else if (quotedMsg.message?.imageMessage) {
+            quotedMessage.imageMessage = {
+                ...quotedMsg.message.imageMessage,
+                // Include mediaUrl if it was downloaded
+                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+            }
+        } else if (quotedMsg.message?.videoMessage) {
+            quotedMessage.videoMessage = {
+                ...quotedMsg.message.videoMessage,
+                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+            }
+        } else if (quotedMsg.message?.audioMessage) {
+            quotedMessage.audioMessage = {
+                ...quotedMsg.message.audioMessage,
+                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+            }
+        } else if (quotedMsg.message?.documentMessage) {
+            quotedMessage.documentMessage = {
+                ...quotedMsg.message.documentMessage,
+                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+            }
+        } else if (quotedMsg.message?.documentWithCaptionMessage) {
+            quotedMessage.documentWithCaptionMessage = quotedMsg.message.documentWithCaptionMessage
+        } else if (quotedMsg.message?.stickerMessage) {
+            quotedMessage.stickerMessage = {
+                ...quotedMsg.message.stickerMessage,
+                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+            }
+        } else {
+            // For any other message type, copy the entire message object
+            Object.assign(quotedMessage, quotedMsg.message)
+        }
+        
+        // Add messageContextInfo if present
+        if (!quotedMessage.messageContextInfo) {
+            quotedMessage.messageContextInfo = {}
+        }
+        
+        log(`✅ Resolved quoted message type: ${Object.keys(quotedMessage)[0]}`)
+        
+        // Return the quoted message in the expected format
+        return {
+            key: quotedMsg.key,
+            message: quotedMessage,
+            messageTimestamp: quotedMsg.messageTimestamp
+        } as proto.IWebMessageInfo
+    } catch (error) {
+        log(`❌ Error resolving quoted message: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        return null
+    }
+}
+
+// Helper function to decrypt poll votes
+const decryptPollVote = async (
+    message: proto.IWebMessageInfo,
+    collections: MongoCollections,
+    instanceId: string,
+    meId: string | undefined,
+    log: (...args: any[]) => void
+): Promise<any> => {
+    try {
+        // Check if this is a poll vote message
+        if (!message.message?.pollUpdateMessage) {
+            return null
+        }
+        
+        const pollUpdate = message.message.pollUpdateMessage
+        const pollKey = pollUpdate.pollCreationMessageKey
+        
+        if (!pollKey?.remoteJid || !pollKey?.id) {
+            log(`⚠️ Poll vote message missing poll creation key`)
+            return null
+        }
+        
+        log(`🗳️ Decrypting poll vote for poll message: ${pollKey.id}`)
+        
+        // Fetch the original poll creation message
+        const originalPoll = await collections.messages.findOne({
+            instanceId,
+            'key.id': pollKey.id,
+            $or: [
+                { jid: pollKey.remoteJid },
+                { 'key.remoteJid': pollKey.remoteJid }
+            ]
+        }) as any
+        
+        if (!originalPoll) {
+            log(`⚠️ Original poll message not found for ID: ${pollKey.id}`)
+            return null
+        }
+        
+        // Check if poll creation message exists
+        if (!originalPoll.message?.pollCreationMessage && 
+            !originalPoll.message?.pollCreationMessageV2 && 
+            !originalPoll.message?.pollCreationMessageV3) {
+            log(`⚠️ Missing poll creation message (v1/v2/v3) for poll: ${pollKey.id}`)
+            return null
+        }
+        
+        // Get the poll encryption key from the original message
+        let pollEncKey: any = originalPoll.message?.messageContextInfo?.messageSecret
+        
+        if (!pollEncKey) {
+            log(`⚠️ No encryption key found for poll: ${pollKey.id}`)
+            return null
+        }
+        
+        // Convert MongoDB Binary object to Buffer if needed
+        if (pollEncKey) {
+            if (pollEncKey.buffer && pollEncKey._bsontype === 'Binary') {
+                // MongoDB Binary object - extract the actual buffer
+                pollEncKey = Buffer.from(pollEncKey.buffer)
+            } else if (pollEncKey.type === 'Buffer' && Array.isArray(pollEncKey.data)) {
+                // JSON-serialized Buffer format (most common from MongoDB)
+                const tempBuffer = Buffer.from(pollEncKey.data)
+                // Check if this is actually a base64 string stored as bytes
+                const asString = tempBuffer.toString('ascii')
+                if (asString.match(/^[A-Za-z0-9+/]+=*$/)) {
+                    // It's a base64 string, decode it
+                    pollEncKey = Buffer.from(asString, 'base64')
+                } else {
+                    // It's raw binary data
+                    pollEncKey = tempBuffer
+                }
+            } else if (pollEncKey.data && Array.isArray(pollEncKey.data)) {
+                // Sometimes stored as an array of bytes
+                pollEncKey = Buffer.from(pollEncKey.data)
+            } else if (typeof pollEncKey === 'string') {
+                // If stored as base64 string
+                pollEncKey = Buffer.from(pollEncKey, 'base64')
+            } else if (Buffer.isBuffer(pollEncKey)) {
+                // Already a Buffer, use as is
+            } else {
+                log(`⚠️ Unknown encryption key format for poll: ${pollKey.id}`)
+                return null
+            }
+        }
+        
+        // Determine the poll creator JID
+        const pollCreatorJid = originalPoll.key?.participant || 
+                               (originalPoll.key?.fromMe ? originalPoll.key?.remoteJid : pollKey.participant) || 
+                               originalPoll.key?.remoteJid
+        
+        // Decrypt the poll vote using Baileys function
+        const decryptedVotes = getAggregateVotesInPollMessage({
+            message: message.message,
+            pollEncKey,
+            meId: meId || undefined
+        } as any)
+        
+        // Get poll options for reference
+        const pollMessage = originalPoll.message?.pollCreationMessage || 
+                          originalPoll.message?.pollCreationMessageV2 || 
+                          originalPoll.message?.pollCreationMessageV3
+        const pollOptions = pollMessage?.options || []
+        
+        // Map selected option names
+        const selectedOptions = decryptedVotes.map((vote: any) => {
+            const optionName = vote.name || vote
+            const option = pollOptions.find((opt: any) => opt.optionName === optionName)
+            return {
+                name: optionName,
+                // Include option index if found
+                index: option ? pollOptions.indexOf(option) : -1
+            }
+        })
+        
+        log(`✅ Decrypted poll vote: ${selectedOptions.map((o: any) => o.name).join(', ')}`)
+        
+        // Extract vote names from decrypted votes
+        const voteNames = decryptedVotes.map((vote: any) => vote.name || vote)
+        
+        return {
+            pollMessageId: pollKey.id,
+            pollCreatorJid,
+            votes: voteNames, // Array of selected option names
+            votesDetailed: selectedOptions, // Array with option names and indices
+            voterJid: message.key?.participant || message.key?.remoteJid,
+            timestamp: message.messageTimestamp,
+            pollQuestion: pollMessage?.name || 'Unknown Poll'
+        }
+    } catch (error) {
+        log(`❌ Error decrypting poll vote: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        return null
+    }
+}
+
 export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfig): Promise<EnhancedMongoDBStore> => {
     const {
         uri,
@@ -193,7 +424,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         hooks = {},
         auth,
         memory,
-        ttlMonitoring
+        ttlMonitoring,
+        meId
     } = config
     
     // Validate instance ID
@@ -388,6 +620,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const { type, jid, message, messageId, update, deleteIds } = job.data
                 
                 if (type === 'upsert' && message) {
+                    // Resolve quoted message if present
+                    if (message.message?.extendedTextMessage?.contextInfo?.stanzaId && 
+                        (!message.message.extendedTextMessage.contextInfo.quotedMessage || 
+                         Object.keys(message.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
+                        
+                        const quotedMsg = await resolveQuotedMessage(message, jid, collections, instanceId, log)
+                        if (quotedMsg && quotedMsg.message) {
+                            // Update the message with the resolved quoted content
+                            message.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
+                            log(`✅ [Bull Queue] Updated message with resolved quoted content for ${message.key?.id}`)
+                        }
+                    }
+                    
+                    // Decrypt poll vote if present
+                    let pollVoteDecrypted = null
+                    if (message.message?.pollUpdateMessage) {
+                        pollVoteDecrypted = await decryptPollVote(message, collections, instanceId, meId, log)
+                        if (pollVoteDecrypted) {
+                            log(`✅ [Bull Queue] Decrypted poll vote for ${message.key?.id}`)
+                        }
+                    }
+                    
                     await collections.messages.replaceOne(
                         {
                             instanceId,
@@ -398,6 +652,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             ...message,
                             instanceId,
                             jid,
+                            ...(pollVoteDecrypted && { pollVoteDecrypted }),
                             updatedAt: new Date()
                         },
                         { upsert: true }
@@ -1213,6 +1468,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
+            // Resolve quoted message if present
+            if (message.message?.extendedTextMessage?.contextInfo?.stanzaId && 
+                (!message.message.extendedTextMessage.contextInfo.quotedMessage || 
+                 Object.keys(message.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
+                
+                const quotedMsg = await resolveQuotedMessage(message, validJid, collections, validatedInstanceId, log)
+                if (quotedMsg && quotedMsg.message) {
+                    // Update the message with the resolved quoted content
+                    message.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
+                    log(`✅ Updated message with resolved quoted content for ${message.key?.id}`)
+                }
+            }
+            
+            // Decrypt poll vote if present
+            let pollVoteDecrypted = null
+            if (message.message?.pollUpdateMessage) {
+                pollVoteDecrypted = await decryptPollVote(message, collections, validatedInstanceId, meId, log)
+                if (pollVoteDecrypted) {
+                    log(`✅ Decrypted poll vote for ${message.key?.id}`)
+                }
+            }
+            
             // Fallback to direct database operation
             await collections.messages.replaceOne(
                 {
@@ -1224,6 +1501,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     ...message,
                     instanceId: validatedInstanceId,
                     jid: validJid,
+                    ...(pollVoteDecrypted && { pollVoteDecrypted }),
                     updatedAt: new Date()
                 },
                 { upsert: true }
@@ -1752,6 +2030,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {
+                            // Resolve quoted message before storing if present
+                            if (msg.message?.extendedTextMessage?.contextInfo?.stanzaId && 
+                                (!msg.message.extendedTextMessage.contextInfo.quotedMessage || 
+                                 Object.keys(msg.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
+                                
+                                const quotedMsg = await resolveQuotedMessage(msg, jid, collections, instanceId, log)
+                                if (quotedMsg && quotedMsg.message) {
+                                    // Update the message with the resolved quoted content
+                                    msg.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
+                                    log(`✅ [Event Handler] Updated message with resolved quoted content for ${msg.key?.id}`)
+                                }
+                            }
+                            
+                            // Decrypt poll vote before storing if present
+                            if (msg.message?.pollUpdateMessage) {
+                                const pollVoteDecrypted = await decryptPollVote(msg, collections, instanceId, meId, log)
+                                if (pollVoteDecrypted) {
+                                    // Add decrypted poll vote data to the message
+                                    (msg as any).pollVoteDecrypted = pollVoteDecrypted
+                                    log(`✅ [Event Handler] Decrypted poll vote for ${msg.key?.id}`)
+                                }
+                            }
+                            
                             // Store the message first
                             await storeImpl.upsertMessage(jid, msg)
                             
