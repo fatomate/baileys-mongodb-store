@@ -90,27 +90,55 @@ export class LidHandler {
     extractLidInfo(message: proto.IWebMessageInfo): {
         lid?: string
         phoneNumber?: string
+        debug?: string[]
     } {
-        const result: { lid?: string; phoneNumber?: string } = {}
+        const result: { lid?: string; phoneNumber?: string; debug?: string[] } = {}
+        const debug: string[] = []
         
         // Check remoteJid for @lid
         if (this.isLidFormat(message.key?.remoteJid)) {
             result.lid = message.key!.remoteJid!
+            debug.push(`Found LID in remoteJid: ${result.lid}`)
         }
         
         // Check senderLid (some messages have this)
         if (this.isLidFormat((message.key as any)?.senderLid)) {
             result.lid = (message.key as any).senderLid
+            debug.push(`Found LID in senderLid: ${result.lid}`)
         }
         
         // Extract phone number from senderPn
         if ((message.key as any)?.senderPn && !this.isLidFormat((message.key as any).senderPn)) {
             result.phoneNumber = (message.key as any).senderPn
+            debug.push(`Found phone in senderPn: ${result.phoneNumber}`)
+        } else if ((message.key as any)?.senderPn) {
+            debug.push(`senderPn is LID format: ${(message.key as any).senderPn}`)
         }
         
         // If remoteJid is not @lid, it might be the phone number
         if (message.key?.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
             result.phoneNumber = message.key.remoteJid
+            debug.push(`Found phone in remoteJid: ${result.phoneNumber}`)
+        }
+        
+        // Check other potential fields for phone numbers
+        const potentialPhoneFields = [
+            (message.key as any)?.participant,
+            (message as any)?.participant,
+            (message as any)?.senderKeyDistributionMessage?.groupId
+        ]
+        
+        for (const field of potentialPhoneFields) {
+            if (field && !this.isLidFormat(field) && field.includes('@s.whatsapp.net')) {
+                if (!result.phoneNumber) {
+                    result.phoneNumber = field
+                    debug.push(`Found phone in alternative field: ${field}`)
+                }
+            }
+        }
+        
+        if (process.env.NODE_ENV !== 'production' || debug.length > 0) {
+            result.debug = debug
         }
         
         return result
@@ -275,24 +303,34 @@ export class LidHandler {
             lid?: string
             phoneNumber?: string
             mappingStored?: boolean
+            debug?: string[]
         }
     }> {
         const lidInfo = this.extractLidInfo(message)
         let normalizedJid = message.key?.remoteJid || ''
         let mappingStored = false
         
+        console.log(`[LidHandler] Processing message ${message.key?.id}: ${JSON.stringify(lidInfo)}`)
+        
         // If we have both LID and phone number, store the mapping
         if (lidInfo.lid && lidInfo.phoneNumber) {
+            console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
             await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber)
             mappingStored = true
             normalizedJid = lidInfo.phoneNumber
         } 
         // If we only have LID, try to get phone number from database
         else if (lidInfo.lid) {
+            console.log(`[LidHandler] Looking up existing mapping for LID: ${lidInfo.lid}`)
             const phoneNumber = await this.getPhoneNumberFromLid(lidInfo.lid)
             if (phoneNumber) {
+                console.log(`[LidHandler] Found existing mapping: ${lidInfo.lid} -> ${phoneNumber}`)
                 normalizedJid = phoneNumber
+            } else {
+                console.log(`[LidHandler] No existing mapping found for LID: ${lidInfo.lid}`)
             }
+        } else {
+            console.log(`[LidHandler] No LID found in message, using original JID: ${normalizedJid}`)
         }
         
         return {
