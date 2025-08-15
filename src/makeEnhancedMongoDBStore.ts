@@ -227,21 +227,36 @@ const resolveQuotedMessage = async (
                 url: quotedMsg.mediaUrl || quotedMsg.message.imageMessage.url,
                 caption: quotedMsg.message.imageMessage.caption,
                 mimetype: quotedMsg.message.imageMessage.mimetype,
-                jpegThumbnail: quotedMsg.message.imageMessage.jpegThumbnail
+                jpegThumbnail: quotedMsg.message.imageMessage.jpegThumbnail,
+                // Keep media key fields for download capability
+                mediaKey: quotedMsg.message.imageMessage.mediaKey,
+                fileEncSha256: quotedMsg.message.imageMessage.fileEncSha256,
+                directPath: quotedMsg.message.imageMessage.directPath,
+                fileSha256: quotedMsg.message.imageMessage.fileSha256
             }
         } else if (quotedMsg.message?.videoMessage) {
             quotedMessage.videoMessage = {
                 url: quotedMsg.mediaUrl || quotedMsg.message.videoMessage.url,
                 caption: quotedMsg.message.videoMessage.caption,
                 mimetype: quotedMsg.message.videoMessage.mimetype,
-                jpegThumbnail: quotedMsg.message.videoMessage.jpegThumbnail
+                jpegThumbnail: quotedMsg.message.videoMessage.jpegThumbnail,
+                // Keep media key fields for download capability
+                mediaKey: quotedMsg.message.videoMessage.mediaKey,
+                fileEncSha256: quotedMsg.message.videoMessage.fileEncSha256,
+                directPath: quotedMsg.message.videoMessage.directPath,
+                fileSha256: quotedMsg.message.videoMessage.fileSha256
             }
         } else if (quotedMsg.message?.audioMessage) {
             quotedMessage.audioMessage = {
                 url: quotedMsg.mediaUrl || quotedMsg.message.audioMessage.url,
                 mimetype: quotedMsg.message.audioMessage.mimetype,
                 ptt: quotedMsg.message.audioMessage.ptt, // voice note flag
-                seconds: quotedMsg.message.audioMessage.seconds // duration
+                seconds: quotedMsg.message.audioMessage.seconds, // duration
+                // Keep media key fields for download capability
+                mediaKey: quotedMsg.message.audioMessage.mediaKey,
+                fileEncSha256: quotedMsg.message.audioMessage.fileEncSha256,
+                directPath: quotedMsg.message.audioMessage.directPath,
+                fileSha256: quotedMsg.message.audioMessage.fileSha256
             }
         } else if (quotedMsg.message?.documentMessage) {
             quotedMessage.documentMessage = {
@@ -249,7 +264,12 @@ const resolveQuotedMessage = async (
                 title: quotedMsg.message.documentMessage.title,
                 fileName: quotedMsg.message.documentMessage.fileName,
                 mimetype: quotedMsg.message.documentMessage.mimetype,
-                jpegThumbnail: quotedMsg.message.documentMessage.jpegThumbnail
+                jpegThumbnail: quotedMsg.message.documentMessage.jpegThumbnail,
+                // Keep media key fields for download capability
+                mediaKey: quotedMsg.message.documentMessage.mediaKey,
+                fileEncSha256: quotedMsg.message.documentMessage.fileEncSha256,
+                directPath: quotedMsg.message.documentMessage.directPath,
+                fileSha256: quotedMsg.message.documentMessage.fileSha256
             }
         } else if (quotedMsg.message?.documentWithCaptionMessage) {
             // Handle document with caption
@@ -262,7 +282,12 @@ const resolveQuotedMessage = async (
                             title: docMsg.title,
                             fileName: docMsg.fileName,
                             mimetype: docMsg.mimetype,
-                            jpegThumbnail: docMsg.jpegThumbnail
+                            jpegThumbnail: docMsg.jpegThumbnail,
+                            // Keep media key fields for download capability
+                            mediaKey: docMsg.mediaKey,
+                            fileEncSha256: docMsg.fileEncSha256,
+                            directPath: docMsg.directPath,
+                            fileSha256: docMsg.fileSha256
                         }
                     },
                     caption: quotedMsg.message.documentWithCaptionMessage.caption
@@ -272,7 +297,12 @@ const resolveQuotedMessage = async (
             quotedMessage.stickerMessage = {
                 url: quotedMsg.mediaUrl || quotedMsg.message.stickerMessage.url,
                 mimetype: quotedMsg.message.stickerMessage.mimetype,
-                isAnimated: quotedMsg.message.stickerMessage.isAnimated
+                isAnimated: quotedMsg.message.stickerMessage.isAnimated,
+                // Keep media key fields for download capability
+                mediaKey: quotedMsg.message.stickerMessage.mediaKey,
+                fileEncSha256: quotedMsg.message.stickerMessage.fileEncSha256,
+                directPath: quotedMsg.message.stickerMessage.directPath,
+                fileSha256: quotedMsg.message.stickerMessage.fileSha256
             }
         } else {
             // For any other message type, copy the entire message object
