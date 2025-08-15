@@ -686,9 +686,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Create queues for different event types
             createQueueAndWorker<MessageJob>(QueueType.MESSAGES, async (job) => {
-                const { type, jid, message, messageId, update, deleteIds } = job.data
+                const { type, message, messageId, update, deleteIds } = job.data
+                let { jid } = job.data
                 
                 if (type === 'upsert' && message) {
+                    // Process LID if handler is available to normalize JIDs
+                    if (lidHandler && message.key?.remoteJid) {
+                        const { normalizedJid, lidInfo } = await lidHandler.processMessage(message)
+                        
+                        // Store original JID for reference before updating
+                        const originalRemoteJid = message.key.remoteJid
+                        
+                        // Update both jid and remoteJid to use normalized phone number
+                        if (normalizedJid !== jid) {
+                            jid = normalizedJid
+                        }
+                        
+                        if (normalizedJid !== message.key.remoteJid) {
+                            message.key.remoteJid = normalizedJid
+                            log(`[Bull Queue LID Handler] Updated remoteJid from ${originalRemoteJid} to ${normalizedJid}`)
+                        }
+                        
+                        // Store LID info in the message for reference
+                        if (lidInfo.lid || lidInfo.phoneNumber) {
+                            (message as any).lidMapping = {
+                                lid: lidInfo.lid,
+                                phoneNumber: lidInfo.phoneNumber,
+                                originalJid: originalRemoteJid
+                            }
+                        }
+                    }
+                    
                     // Resolve quoted message if present
                     if (message.message?.extendedTextMessage?.contextInfo?.stanzaId && 
                         (!message.message.extendedTextMessage.contextInfo.quotedMessage || 
@@ -2190,15 +2218,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (lidHandler) {
                         const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
                         
+                        // Store original JID for reference before updating
+                        const originalRemoteJid = msg.key.remoteJid
+                        
                         // Use normalized JID (phone number) for storage
                         jid = normalizedJid
+                        
+                        // Update the message's remoteJid to use the normalized phone number
+                        if (normalizedJid !== msg.key.remoteJid) {
+                            msg.key.remoteJid = normalizedJid
+                            log(`[LID Handler] Updated remoteJid from ${originalRemoteJid} to ${normalizedJid}`)
+                        }
                         
                         // Store LID info in the message for reference
                         if (lidInfo.lid || lidInfo.phoneNumber) {
                             (msg as any).lidMapping = {
                                 lid: lidInfo.lid,
                                 phoneNumber: lidInfo.phoneNumber,
-                                originalJid: msg.key.remoteJid
+                                originalJid: originalRemoteJid
                             }
                         }
                         

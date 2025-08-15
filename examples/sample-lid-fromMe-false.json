@@ -1,0 +1,166 @@
+// First message from user to bot (only lid, no senderPn)
+
+{
+  "_id": {
+    "$oid": "689f343e1dd7dd80a51e4fcf"
+  },
+  "key": {
+    "remoteJid": "114194640801953@lid",
+    "fromMe": false,
+    "id": "3EB07CF79571C6587615EB",
+    "senderLid": "114194640801953@lid"
+  },
+  "messageTimestamp": 1755264062,
+  "pushName": "Firdaus Azizi",
+  "broadcast": false,
+  "message": {
+    "extendedTextMessage": {
+      "text": "test 1",
+      "contextInfo": {
+        "conversionSource": "unknown",
+        "ephemeralSettingTimestamp": "1755251004",
+        "disappearingMode": {
+          "initiator": "CHANGED_IN_CHAT",
+          "trigger": "CHAT_SETTING",
+          "initiatedByMe": false
+        }
+      },
+      "inviteLinkGroupTypeV2": "DEFAULT"
+    },
+    "messageContextInfo": {
+      "deviceListMetadata": {
+        "senderKeyHash": "BwLNiWKR7dSasw==",
+        "senderTimestamp": "1755152609",
+        "senderAccountType": "E2EE",
+        "receiverAccountType": "E2EE",
+        "recipientKeyHash": "WiQUfaXY1asCbA==",
+        "recipientTimestamp": "1755239202"
+      },
+      "deviceListMetadataVersion": 2,
+      "messageSecret": "bzno+EoideutcjCwxMF+fwW0XWwdQNTuxNkt7j2fgsM=",
+      "limitSharingV2": {
+        "sharingLimited": false,
+        "trigger": "UNKNOWN",
+        "limitSharingSettingTimestamp": "0",
+        "initiatedByMe": false
+      }
+    }
+  },
+  "instanceId": "6860DCA0E2819",
+  "jid": "60196953307@s.whatsapp.net",
+  "updatedAt": {
+    "$date": "2025-08-15T13:21:02.854Z"
+  }
+}
+
+// Second message from bot to user, (lid with senderPn)
+
+{
+  "_id": {
+    "$oid": "689f35401dd7dd80a51e4fd5"
+  },
+  "key": {
+    "remoteJid": "114194640801953@lid",
+    "fromMe": false,
+    "id": "3EB06E7C17F9DB9E2C71B6",
+    "senderLid": "114194640801953@lid",
+    "senderPn": "60196953307@s.whatsapp.net"
+  },
+  "messageTimestamp": 1755264320,
+  "pushName": "Firdaus Azizi",
+  "broadcast": false,
+  "message": {
+    "extendedTextMessage": {
+      "text": "test 2",
+      "contextInfo": {
+        "conversionSource": "unknown",
+        "ephemeralSettingTimestamp": "1755251004",
+        "disappearingMode": {
+          "initiator": "CHANGED_IN_CHAT",
+          "trigger": "CHAT_SETTING",
+          "initiatedByMe": false
+        }
+      },
+      "inviteLinkGroupTypeV2": "DEFAULT"
+    },
+    "messageContextInfo": {
+      "deviceListMetadata": {
+        "senderKeyHash": "BwLNiWKR7dSasw==",
+        "senderTimestamp": "1755152609",
+        "senderAccountType": "E2EE",
+        "receiverAccountType": "E2EE",
+        "recipientKeyHash": "WiQUfaXY1asCbA==",
+        "recipientTimestamp": "1755239202"
+      },
+      "deviceListMetadataVersion": 2,
+      "messageSecret": "bLOJK1SZQcS7UmFcxzAThaDxoX1RdT5m9cuV7cVxfVk=",
+      "limitSharingV2": {
+        "sharingLimited": false,
+        "trigger": "UNKNOWN",
+        "limitSharingSettingTimestamp": "0",
+        "initiatedByMe": false
+      }
+    }
+  },
+  "instanceId": "6860DCA0E2819",
+  "jid": "60196953307@s.whatsapp.net",
+  "updatedAt": {
+    "$date": "2025-08-15T13:25:20.768Z"
+  }
+}
+
+// Third message from user to bot (no lid, actual phone number)
+
+{
+  "_id": {
+    "$oid": "689f35a21dd7dd80a51e4fd6"
+  },
+  "key": {
+    "remoteJid": "60196953307@s.whatsapp.net",
+    "fromMe": false,
+    "id": "3EB0A4AD570AAFEDD6C118",
+    "senderLid": "114194640801953@lid",
+    "senderPn": "60196953307@s.whatsapp.net"
+  },
+  "messageTimestamp": 1755264418,
+  "pushName": "Firdaus Azizi",
+  "broadcast": false,
+  "message": {
+    "extendedTextMessage": {
+      "text": "test 3",
+      "contextInfo": {
+        "conversionSource": "unknown",
+        "ephemeralSettingTimestamp": "1755251004",
+        "disappearingMode": {
+          "initiator": "CHANGED_IN_CHAT",
+          "trigger": "CHAT_SETTING",
+          "initiatedByMe": false
+        }
+      },
+      "inviteLinkGroupTypeV2": "DEFAULT"
+    },
+    "messageContextInfo": {
+      "deviceListMetadata": {
+        "senderKeyHash": "BwLNiWKR7dSasw==",
+        "senderTimestamp": "1755152609",
+        "senderAccountType": "E2EE",
+        "receiverAccountType": "E2EE",
+        "recipientKeyHash": "WiQUfaXY1asCbA==",
+        "recipientTimestamp": "1755239202"
+      },
+      "deviceListMetadataVersion": 2,
+      "messageSecret": "gME5bOaT6Mf4f1Y+ojIwXldCKJHhja6o7TwTADCcUEc=",
+      "limitSharingV2": {
+        "sharingLimited": false,
+        "trigger": "UNKNOWN",
+        "limitSharingSettingTimestamp": "0",
+        "initiatedByMe": false
+      }
+    }
+  },
+  "instanceId": "6860DCA0E2819",
+  "jid": "60196953307@s.whatsapp.net",
+  "updatedAt": {
+    "$date": "2025-08-15T13:26:58.832Z"
+  }
+}

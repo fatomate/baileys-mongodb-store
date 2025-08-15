@@ -1,0 +1,114 @@
+// Previous message from user to bot
+
+{
+    "_id": {
+      "$oid": "689f21551dd7dd80a51e4f3a"
+    },
+    "key": {
+      "remoteJid": "60196953307@s.whatsapp.net",
+      "fromMe": false,
+      "id": "3EB058E32E1C7ACCBD0BB7",
+      "senderLid": "114194640801953@lid",
+      "senderPn": "60196953307@s.whatsapp.net"
+    },
+    "messageTimestamp": 1755259220,
+    "pushName": "Firdaus Azizi",
+    "broadcast": false,
+    "message": {
+      "extendedTextMessage": {
+        "text": "hello",
+        "contextInfo": {
+          "conversionSource": "unknown",
+          "ephemeralSettingTimestamp": "1755249841",
+          "disappearingMode": {
+            "initiator": "CHANGED_IN_CHAT",
+            "trigger": "CHAT_SETTING",
+            "initiatedByMe": false
+          }
+        },
+        "inviteLinkGroupTypeV2": "DEFAULT"
+      },
+      "messageContextInfo": {
+        "deviceListMetadata": {
+          "senderKeyHash": "BwLNiWKR7dSasw==",
+          "senderTimestamp": "1755152609",
+          "senderAccountType": "E2EE",
+          "receiverAccountType": "E2EE",
+          "recipientKeyHash": "WiQUfaXY1asCbA==",
+          "recipientTimestamp": "1755152344"
+        },
+        "deviceListMetadataVersion": 2,
+        "messageSecret": "84cFpfzbMzymWQpYKgb/DVpy4noxaWTbaMoIMDxS4TY="
+      }
+    },
+    "instanceId": "6860DCA0E2819",
+    "jid": "60196953307@s.whatsapp.net",
+    "updatedAt": {
+      "$date": "2025-08-15T12:00:21.056Z"
+    }
+  }
+
+  // Message from bot to user, sent from WhatsApp Web
+
+  {
+    "_id": {
+      "$oid": "689f216a1dd7dd80a51e4f3c"
+    },
+    "key": {
+      "remoteJid": "114194640801953@lid",
+      "fromMe": true,
+      "id": "3EB0977492AF18C76F1F37",
+      "senderLid": "114194640801953@lid",
+      "senderPn": "114194640801953@lid"
+    },
+    "messageTimestamp": 1755259247,
+    "pushName": "Wabot Demo",
+    "broadcast": false,
+    "status": 2,
+    "verifiedBizName": "Wabot Demo",
+    "message": {
+      "extendedTextMessage": {
+        "text": "yoyo",
+        "contextInfo": {
+          "conversionSource": "unknown",
+          "ephemeralSettingTimestamp": "1755249841",
+          "disappearingMode": {
+            "initiator": "CHANGED_IN_CHAT",
+            "trigger": "CHAT_SETTING",
+            "initiatedByMe": true
+          }
+        },
+        "inviteLinkGroupTypeV2": "DEFAULT"
+      }
+    },
+    "instanceId": "6860DCA0E2819",
+    "jid": "114194640801953@lid",
+    "updatedAt": {
+      "$date": "2025-08-15T12:00:48.253Z"
+    }
+  }
+
+// Message from bot to user, sent from Baileys API
+
+{
+    "_id": {
+      "$oid": "689f215a1dd7dd80a51e4f3b"
+    },
+    "key": {
+      "remoteJid": "60196953307@s.whatsapp.net",
+      "fromMe": true,
+      "id": "3EB032157DAA6E57331F4D"
+    },
+    "message": {
+      "extendedTextMessage": {
+        "text": "Maaf Firdaus Azizi...\r\n\r\nChatbot tidak dapat respon buat masa ini.\r\n\r\nMungkin anda dah test chatbot dengan terlalu kerap dalam tempoh yang singkat 😅\r\n\r\nSila cuba semula selepas beberapa jam ya 🙏🏻"
+      }
+    },
+    "messageTimestamp": "1755259226",
+    "status": 3,
+    "instanceId": "6860DCA0E2819",
+    "jid": "60196953307@s.whatsapp.net",
+    "updatedAt": {
+      "$date": "2025-08-15T12:00:27.855Z"
+    }
+  }
