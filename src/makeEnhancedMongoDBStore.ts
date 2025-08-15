@@ -216,38 +216,63 @@ const resolveQuotedMessage = async (
         // Extract the relevant message content
         const quotedMessage: any = {}
         
-        // Handle different message types
+        // Handle different message types - only extract essential fields
         if (quotedMsg.message?.conversation) {
             quotedMessage.conversation = quotedMsg.message.conversation
         } else if (quotedMsg.message?.extendedTextMessage?.text) {
             quotedMessage.conversation = quotedMsg.message.extendedTextMessage.text
         } else if (quotedMsg.message?.imageMessage) {
+            // Only extract essential fields to avoid Long/BigInt serialization issues
             quotedMessage.imageMessage = {
-                ...quotedMsg.message.imageMessage,
-                // Include mediaUrl if it was downloaded
-                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+                url: quotedMsg.mediaUrl || quotedMsg.message.imageMessage.url,
+                caption: quotedMsg.message.imageMessage.caption,
+                mimetype: quotedMsg.message.imageMessage.mimetype,
+                jpegThumbnail: quotedMsg.message.imageMessage.jpegThumbnail
             }
         } else if (quotedMsg.message?.videoMessage) {
             quotedMessage.videoMessage = {
-                ...quotedMsg.message.videoMessage,
-                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+                url: quotedMsg.mediaUrl || quotedMsg.message.videoMessage.url,
+                caption: quotedMsg.message.videoMessage.caption,
+                mimetype: quotedMsg.message.videoMessage.mimetype,
+                jpegThumbnail: quotedMsg.message.videoMessage.jpegThumbnail
             }
         } else if (quotedMsg.message?.audioMessage) {
             quotedMessage.audioMessage = {
-                ...quotedMsg.message.audioMessage,
-                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+                url: quotedMsg.mediaUrl || quotedMsg.message.audioMessage.url,
+                mimetype: quotedMsg.message.audioMessage.mimetype,
+                ptt: quotedMsg.message.audioMessage.ptt, // voice note flag
+                seconds: quotedMsg.message.audioMessage.seconds // duration
             }
         } else if (quotedMsg.message?.documentMessage) {
             quotedMessage.documentMessage = {
-                ...quotedMsg.message.documentMessage,
-                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+                url: quotedMsg.mediaUrl || quotedMsg.message.documentMessage.url,
+                title: quotedMsg.message.documentMessage.title,
+                fileName: quotedMsg.message.documentMessage.fileName,
+                mimetype: quotedMsg.message.documentMessage.mimetype,
+                jpegThumbnail: quotedMsg.message.documentMessage.jpegThumbnail
             }
         } else if (quotedMsg.message?.documentWithCaptionMessage) {
-            quotedMessage.documentWithCaptionMessage = quotedMsg.message.documentWithCaptionMessage
+            // Handle document with caption
+            const docMsg = quotedMsg.message.documentWithCaptionMessage.message?.documentMessage
+            if (docMsg) {
+                quotedMessage.documentWithCaptionMessage = {
+                    message: {
+                        documentMessage: {
+                            url: quotedMsg.mediaUrl || docMsg.url,
+                            title: docMsg.title,
+                            fileName: docMsg.fileName,
+                            mimetype: docMsg.mimetype,
+                            jpegThumbnail: docMsg.jpegThumbnail
+                        }
+                    },
+                    caption: quotedMsg.message.documentWithCaptionMessage.caption
+                }
+            }
         } else if (quotedMsg.message?.stickerMessage) {
             quotedMessage.stickerMessage = {
-                ...quotedMsg.message.stickerMessage,
-                ...(quotedMsg.mediaUrl && { url: quotedMsg.mediaUrl })
+                url: quotedMsg.mediaUrl || quotedMsg.message.stickerMessage.url,
+                mimetype: quotedMsg.message.stickerMessage.mimetype,
+                isAnimated: quotedMsg.message.stickerMessage.isAnimated
             }
         } else {
             // For any other message type, copy the entire message object
