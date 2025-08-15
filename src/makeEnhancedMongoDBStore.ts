@@ -1,5 +1,5 @@
 import { MongoClient, Collection } from 'mongodb'
-import { proto, getAggregateVotesInPollMessage } from 'baileys'
+import { proto, getAggregateVotesInPollMessage, updateMessageWithReceipt, updateMessageWithReaction } from 'baileys'
 import type { 
     BaileysEventEmitter, 
     Chat, 
@@ -2446,8 +2446,157 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             })
 
-            // Note: Labels and label-associations events are not part of the standard Baileys events
-            // They would need to be implemented separately if needed
+            // Messaging history sync
+            ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
+                if (enableMetrics) updateEventMetrics('messaging-history.set', 'received')
+                
+                const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
+                if (await shouldStoreEvent('messaging-history.set', historyData)) {
+                    try {
+                        if (isLatest) {
+                            // Clear existing data when syncing latest history
+                            await storeImpl.clearAll()
+                            log(`[${instanceId}] Cleared all data for latest history sync`)
+                        }
+                        
+                        // Process in parallel
+                        const promises: Promise<void>[] = []
+                        
+                        if (newChats?.length) {
+                            promises.push((async () => {
+                                await storeImpl.upsertChats(...newChats)
+                                log(`[${instanceId}] Synced ${newChats.length} chats from history`)
+                            })())
+                        }
+                        
+                        if (newContacts?.length) {
+                            promises.push((async () => {
+                                await storeImpl.upsertContacts(newContacts)
+                                log(`[${instanceId}] Synced ${newContacts.length} contacts from history`)
+                            })())
+                        }
+                        
+                        if (newMessages?.length) {
+                            // Process messages in batches
+                            for (const msg of newMessages) {
+                                const jid = msg.key.remoteJid
+                                if (!jid) continue
+                                await storeImpl.upsertMessage(jid, msg)
+                            }
+                            log(`[${instanceId}] Synced ${newMessages.length} messages from history`)
+                        }
+                        
+                        await Promise.all(promises)
+                        
+                        if (enableMetrics) updateEventMetrics('messaging-history.set', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('messaging-history.set', historyData)
+                    } catch (error) {
+                        logError('Failed to process messaging history:', error)
+                        if (enableMetrics) updateEventMetrics('messaging-history.set', 'error')
+                    }
+                }
+            })
+
+            // Labels edit
+            ev.on('labels.edit', async (label) => {
+                if (enableMetrics) updateEventMetrics('labels.edit', 'received')
+                
+                if (await shouldStoreEvent('labels.edit', label)) {
+                    try {
+                        if (label.deleted) {
+                            await storeImpl.deleteLabel(label.id)
+                            // Also delete all associations for this label
+                            const deleteResult = await collections.labelAssociations.deleteMany({
+                                instanceId,
+                                labelId: label.id
+                            })
+                            if (deleteResult.deletedCount > 0) {
+                                log(`[${instanceId}] Deleted ${deleteResult.deletedCount} label associations for deleted label ${label.id}`)
+                            }
+                        } else {
+                            await storeImpl.upsertLabel(label.id, label)
+                        }
+                        
+                        if (enableMetrics) updateEventMetrics('labels.edit', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('labels.edit', label)
+                    } catch (error) {
+                        logError(`Failed to process label edit for ${label.id}:`, error)
+                        if (enableMetrics) updateEventMetrics('labels.edit', 'error')
+                    }
+                }
+            })
+
+            // Labels association
+            ev.on('labels.association', async ({ type, association }) => {
+                if (enableMetrics) updateEventMetrics('labels.association', 'received')
+                
+                const associationData = { type, association }
+                if (await shouldStoreEvent('labels.association', associationData)) {
+                    try {
+                        if (type === 'add') {
+                            await storeImpl.upsertLabelAssociation(association)
+                        } else if (type === 'remove') {
+                            await storeImpl.deleteLabelAssociation(association)
+                        }
+                        
+                        if (enableMetrics) updateEventMetrics('labels.association', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('labels.association', associationData)
+                    } catch (error) {
+                        logError('Failed to process label association:', error)
+                        if (enableMetrics) updateEventMetrics('labels.association', 'error')
+                    }
+                }
+            })
+
+            // Message receipt update
+            ev.on('message-receipt.update', async (updates) => {
+                if (enableMetrics) updateEventMetrics('message-receipt.update', 'received')
+                
+                for (const { key, receipt } of updates) {
+                    if (await shouldStoreEvent('message-receipt.update', { key, receipt })) {
+                        try {
+                            const jid = key.remoteJid
+                            if (!jid) continue
+                            
+                            const msg = await storeImpl.getMessage(jid, key.id!)
+                            if (msg) {
+                                updateMessageWithReceipt(msg, receipt)
+                                await storeImpl.updateMessage(jid, key.id!, msg)
+                                if (enableMetrics) updateEventMetrics('message-receipt.update', 'stored')
+                                if (hooks.afterStore) await hooks.afterStore('message-receipt.update', { key, receipt })
+                            }
+                        } catch (error) {
+                            logError(`Failed to update message receipt for ${key.remoteJid}:`, error)
+                            if (enableMetrics) updateEventMetrics('message-receipt.update', 'error')
+                        }
+                    }
+                }
+            })
+
+            // Messages reaction
+            ev.on('messages.reaction', async (reactions) => {
+                if (enableMetrics) updateEventMetrics('messages.reaction', 'received')
+                
+                for (const { key, reaction } of reactions) {
+                    if (await shouldStoreEvent('messages.reaction', { key, reaction })) {
+                        try {
+                            const jid = key.remoteJid
+                            if (!jid) continue
+                            
+                            const msg = await storeImpl.getMessage(jid, key.id!)
+                            if (msg) {
+                                updateMessageWithReaction(msg, reaction)
+                                await storeImpl.updateMessage(jid, key.id!, msg)
+                                if (enableMetrics) updateEventMetrics('messages.reaction', 'stored')
+                                if (hooks.afterStore) await hooks.afterStore('messages.reaction', { key, reaction })
+                            }
+                        } catch (error) {
+                            logError(`Failed to update message reaction for ${key.remoteJid}:`, error)
+                            if (enableMetrics) updateEventMetrics('messages.reaction', 'error')
+                        }
+                    }
+                }
+            })
         },
 
         async loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]> {
