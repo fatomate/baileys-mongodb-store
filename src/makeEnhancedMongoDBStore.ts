@@ -686,36 +686,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Create queues for different event types
             createQueueAndWorker<MessageJob>(QueueType.MESSAGES, async (job) => {
-                const { type, message, messageId, update, deleteIds } = job.data
-                let { jid } = job.data
+                const { type, message, messageId, update, deleteIds, jid } = job.data
                 
                 if (type === 'upsert' && message) {
-                    // Process LID if handler is available to normalize JIDs
-                    if (lidHandler && message.key?.remoteJid) {
-                        const { normalizedJid, lidInfo } = await lidHandler.processMessage(message)
-                        
-                        // Store original JID for reference before updating
-                        const originalRemoteJid = message.key.remoteJid
-                        
-                        // Update both jid and remoteJid to use normalized phone number
-                        if (normalizedJid !== jid) {
-                            jid = normalizedJid
-                        }
-                        
-                        if (normalizedJid !== message.key.remoteJid) {
-                            message.key.remoteJid = normalizedJid
-                            log(`[Bull Queue LID Handler] Updated remoteJid from ${originalRemoteJid} to ${normalizedJid}`)
-                        }
-                        
-                        // Store LID info in the message for reference
-                        if (lidInfo.lid || lidInfo.phoneNumber) {
-                            (message as any).lidMapping = {
-                                lid: lidInfo.lid,
-                                phoneNumber: lidInfo.phoneNumber,
-                                originalJid: originalRemoteJid
-                            }
-                        }
-                    }
+                    // Note: LID processing is now done in upsertMessage before queuing
+                    // The message and jid here are already normalized
                     
                     // Resolve quoted message if present
                     if (message.message?.extendedTextMessage?.contextInfo?.stanzaId && 
@@ -1593,20 +1568,57 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         async upsertMessage(jid: string, message: proto.IWebMessageInfo): Promise<void> {
             try {
-                const validJid = safeValidateJID(jid)
+                // Deep clone the message to ensure we work with a mutable copy
+                // This prevents issues with Baileys' object references and multiple event emissions
+                const clonedMessage = JSON.parse(JSON.stringify(message))
+                
+                let validJid = safeValidateJID(jid)
+                
+                // Process LID if handler is available
+                if (lidHandler && clonedMessage.key?.remoteJid) {
+                    const { normalizedJid, lidInfo } = await lidHandler.processMessage(clonedMessage)
+                    
+                    // Store original JID for reference before updating
+                    const originalRemoteJid = clonedMessage.key.remoteJid
+                    
+                    // Use normalized JID (phone number) for storage
+                    if (normalizedJid !== jid) {
+                        validJid = safeValidateJID(normalizedJid)
+                    }
+                    
+                    // Update the cloned message's remoteJid to use the normalized phone number
+                    if (normalizedJid !== clonedMessage.key.remoteJid) {
+                        clonedMessage.key.remoteJid = normalizedJid
+                        log(`[upsertMessage LID Handler] Updated remoteJid from ${originalRemoteJid} to ${normalizedJid}`)
+                    }
+                    
+                    // Store LID info in the cloned message for reference
+                    if (lidInfo.lid || lidInfo.phoneNumber) {
+                        (clonedMessage as any).lidMapping = {
+                            lid: lidInfo.lid,
+                            phoneNumber: lidInfo.phoneNumber,
+                            originalJid: originalRemoteJid
+                        }
+                    }
+                    
+                    // Log LID mapping if discovered
+                    if (lidInfo.mappingStored) {
+                        log(`[upsertMessage LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                    }
+                }
                 
                 // Check if this is an Official API message
-                const isOfficialAPI = (message as any).official_api === true
+                const isOfficialAPI = (clonedMessage as any).official_api === true
                 
                 // Validate message ID if present (with special handling for Official API)
-                if (message.key?.id) {
-                    safeValidateMessageId(message.key.id, isOfficialAPI)
+                if (clonedMessage.key?.id) {
+                    safeValidateMessageId(clonedMessage.key.id, isOfficialAPI)
                 }
                 
                 // Check write permissions
                 accessContext.validateAccess(validatedInstanceId, 'write')
                 
-                const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${message.key?.id ? hashForLogging(message.key.id) : ''}`
+                const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${clonedMessage.key?.id ? hashForLogging(clonedMessage.key.id) : ''}`
             binaryConversionCache.del(cacheKey)
             
             // Use Bull queue if available
@@ -1618,7 +1630,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         {
                             type: 'upsert',
                             jid: validJid,
-                            message,
+                            message: clonedMessage,
                             instanceId: validatedInstanceId,
                             timestamp: Date.now()
                         },
@@ -1631,24 +1643,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Resolve quoted message if present
-            if (message.message?.extendedTextMessage?.contextInfo?.stanzaId && 
-                (!message.message.extendedTextMessage.contextInfo.quotedMessage || 
-                 Object.keys(message.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
+            if (clonedMessage.message?.extendedTextMessage?.contextInfo?.stanzaId && 
+                (!clonedMessage.message.extendedTextMessage.contextInfo.quotedMessage || 
+                 Object.keys(clonedMessage.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
                 
-                const quotedMsg = await resolveQuotedMessage(message, validJid, collections, validatedInstanceId, log)
+                const quotedMsg = await resolveQuotedMessage(clonedMessage, validJid, collections, validatedInstanceId, log)
                 if (quotedMsg && quotedMsg.message) {
-                    // Update the message with the resolved quoted content
-                    message.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
-                    log(`✅ Updated message with resolved quoted content for ${message.key?.id}`)
+                    // Update the cloned message with the resolved quoted content
+                    clonedMessage.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
+                    log(`✅ Updated message with resolved quoted content for ${clonedMessage.key?.id}`)
                 }
             }
             
             // Decrypt poll vote if present
             let pollVoteDecrypted = null
-            if (message.message?.pollUpdateMessage) {
-                pollVoteDecrypted = await decryptPollVote(message, collections, validatedInstanceId, meId, log)
+            if (clonedMessage.message?.pollUpdateMessage) {
+                pollVoteDecrypted = await decryptPollVote(clonedMessage, collections, validatedInstanceId, meId, log)
                 if (pollVoteDecrypted) {
-                    log(`✅ Decrypted poll vote for ${message.key?.id}`)
+                    log(`✅ Decrypted poll vote for ${clonedMessage.key?.id}`)
                 }
             }
             
@@ -1657,10 +1669,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 {
                     instanceId: validatedInstanceId,
                     jid: validJid,
-                    'key.id': message.key?.id
+                    'key.id': clonedMessage.key?.id
                 },
                 {
-                    ...message,
+                    ...clonedMessage,
                     instanceId: validatedInstanceId,
                     jid: validJid,
                     ...(pollVoteDecrypted && { pollVoteDecrypted }),
@@ -1671,8 +1683,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Handle media download for Official API messages
             if (config.media?.enabled && isOfficialAPI) {
-                log(`🔍 Checking for Official API media in message ${message.key?.id}`)
-                const mediaInfo = extractMediaInfo(message)
+                log(`🔍 Checking for Official API media in message ${clonedMessage.key?.id}`)
+                const mediaInfo = extractMediaInfo(clonedMessage)
                 log(`📋 Media extraction result: ${mediaInfo ? `Found ${mediaInfo.type} media` : 'No media found'}`)
                 
                 if (mediaInfo) {
@@ -1680,7 +1692,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`🆔 Media ID: ${mediaMessage.id}, Type: ${mediaInfo.type}, Mimetype: ${mediaInfo.mimetype}`)
                     
                     config.logger?.info({
-                        messageId: message.key?.id,
+                        messageId: clonedMessage.key?.id,
                         jid: validJid,
                         mediaType: mediaInfo.type,
                         mediaId: mediaMessage.id,
@@ -1698,7 +1710,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     // Download media asynchronously
-                    downloadOfficialAPIMedia(message, validatedInstanceId, config.media, config.logger, checkExistingMedia)
+                    downloadOfficialAPIMedia(clonedMessage, validatedInstanceId, config.media, config.logger, checkExistingMedia)
                         .then(async (mediaResult) => {
                             if (mediaResult.success && mediaResult.localPath) {
                                 // Update message with media URL
@@ -1706,7 +1718,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     { 
                                         instanceId: validatedInstanceId, 
                                         jid: validJid, 
-                                        'key.id': message.key?.id 
+                                        'key.id': clonedMessage.key?.id 
                                     },
                                     { 
                                         $set: { 
@@ -1718,13 +1730,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 )
                                 log(`✅ Official API media downloaded successfully: ${mediaResult.localPath}`)
                                 config.logger?.info({
-                                    messageId: message.key?.id,
+                                    messageId: clonedMessage.key?.id,
                                     mediaUrl: mediaResult.localPath
                                 }, '✅ Official API media downloaded and URL updated')
                             } else {
                                 log(`❌ Failed to download Official API media: ${mediaResult.error}`)
                                 config.logger?.warn({
-                                    messageId: message.key?.id,
+                                    messageId: clonedMessage.key?.id,
                                     error: mediaResult.error
                                 }, '❌ Failed to download Official API media')
                             }
@@ -1732,12 +1744,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         .catch(error => {
                             log(`❌ Error downloading Official API media: ${error instanceof Error ? error.message : 'Unknown error'}`)
                             config.logger?.error({
-                                messageId: message.key?.id,
+                                messageId: clonedMessage.key?.id,
                                 error: error instanceof Error ? error.message : 'Unknown error'
                             }, '❌ Error downloading Official API media')
                         })
                 } else {
-                    log(`⚠️ No media info extracted from Official API message ${message.key?.id}`)
+                    log(`⚠️ No media info extracted from Official API message ${clonedMessage.key?.id}`)
                 }
             }
             
@@ -2211,39 +2223,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
                 
                 for (const msg of messages) {
-                    let jid = msg.key.remoteJid
+                    const jid = msg.key.remoteJid
                     if (!jid) continue
-                    
-                    // Process LID if handler is available
-                    if (lidHandler) {
-                        const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
-                        
-                        // Store original JID for reference before updating
-                        const originalRemoteJid = msg.key.remoteJid
-                        
-                        // Use normalized JID (phone number) for storage
-                        jid = normalizedJid
-                        
-                        // Update the message's remoteJid to use the normalized phone number
-                        if (normalizedJid !== msg.key.remoteJid) {
-                            msg.key.remoteJid = normalizedJid
-                            log(`[LID Handler] Updated remoteJid from ${originalRemoteJid} to ${normalizedJid}`)
-                        }
-                        
-                        // Store LID info in the message for reference
-                        if (lidInfo.lid || lidInfo.phoneNumber) {
-                            (msg as any).lidMapping = {
-                                lid: lidInfo.lid,
-                                phoneNumber: lidInfo.phoneNumber,
-                                originalJid: originalRemoteJid
-                            }
-                        }
-                        
-                        // Log LID mapping if discovered
-                        if (lidInfo.mappingStored) {
-                            log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
-                        }
-                    }
                     
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {

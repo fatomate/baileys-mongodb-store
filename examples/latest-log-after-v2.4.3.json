@@ -1,0 +1,156 @@
+messages.upsert received for instance 6860DCA0E2819 : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "114194640801953@lid",
+        "fromMe": true,
+        "id": "52BD71F5B15A9C96574D08FFB72D5D03",
+        "senderLid": "114194640801953@lid",
+        "senderPn": "114194640801953@lid"
+      },
+      "messageTimestamp": 1755266250,
+      "pushName": "Wabot Demo",
+      "broadcast": false,
+      "status": 2,
+      "messageStubType": 2,
+      "messageStubParameters": [
+        "No matching sessions found for message"
+      ]
+    }
+  ],
+  "type": "notify"
+}
+⚠️ Media download failed for message 52BD71F5B15A9C96574D08FFB72D5D03: No media found in message
+Found message but JID mismatch: 114194640801953@lid !== 60196953307:73@s.whatsapp.net
+Discovered LID-phone pair: 114194640801953@lid <-> 60196953307:73@s.whatsapp.net
+Found message with alternative query
+✅ Updated message 52BD71F5B15A9C96574D08FFB72D5D03 preserving quoted message structure
+✅ messages job 8 completed
+Found message but JID mismatch: 114194640801953@lid !== 60196953307@s.whatsapp.net
+Discovered LID-phone pair: 114194640801953@lid <-> 60196953307@s.whatsapp.net
+Found message with alternative query
+✅ Updated message 52BD71F5B15A9C96574D08FFB72D5D03 preserving quoted message structure
+✅ messages job 9 completed
+messages.upsert received for instance 6860DCA0E2819 : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "60173577321@s.whatsapp.net",
+        "fromMe": true,
+        "id": "CA90E038FBB430ECE08E081309EF250B",
+        "senderLid": "60173577321@s.whatsapp.net",
+        "senderPn": "60173577321@s.whatsapp.net"
+      },
+      "messageTimestamp": 1755266256,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE",
+          "peerDataOperationRequestResponseMessage": {
+            "peerDataOperationRequestType": "PLACEHOLDER_MESSAGE_RESEND",
+            "stanzaId": "3EB01FD8D49A358A7E6D2F",
+            "peerDataOperationResult": [
+              {
+                "mediaUploadResult": "SUCCESS",
+                "placeholderMessageResendResponse": {
+                  "webMessageInfoBytes": "CjkKEzExNDE5NDY0MDgwMTk1M0BsaWQQARogNTJCRDcxRjVCMTVBOUM5NjU3NEQwOEZGQjcyRDVEMDMSLQoGdG9sb25nmgIiGiD5MXeP05aQP/bEx8fqgj5nAw+cVI4ihmR7ocVSliMHyhjK+fzEBiAEwgImCho2MDE5Njk1MzMwN0BzLndoYXRzYXBwLm5ldBAAGMv5/MQGIADCAh8KEzExNDE5NDY0MDgwMTk1M0BsaWQQy/n8xAYYACAAigMg+TF3j9OWkD/2xMfH6oI+ZwMPnFSOIoZke6HFUpYjB8qIBAA="
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "key": {
+        "remoteJid": "114194640801953@lid",
+        "fromMe": true,
+        "id": "52BD71F5B15A9C96574D08FFB72D5D03",
+        "senderLid": "114194640801953@lid",
+        "senderPn": "114194640801953@lid"
+      },
+      "messageTimestamp": 1755266256,
+      "pushName": "Wabot Demo",
+      "broadcast": false,
+      "status": 2,
+      "messageStubType": 2,
+      "messageStubParameters": [
+        "No matching sessions found for message"
+      ]
+    }
+  ],
+  "type": "notify"
+}
+Empty or invalid message ID encountered (processing with placeholder)
+⚠️ Media download failed for message CA90E038FBB430ECE08E081309EF250B: No media found in message
+⚠️ Media download failed for message 52BD71F5B15A9C96574D08FFB72D5D03: No media found in message
+Skipping protocolMessage for instance 6860DCA0E2819: 17
+✅ messages job 10 completed
+✅ messages job 11 completed
+✅ messages job 12 completed
+messages.upsert received for instance 6860DCA0E2819 : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "114194640801953@lid",
+        "fromMe": true,
+        "id": "52BD71F5B15A9C96574D08FFB72D5D03"
+      },
+      "message": {
+        "conversation": "tolong",
+        "messageContextInfo": {
+          "messageSecret": "+TF3j9OWkD/2xMfH6oI+ZwMPnFSOIoZke6HFUpYjB8o="
+        }
+      },
+      "messageTimestamp": "1755266250",
+      "status": "READ",
+      "userReceipt": [
+        {
+          "userJid": "60196953307@s.whatsapp.net",
+          "receiptTimestamp": "0",
+          "readTimestamp": "1755266251",
+          "playedTimestamp": "0"
+        },
+        {
+          "userJid": "114194640801953@lid",
+          "receiptTimestamp": "1755266251",
+          "readTimestamp": "0",
+          "playedTimestamp": "0"
+        }
+      ],
+      "messageSecret": "+TF3j9OWkD/2xMfH6oI+ZwMPnFSOIoZke6HFUpYjB8o=",
+      "isMentionedInStatus": false
+    }
+  ],
+  "type": "notify",
+  "requestId": "3EB01FD8D49A358A7E6D2F"
+}
+⚠️ Media download failed for message 52BD71F5B15A9C96574D08FFB72D5D03: No media found in message
+✅ messages job 13 completed
+messages.upsert received for instance 6860DCA0E2819 : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "114194640801953@lid",
+        "fromMe": true,
+        "id": "52BD71F5B15A9C96574D08FFB72D5D03",
+        "senderLid": "114194640801953@lid",
+        "senderPn": "114194640801953@lid"
+      },
+      "messageTimestamp": 1755266257,
+      "pushName": "Wabot Demo",
+      "broadcast": false,
+      "status": 2,
+      "verifiedBizName": "Wabot Demo",
+      "message": {
+        "conversation": "tolong"
+      }
+    }
+  ],
+  "type": "notify"
+}
+⚠️ Media download failed for message 52BD71F5B15A9C96574D08FFB72D5D03: No media found in message
+✅ messages job 14 completed
+✅ chats job 2 completed
+Would save message to MongoDB: 52BD71F5B15A9C96574D08FFB72D5D03
