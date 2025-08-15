@@ -1457,15 +1457,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const validJid = safeValidateJID(jid)
                 const validId = safeValidateMessageId(id)
                 
-                log(`getMessage called with ${jid} and ${id}`)
-                log(`getMessage validJid ${validJid}`)
-                log(`getMessage validId ${validId}`)
-                
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
-                log(`getMessage cacheKey ${cacheKey}`)
                 
                 const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
-                log(`getMessage cached ${cached ? 'found' : 'undefined'}`)
                 if (cached) return cached
                 
                 // First try the standard query
@@ -1475,11 +1469,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     'key.id': validId
                 })
                 
-                log(`getMessage message ${message ? 'found' : 'null'}`)
-                
                 // If not found, try alternative queries for poll messages and other edge cases
                 if (!message) {
-                    log(`Trying alternative query for poll message`)
                     
                     // Try with key.remoteJid instead of jid field
                     message = await collections.messages.findOne({
@@ -1490,7 +1481,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     if (!message) {
                         // Try without the jid constraint at all (just instanceId and key.id)
-                        log(`Trying query with just instanceId and key.id`)
                         message = await collections.messages.findOne({
                             instanceId: validatedInstanceId,
                             'key.id': validId
@@ -1499,18 +1489,50 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Check if the JID mismatch is acceptable
                         if (message && message.key?.remoteJid !== validJid) {
                             const foundJid = message.key?.remoteJid || message.jid
-                            log(`Found message but JID mismatch: ${foundJid} !== ${validJid}`)
                             
                             // Check if JIDs are equivalent (same JID with different format)
                             if (areJidsEquivalent(foundJid, validJid)) {
-                                log(`JIDs are equivalent, accepting message`)
+                                // JIDs are equivalent, accept the message
                             }
                             // Check if this is a LID-phone pair
                             else if (isLidAndPhonePair(foundJid, validJid)) {
                                 log(`Discovered LID-phone pair: ${foundJid} <-> ${validJid}`)
                                 // Store the discovered mapping if we have a LID handler
                                 if (lidHandler) {
-                                    await lidHandler.storeDiscoveredMapping(foundJid, validJid)
+                                    const stored = await lidHandler.storeDiscoveredMapping(foundJid, validJid)
+                                    
+                                    // If mapping was successfully stored, update existing messages with LID format
+                                    if (stored) {
+                                        // Determine which one is the LID and which is the phone
+                                        const lidJid = lidHandler.isLidFormat(foundJid) ? foundJid : validJid
+                                        const phoneJid = lidHandler.isLidFormat(foundJid) ? validJid : foundJid
+                                        
+                                        log(`Updating existing messages from LID ${lidJid} to phone ${phoneJid}`)
+                                        
+                                        // Update messages that have the LID as remoteJid
+                                        try {
+                                            const updateResult = await collections.messages.updateMany(
+                                                {
+                                                    instanceId: validatedInstanceId,
+                                                    'key.remoteJid': lidJid
+                                                },
+                                                {
+                                                    $set: {
+                                                        'key.remoteJid': phoneJid,
+                                                        jid: phoneJid,
+                                                        'lidMapping.resolved': true,
+                                                        'lidMapping.resolvedAt': new Date()
+                                                    }
+                                                }
+                                            )
+                                            
+                                            if (updateResult.modifiedCount > 0) {
+                                                log(`Updated ${updateResult.modifiedCount} messages from LID to phone number format`)
+                                            }
+                                        } catch (updateError) {
+                                            logError(`Failed to update messages with new LID mapping:`, updateError)
+                                        }
+                                    }
                                 }
                             }
                             // Otherwise, reject the message
@@ -1520,10 +1542,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             }
                         }
                     }
-                    
-                    if (message) {
-                        log(`Found message with alternative query`)
-                    } else {
+
+                    // After all attempts, if still not found, log debug and return null
+                    if (!message) {
                         // Log more details to help debug
                         const count = await collections.messages.countDocuments({
                             instanceId: validatedInstanceId
@@ -1553,10 +1574,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // eslint-disable-next-line @typescript-eslint/no-unused-vars
                 const { _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg } = message
                 const converted = convertBinaryToBuffer(msg)
-            
-            binaryConversionCache.set(cacheKey, converted)
-            
-            return converted
+                
+                binaryConversionCache.set(cacheKey, converted)
+                
+                return converted
             } catch (error) {
                 if (error instanceof ValidationError || error instanceof AuthorizationError) {
                     throw error

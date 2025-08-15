@@ -92,16 +92,61 @@ export const isLidAndPhonePair = (jid1: string | undefined | null, jid2: string 
  * Returns null if not a valid pair
  */
 export const extractLidPhonePair = (jid1: string, jid2: string): { lid: string; phoneNumber: string } | null => {
-    if (!isLidAndPhonePair(jid1, jid2)) return null
+    // Debug logging for troubleshooting
+    if (process.env.DEBUG_LID === 'true') {
+        console.log(`[extractLidPhonePair] Input: jid1="${jid1}", jid2="${jid2}"`)
+    }
+    
+    // Validate inputs
+    if (!jid1 || !jid2) {
+        if (process.env.DEBUG_LID === 'true') {
+            console.log(`[extractLidPhonePair] Invalid input: one or both JIDs are empty`)
+        }
+        return null
+    }
+    
+    // Check if they form a LID-phone pair
+    if (!isLidAndPhonePair(jid1, jid2)) {
+        if (process.env.DEBUG_LID === 'true') {
+            console.log(`[extractLidPhonePair] Not a LID-phone pair: jid1=${jid1}, jid2=${jid2}`)
+        }
+        return null
+    }
     
     const norm1 = normalizeJidForComparison(jid1)
     const norm2 = normalizeJidForComparison(jid2)
     
-    if (isLidFormat(norm1)) {
-        return { lid: norm1, phoneNumber: norm2 }
-    } else {
-        return { lid: norm2, phoneNumber: norm1 }
+    if (process.env.DEBUG_LID === 'true') {
+        console.log(`[extractLidPhonePair] Normalized: norm1="${norm1}", norm2="${norm2}"`)
     }
+    
+    // Ensure they're not identical after normalization
+    if (norm1 === norm2) {
+        if (process.env.DEBUG_LID === 'true') {
+            console.log(`[extractLidPhonePair] Error: normalized JIDs are identical: ${norm1}`)
+        }
+        return null
+    }
+    
+    // Extract the LID and phone number
+    let result: { lid: string; phoneNumber: string } | null = null
+    
+    if (isLidFormat(norm1) && isPhoneNumberFormat(norm2)) {
+        result = { lid: norm1, phoneNumber: norm2 }
+    } else if (isPhoneNumberFormat(norm1) && isLidFormat(norm2)) {
+        result = { lid: norm2, phoneNumber: norm1 }
+    } else {
+        if (process.env.DEBUG_LID === 'true') {
+            console.log(`[extractLidPhonePair] Error: unexpected format combination`)
+        }
+        return null
+    }
+    
+    if (process.env.DEBUG_LID === 'true' && result) {
+        console.log(`[extractLidPhonePair] Success: lid="${result.lid}", phone="${result.phoneNumber}"`)
+    }
+    
+    return result
 }
 
 /**

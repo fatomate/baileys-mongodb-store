@@ -372,10 +372,23 @@ export class LidHandler {
      * This is called when we find a message with mismatched JIDs that form a LID-phone pair
      */
     async storeDiscoveredMapping(jid1: string, jid2: string): Promise<boolean> {
-        const pair = extractLidPhonePair(jid1, jid2)
-        if (!pair) return false
+        console.log(`[LidHandler] storeDiscoveredMapping called with: jid1="${jid1}", jid2="${jid2}"`)
         
-        console.log(`[LidHandler] Discovered mapping from JID mismatch: ${pair.lid} <-> ${pair.phoneNumber}`)
+        const pair = extractLidPhonePair(jid1, jid2)
+        if (!pair) {
+            console.log(`[LidHandler] Failed to extract LID-phone pair from: "${jid1}" and "${jid2}"`)
+            
+            // Additional debugging to understand why it failed
+            if (process.env.DEBUG_LID === 'true') {
+                console.log(`[LidHandler] Debug info:`)
+                console.log(`  - jid1 isLid: ${this.isLidFormat(jid1)}, isPhone: ${isPhoneNumberFormat(jid1)}`)
+                console.log(`  - jid2 isLid: ${this.isLidFormat(jid2)}, isPhone: ${isPhoneNumberFormat(jid2)}`)
+                console.log(`  - areJidsEquivalent: ${areJidsEquivalent(jid1, jid2)}`)
+            }
+            return false
+        }
+        
+        console.log(`[LidHandler] Successfully extracted mapping: ${pair.lid} <-> ${pair.phoneNumber}`)
         await this.storeLidMapping(pair.lid, pair.phoneNumber)
         return true
     }
@@ -488,6 +501,10 @@ export class LidHandler {
                     lidInfo.phoneNumber = existingPhone
                 } else {
                     console.log(`[LidHandler] No phone number found for sent message LID: ${lidInfo.lid}`)
+                    // IMPORTANT: Keep the LID for now, but mark it for future update
+                    // The phone number might become available later through getMessage discovery
+                    normalizedJid = lidInfo.lid
+                    console.log(`[LidHandler] Using LID as temporary JID, will update when phone number is discovered`)
                 }
             }
         }
@@ -502,8 +519,8 @@ export class LidHandler {
                 console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
                 await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber)
                 mappingStored = true
+                normalizedJid = lidInfo.phoneNumber
             }
-            normalizedJid = lidInfo.phoneNumber
         } 
         // If we only have LID, try to get phone number from database
         else if (lidInfo.lid) {
@@ -512,8 +529,11 @@ export class LidHandler {
             if (phoneNumber) {
                 console.log(`[LidHandler] Found existing mapping: ${lidInfo.lid} -> ${phoneNumber}`)
                 normalizedJid = phoneNumber
+                lidInfo.phoneNumber = phoneNumber
             } else {
                 console.log(`[LidHandler] No existing mapping found for LID: ${lidInfo.lid}`)
+                // Keep the LID for now, might be resolved later
+                normalizedJid = lidInfo.lid
             }
         } else {
             console.log(`[LidHandler] No LID found in message, using original JID: ${normalizedJid}`)
