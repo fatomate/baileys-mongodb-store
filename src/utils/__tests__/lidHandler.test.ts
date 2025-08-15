@@ -364,6 +364,71 @@ describe('LidHandler', () => {
             expect(result.lidInfo.phoneNumber).toBeUndefined()
             expect(result.lidInfo.needsReverseLookup).toBe(true)
         })
+
+        it('should handle fromMe message with LID in both senderLid and senderPn (WhatsApp bug)', async () => {
+            // First, insert a received message with correct senderLid
+            await db.collection('test_messages').insertOne({
+                instanceId: 'test-instance',
+                key: {
+                    id: 'msg1',
+                    fromMe: false,
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    senderLid: '114194640801953@lid',
+                    senderPn: '60196953307@s.whatsapp.net'
+                }
+            })
+
+            // Now process a sent message where both senderLid and senderPn incorrectly have LID
+            const sentMessage: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    fromMe: true,
+                    id: 'msg2',
+                    senderLid: '114194640801953@lid',
+                    senderPn: '114194640801953@lid'  // This is the bug - should be phone number
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(sentMessage)
+            
+            // Should correctly identify the phone number through reverse lookup
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBe('114194640801953@lid')
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.needsReverseLookup).toBe(true)
+
+            // Verify the correct mapping was stored (not LID->LID)
+            const mapping = await db.collection('test_lidMappings').findOne({
+                instanceId: 'test-instance',
+                lid: '114194640801953@lid'
+            })
+            expect(mapping?.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(mapping?.phoneNumber).not.toBe('114194640801953@lid')
+        })
+
+        it('should not store invalid LID->LID mappings', async () => {
+            // Try to process a message with LID as both lid and phoneNumber
+            const invalidMessage: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    senderLid: '114194640801953@lid',
+                    senderPn: '114194640801953@lid'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(invalidMessage)
+            
+            // Should not store any mapping
+            const mappingCount = await db.collection('test_lidMappings').countDocuments({
+                instanceId: 'test-instance'
+            })
+            expect(mappingCount).toBe(0)
+            
+            // Should still return the LID as normalizedJid
+            expect(result.normalizedJid).toBe('114194640801953@lid')
+        })
     })
 
     describe('clearCache', () => {

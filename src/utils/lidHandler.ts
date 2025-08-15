@@ -154,11 +154,20 @@ export class LidHandler {
         }
         
         // Extract phone number from senderPn
-        if ((message.key as any)?.senderPn && !this.isLidFormat((message.key as any).senderPn)) {
-            result.phoneNumber = (message.key as any).senderPn
-            debug.push(`Found phone in senderPn: ${result.phoneNumber}`)
-        } else if ((message.key as any)?.senderPn) {
-            debug.push(`senderPn is LID format: ${(message.key as any).senderPn}`)
+        // Special handling: For fromMe messages with LID remoteJid, senderPn might incorrectly be a LID too
+        // In this case, we should ignore senderPn and rely on reverse lookup
+        if ((message.key as any)?.senderPn) {
+            const senderPn = (message.key as any).senderPn
+            if (!this.isLidFormat(senderPn)) {
+                result.phoneNumber = senderPn
+                debug.push(`Found phone in senderPn: ${result.phoneNumber}`)
+            } else if (message.key?.fromMe && this.isLidFormat(message.key?.remoteJid)) {
+                // For fromMe messages to LID, if senderPn is also LID, ignore it
+                // This is likely a WhatsApp bug where both fields are set to the recipient's LID
+                debug.push(`Ignoring LID senderPn in fromMe message: ${senderPn}`)
+            } else {
+                debug.push(`senderPn is LID format: ${senderPn}`)
+            }
         }
         
         // If remoteJid is not @lid, it might be the phone number
@@ -207,6 +216,18 @@ export class LidHandler {
         if (!normalizedLid || !normalizedPhone) return
         if (!this.isLidFormat(normalizedLid)) return
         if (!isPhoneNumberFormat(normalizedPhone)) return
+        
+        // Prevent storing LID->LID mappings (this is invalid)
+        if (normalizedLid === normalizedPhone) {
+            console.warn(`[LidHandler] Attempted to store invalid LID->LID mapping: ${normalizedLid} -> ${normalizedPhone}`)
+            return
+        }
+        
+        // Additional check: both shouldn't be LID format
+        if (this.isLidFormat(normalizedPhone)) {
+            console.warn(`[LidHandler] Attempted to store LID as phone number: ${normalizedLid} -> ${normalizedPhone}`)
+            return
+        }
         
         const now = new Date()
         
@@ -472,9 +493,16 @@ export class LidHandler {
         }
         // If we have both LID and phone number, store the mapping
         else if (lidInfo.lid && lidInfo.phoneNumber) {
-            console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
-            await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber)
-            mappingStored = true
+            // Additional validation: Don't store if both are the same or both are LIDs
+            if (lidInfo.lid === lidInfo.phoneNumber) {
+                console.warn(`[LidHandler] Skipping invalid mapping where LID equals phone number: ${lidInfo.lid}`)
+            } else if (this.isLidFormat(lidInfo.phoneNumber)) {
+                console.warn(`[LidHandler] Skipping invalid mapping where phone number is also a LID: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+            } else {
+                console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber)
+                mappingStored = true
+            }
             normalizedJid = lidInfo.phoneNumber
         } 
         // If we only have LID, try to get phone number from database
