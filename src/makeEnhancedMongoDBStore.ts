@@ -780,7 +780,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         
                         // Ensure quoted message is preserved
                         if (update.message?.extendedTextMessage && 
-                            existingMsg.message.extendedTextMessage.contextInfo?.quotedMessage) {
+                            existingMsg.message.extendedTextMessage.contextInfo?.quotedMessage &&
+                            mergedMessage.extendedTextMessage) {
                             if (!mergedMessage.extendedTextMessage.contextInfo) {
                                 mergedMessage.extendedTextMessage.contextInfo = existingMsg.message.extendedTextMessage.contextInfo
                             } else if (!mergedMessage.extendedTextMessage.contextInfo.quotedMessage) {
