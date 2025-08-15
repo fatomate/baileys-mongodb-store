@@ -28,6 +28,7 @@ describe('LidHandler', () => {
     beforeEach(async () => {
         // Clear any existing data first
         await db.collection('test_lidMappings').deleteMany({})
+        await db.collection('test_messages').deleteMany({})
         
         // Create new LID handler for each test
         lidHandler = new LidHandler('test-instance', {
@@ -302,6 +303,66 @@ describe('LidHandler', () => {
             expect(result.lidInfo.lid).toBeUndefined()
             expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
             expect(result.lidInfo.mappingStored).toBe(false)
+        })
+
+        it('should handle fromMe message with LID using reverse lookup', async () => {
+            // First, insert a received message with senderLid
+            const insertResult = await db.collection('test_messages').insertOne({
+                instanceId: 'test-instance',
+                key: {
+                    id: 'msg1',
+                    fromMe: false,
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    senderLid: '114194640801953@lid',
+                    senderPn: '60196953307@s.whatsapp.net'
+                }
+            })
+            
+            // Verify the message was inserted
+            expect(insertResult.acknowledged).toBe(true)
+
+            // Now process a sent message with LID remoteJid
+            const sentMessage: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    fromMe: true,
+                    id: 'msg2'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(sentMessage)
+            
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBe('114194640801953@lid')
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.needsReverseLookup).toBe(true)
+
+            // Verify mapping was discovered and stored
+            const mapping = await db.collection('test_lidMappings').findOne({
+                instanceId: 'test-instance',
+                lid: '114194640801953@lid'
+            })
+            expect(mapping?.phoneNumber).toBe('60196953307@s.whatsapp.net')
+        })
+
+        it('should handle fromMe message when no reverse lookup match found', async () => {
+            const sentMessage: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '999999999@lid',
+                    fromMe: true,
+                    id: 'msg3'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(sentMessage)
+            
+            // Should return the LID since no phone number was found
+            expect(result.normalizedJid).toBe('999999999@lid')
+            expect(result.lidInfo.lid).toBe('999999999@lid')
+            expect(result.lidInfo.phoneNumber).toBeUndefined()
+            expect(result.lidInfo.needsReverseLookup).toBe(true)
         })
     })
 

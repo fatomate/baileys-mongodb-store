@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import { normalizeJidForComparison } from './jidUtils'
 
 /**
  * Security utilities for input validation and sanitization
@@ -285,9 +286,22 @@ export const validateMongoQuery = (query: Record<string, unknown>): void => {
 export const safeValidateJID = (jid: string): string => {
     const trimmedJid = jid?.trim()
     if (!isValidJID(trimmedJid)) {
+        // Try with normalized JID (removing :XX suffixes)
+        const normalized = normalizeJidForComparison(trimmedJid)
+        if (isValidJID(normalized)) {
+            return normalized
+        }
         console.warn(`Invalid JID format (processing anyway): ${trimmedJid?.substring(0, 30)}`)
     }
     return trimmedJid || ''
+}
+
+/**
+ * Normalize a JID for safe comparison
+ * Removes :XX suffixes while maintaining safety
+ */
+export const safeNormalizeJid = (jid: string): string => {
+    return normalizeJidForComparison(jid)
 }
 
 /**

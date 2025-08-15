@@ -1,6 +1,13 @@
 import { Collection, Db } from 'mongodb'
 import NodeCache from 'node-cache'
 import { proto } from 'baileys'
+import { 
+    normalizeJidForStorage,
+    isLidFormat as isLidFormatUtil,
+    isPhoneNumberFormat,
+    areJidsEquivalent,
+    extractLidPhonePair
+} from './jidUtils'
 
 export interface LidMapping {
     instanceId: string
@@ -18,6 +25,7 @@ export interface LidHandlerConfig {
 
 export class LidHandler {
     private lidMappingsCollection: Collection<LidMapping> | null = null
+    private messagesCollection: Collection<any> | null = null
     private cache: NodeCache
     private config: Required<LidHandlerConfig>
     private instanceId: string
@@ -41,8 +49,13 @@ export class LidHandler {
      * Initialize the handler with MongoDB connection
      */
     async initialize(db: Db, collectionPrefix = ''): Promise<void> {
-        const collectionName = collectionPrefix ? `${collectionPrefix}_lidMappings` : 'lidMappings'
+        const collectionName = collectionPrefix ? `${collectionPrefix}lidMappings` : 'lidMappings'
         this.lidMappingsCollection = db.collection<LidMapping>(collectionName)
+        
+        // Also get reference to messages collection for reverse lookups
+        const messagesCollectionName = collectionPrefix ? `${collectionPrefix}messages` : 'messages'
+        this.messagesCollection = db.collection(messagesCollectionName)
+        
         
         // Create indexes for efficient lookups
         await this.createIndexes()
@@ -52,10 +65,11 @@ export class LidHandler {
      * Create MongoDB indexes for efficient lookups
      */
     private async createIndexes(): Promise<void> {
-        if (!this.lidMappingsCollection) return
+        const promises: Promise<any>[] = []
         
-        try {
-            await Promise.all([
+        // Create indexes for lidMappings collection
+        if (this.lidMappingsCollection) {
+            promises.push(
                 // Compound index for instance + lid lookup
                 this.lidMappingsCollection.createIndex(
                     { instanceId: 1, lid: 1 },
@@ -70,18 +84,35 @@ export class LidHandler {
                     { lastSeen: 1 },
                     { expireAfterSeconds: 90 * 24 * 60 * 60 }
                 )
-            ])
+            )
+        }
+        
+        // Create indexes for messages collection (for reverse lookup)
+        if (this.messagesCollection) {
+            promises.push(
+                // Compound index for reverse lookup: find messages by senderLid
+                this.messagesCollection.createIndex(
+                    { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 },
+                    { background: true }
+                )
+            )
+        }
+        
+        try {
+            if (promises.length > 0) {
+                await Promise.all(promises)
+                console.log('[LidHandler] Indexes created successfully')
+            }
         } catch (error) {
-            console.error('Failed to create LID mapping indexes:', error)
+            console.error('Failed to create LID handler indexes:', error)
         }
     }
 
     /**
-     * Check if a JID is in @lid format
+     * Check if a JID is in @lid format (handles :XX suffixes)
      */
     isLidFormat(jid: string | undefined | null): boolean {
-        if (!jid) return false
-        return jid.includes('@lid')
+        return isLidFormatUtil(jid)
     }
 
     /**
@@ -90,10 +121,25 @@ export class LidHandler {
     extractLidInfo(message: proto.IWebMessageInfo): {
         lid?: string
         phoneNumber?: string
+        needsReverseLookup?: boolean
         debug?: string[]
     } {
-        const result: { lid?: string; phoneNumber?: string; debug?: string[] } = {}
+        const result: { lid?: string; phoneNumber?: string; needsReverseLookup?: boolean; debug?: string[] } = {}
         const debug: string[] = []
+        
+        // Check if this is a sent message (fromMe: true) with LID remoteJid
+        if (message.key?.fromMe && this.isLidFormat(message.key?.remoteJid)) {
+            result.lid = message.key.remoteJid!
+            result.needsReverseLookup = true
+            debug.push(`Found LID in remoteJid (fromMe=true, needs reverse lookup): ${result.lid}`)
+            
+            // For sent messages, we won't find phone number in the message itself
+            // We need to do a reverse lookup
+            if (process.env.NODE_ENV !== 'production' || debug.length > 0) {
+                result.debug = debug
+            }
+            return result
+        }
         
         // Check remoteJid for @lid
         if (this.isLidFormat(message.key?.remoteJid)) {
@@ -153,9 +199,14 @@ export class LidHandler {
             return
         }
         
+        // Normalize JIDs for storage
+        const normalizedLid = normalizeJidForStorage(lid)
+        const normalizedPhone = normalizeJidForStorage(phoneNumber)
+        
         // Validate inputs
-        if (!lid || !phoneNumber) return
-        if (!this.isLidFormat(lid)) return
+        if (!normalizedLid || !normalizedPhone) return
+        if (!this.isLidFormat(normalizedLid)) return
+        if (!isPhoneNumberFormat(normalizedPhone)) return
         
         const now = new Date()
         
@@ -164,31 +215,31 @@ export class LidHandler {
             await this.lidMappingsCollection.updateOne(
                 { 
                     instanceId: this.instanceId, 
-                    lid 
+                    lid: normalizedLid 
                 },
                 {
                     $set: {
-                        phoneNumber,
+                        phoneNumber: normalizedPhone,
                         lastSeen: now,
                         updatedAt: now
                     },
                     $setOnInsert: {
                         instanceId: this.instanceId,
-                        lid,
+                        lid: normalizedLid,
                         firstSeen: now
                     }
                 },
                 { upsert: true }
             )
             
-            // Update cache if enabled
+            // Update cache if enabled (use normalized JIDs for cache keys)
             if (this.config.enableCache) {
                 // Cache both directions
-                this.cache.set(`lid:${this.instanceId}:${lid}`, phoneNumber)
-                this.cache.set(`phone:${this.instanceId}:${phoneNumber}`, lid)
+                this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, normalizedPhone)
+                this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
             }
             
-            console.log(`[LidHandler] Stored mapping: ${lid} -> ${phoneNumber}`)
+            console.log(`[LidHandler] Stored mapping: ${normalizedLid} -> ${normalizedPhone}`)
         } catch (error) {
             console.error('[LidHandler] Failed to store LID mapping:', error)
         }
@@ -198,11 +249,12 @@ export class LidHandler {
      * Get phone number from @lid
      */
     async getPhoneNumberFromLid(lid: string): Promise<string | null> {
-        if (!this.isLidFormat(lid)) return lid
+        const normalizedLid = normalizeJidForStorage(lid)
+        if (!this.isLidFormat(normalizedLid)) return lid
         
-        // Check cache first
+        // Check cache first (use normalized JID for cache key)
         if (this.config.enableCache) {
-            const cached = this.cache.get<string>(`lid:${this.instanceId}:${lid}`)
+            const cached = this.cache.get<string>(`lid:${this.instanceId}:${normalizedLid}`)
             if (cached) return cached
         }
         
@@ -215,13 +267,13 @@ export class LidHandler {
         try {
             const mapping = await this.lidMappingsCollection.findOne({
                 instanceId: this.instanceId,
-                lid
+                lid: normalizedLid
             })
             
             if (mapping) {
                 // Update cache
                 if (this.config.enableCache) {
-                    this.cache.set(`lid:${this.instanceId}:${lid}`, mapping.phoneNumber)
+                    this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, mapping.phoneNumber)
                 }
                 
                 // Update lastSeen
@@ -243,11 +295,12 @@ export class LidHandler {
      * Get @lid from phone number (reverse lookup)
      */
     async getLidFromPhoneNumber(phoneNumber: string): Promise<string | null> {
-        if (this.isLidFormat(phoneNumber)) return phoneNumber
+        const normalizedPhone = normalizeJidForStorage(phoneNumber)
+        if (this.isLidFormat(normalizedPhone)) return normalizedPhone
         
         // Check cache first
         if (this.config.enableCache) {
-            const cached = this.cache.get<string>(`phone:${this.instanceId}:${phoneNumber}`)
+            const cached = this.cache.get<string>(`phone:${this.instanceId}:${normalizedPhone}`)
             if (cached) return cached
         }
         
@@ -260,13 +313,13 @@ export class LidHandler {
         try {
             const mapping = await this.lidMappingsCollection.findOne({
                 instanceId: this.instanceId,
-                phoneNumber
+                phoneNumber: normalizedPhone
             })
             
             if (mapping) {
                 // Update cache
                 if (this.config.enableCache) {
-                    this.cache.set(`phone:${this.instanceId}:${phoneNumber}`, mapping.lid)
+                    this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, mapping.lid)
                 }
                 
                 return mapping.lid
@@ -294,6 +347,88 @@ export class LidHandler {
     }
 
     /**
+     * Store a discovered LID-phone mapping from JID mismatch
+     * This is called when we find a message with mismatched JIDs that form a LID-phone pair
+     */
+    async storeDiscoveredMapping(jid1: string, jid2: string): Promise<boolean> {
+        const pair = extractLidPhonePair(jid1, jid2)
+        if (!pair) return false
+        
+        console.log(`[LidHandler] Discovered mapping from JID mismatch: ${pair.lid} <-> ${pair.phoneNumber}`)
+        await this.storeLidMapping(pair.lid, pair.phoneNumber)
+        return true
+    }
+
+    /**
+     * Discover phone number from sent messages (fromMe: true) with LID remoteJid
+     * Searches for received messages where senderLid matches the LID
+     */
+    async discoverPhoneFromSentMessage(lid: string): Promise<string | null> {
+        if (!this.messagesCollection) {
+            console.warn('[LidHandler] Messages collection not available for reverse lookup')
+            return null
+        }
+        
+        const normalizedLid = normalizeJidForStorage(lid)
+        console.log(`[LidHandler] Searching for phone number from sent message with LID: ${normalizedLid}`)
+        
+        try {
+            // Search for messages where:
+            // 1. fromMe is false (received messages)
+            // 2. senderLid matches our LID
+            const receivedMessage = await this.messagesCollection.findOne({
+                instanceId: this.instanceId,
+                'key.fromMe': false,
+                $or: [
+                    { 'key.senderLid': normalizedLid },
+                    { 'key.senderLid': lid } // Try original format too
+                ]
+            })
+            
+            if (receivedMessage) {
+                // Extract phone number from senderPn or remoteJid
+                let phoneNumber: string | null = null
+                
+                // First try senderPn
+                if (receivedMessage.key?.senderPn && !this.isLidFormat(receivedMessage.key.senderPn)) {
+                    phoneNumber = receivedMessage.key.senderPn
+                    console.log(`[LidHandler] Found phone number in senderPn: ${phoneNumber}`)
+                }
+                // Then try remoteJid if it's not a LID
+                else if (receivedMessage.key?.remoteJid && !this.isLidFormat(receivedMessage.key.remoteJid)) {
+                    phoneNumber = receivedMessage.key.remoteJid
+                    console.log(`[LidHandler] Found phone number in remoteJid: ${phoneNumber}`)
+                }
+                // Also check participant field
+                else if (receivedMessage.key?.participant && !this.isLidFormat(receivedMessage.key.participant)) {
+                    phoneNumber = receivedMessage.key.participant
+                    console.log(`[LidHandler] Found phone number in participant: ${phoneNumber}`)
+                }
+                
+                if (phoneNumber && isPhoneNumberFormat(phoneNumber)) {
+                    // Store the discovered mapping
+                    console.log(`[LidHandler] Discovered phone number ${phoneNumber} for LID ${normalizedLid} via reverse lookup`)
+                    await this.storeLidMapping(normalizedLid, phoneNumber)
+                    return phoneNumber
+                }
+            } else {
+                console.log(`[LidHandler] No received messages found with senderLid: ${normalizedLid}`)
+            }
+        } catch (error) {
+            console.error('[LidHandler] Error during reverse lookup:', error)
+        }
+        
+        return null
+    }
+
+    /**
+     * Check if two JIDs are equivalent (same JID with different formats)
+     */
+    areJidsEquivalent(jid1: string, jid2: string): boolean {
+        return areJidsEquivalent(jid1, jid2)
+    }
+
+    /**
      * Process a message and extract/store LID mappings
      * Returns the normalized JID (phone number) if available
      */
@@ -303,6 +438,7 @@ export class LidHandler {
             lid?: string
             phoneNumber?: string
             mappingStored?: boolean
+            needsReverseLookup?: boolean
             debug?: string[]
         }
     }> {
@@ -312,8 +448,30 @@ export class LidHandler {
         
         console.log(`[LidHandler] Processing message ${message.key?.id}: ${JSON.stringify(lidInfo)}`)
         
+        // Handle fromMe messages with LID that need reverse lookup
+        if (lidInfo.needsReverseLookup && lidInfo.lid) {
+            console.log(`[LidHandler] Performing reverse lookup for sent message with LID: ${lidInfo.lid}`)
+            const discoveredPhone = await this.discoverPhoneFromSentMessage(lidInfo.lid)
+            
+            if (discoveredPhone) {
+                console.log(`[LidHandler] Reverse lookup successful: ${lidInfo.lid} -> ${discoveredPhone}`)
+                lidInfo.phoneNumber = discoveredPhone
+                normalizedJid = discoveredPhone
+                mappingStored = true // Mapping was stored during discovery
+            } else {
+                // Try existing mapping as fallback
+                const existingPhone = await this.getPhoneNumberFromLid(lidInfo.lid)
+                if (existingPhone) {
+                    console.log(`[LidHandler] Using existing mapping: ${lidInfo.lid} -> ${existingPhone}`)
+                    normalizedJid = existingPhone
+                    lidInfo.phoneNumber = existingPhone
+                } else {
+                    console.log(`[LidHandler] No phone number found for sent message LID: ${lidInfo.lid}`)
+                }
+            }
+        }
         // If we have both LID and phone number, store the mapping
-        if (lidInfo.lid && lidInfo.phoneNumber) {
+        else if (lidInfo.lid && lidInfo.phoneNumber) {
             console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
             await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber)
             mappingStored = true

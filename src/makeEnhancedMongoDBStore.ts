@@ -36,6 +36,7 @@ import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
 import { LidHandler } from './utils/lidHandler'
+import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -1492,10 +1493,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             'key.id': validId
                         })
                         
-                        // Verify the jid matches if we found something
+                        // Check if the JID mismatch is acceptable
                         if (message && message.key?.remoteJid !== validJid) {
-                            log(`Found message but JID mismatch: ${message.key?.remoteJid} !== ${validJid}`)
-                            message = null
+                            const foundJid = message.key?.remoteJid || message.jid
+                            log(`Found message but JID mismatch: ${foundJid} !== ${validJid}`)
+                            
+                            // Check if JIDs are equivalent (same JID with different format)
+                            if (areJidsEquivalent(foundJid, validJid)) {
+                                log(`JIDs are equivalent, accepting message`)
+                            }
+                            // Check if this is a LID-phone pair
+                            else if (isLidAndPhonePair(foundJid, validJid)) {
+                                log(`Discovered LID-phone pair: ${foundJid} <-> ${validJid}`)
+                                // Store the discovered mapping if we have a LID handler
+                                if (lidHandler) {
+                                    await lidHandler.storeDiscoveredMapping(foundJid, validJid)
+                                }
+                            }
+                            // Otherwise, reject the message
+                            else {
+                                log(`JIDs are not related, rejecting message`)
+                                message = null
+                            }
                         }
                     }
                     

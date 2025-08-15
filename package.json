@@ -1,6 +1,6 @@
 {
   "name": "@baileys/mongodb-store",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "MongoDB store implementation for WhiskeySockets Baileys WhatsApp Web API with multi-instance support and TTL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
