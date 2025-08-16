@@ -2257,37 +2257,96 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {
-                            // Process LID if handler is available
+                            // Enhanced LID handling with complete pattern support
                             if (lidHandler) {
-                                const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
+                                const isFromMe = msg.key.fromMe || false
+                                const remoteJid = msg.key.remoteJid
+                                const senderLid = (msg.key as any)?.senderLid
+                                const senderPn = (msg.key as any)?.senderPn
                                 
-                                // Update the message's remoteJid to use normalized (phone number) format
-                                if (normalizedJid && normalizedJid !== msg.key.remoteJid) {
-                                    log(`[LID Handler] Normalizing JID: ${msg.key.remoteJid} -> ${normalizedJid}`)
-                                    msg.key.remoteJid = normalizedJid
-                                    jid = normalizedJid
+                                // Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
+                                if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
+                                    log(`[LID] Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
+                                    log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
+                                    
+                                    // Store the mapping
+                                    await lidHandler.storeLidMapping(remoteJid, senderPn)
+                                    
+                                    // Update message to use phone number
+                                    msg.key.remoteJid = senderPn
+                                    jid = senderPn
+                                    
+                                    // Update existing messages with this LID
+                                    await lidHandler.updateExistingMessages(remoteJid, senderPn)
                                 }
-                                
-                                // Store LID info in the message for reference
-                                if (lidInfo.lid || lidInfo.phoneNumber) {
-                                    (msg as any).lidMapping = {
-                                        lid: lidInfo.lid,
-                                        phoneNumber: lidInfo.phoneNumber,
-                                        originalJid: msg.key.remoteJid,
-                                        mappingStored: lidInfo.mappingStored
+                                // Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
+                                else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] Pattern 2: FromMe=true, LID remoteJid (need reverse lookup)`)
+                                    
+                                    // First check if we already have a mapping
+                                    let phoneNumber = await lidHandler.getPhoneNumberFromLid(remoteJid)
+                                    
+                                    // If no mapping, try reverse lookup from previous messages
+                                    if (!phoneNumber) {
+                                        log(`[LID] No cached mapping, attempting reverse lookup for ${remoteJid}`)
+                                        phoneNumber = await lidHandler.reversePhoneLookupFromMessages(remoteJid)
+                                        
+                                        if (phoneNumber) {
+                                            log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
+                                            await lidHandler.storeLidMapping(remoteJid, phoneNumber)
+                                            await lidHandler.updateExistingMessages(remoteJid, phoneNumber)
+                                        }
+                                    }
+                                    
+                                    // Update message if we found the phone number
+                                    if (phoneNumber) {
+                                        log(`[LID] Normalizing fromMe message: ${remoteJid} -> ${phoneNumber}`)
+                                        msg.key.remoteJid = phoneNumber
+                                        jid = phoneNumber
+                                    } else {
+                                        log(`[LID] Warning: Could not resolve LID ${remoteJid} for fromMe message`)
+                                    }
+                                }
+                                // Pattern 3: FromMe=false with only senderLid (no phone yet)
+                                else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && !senderPn) {
+                                    log(`[LID] Pattern 3: FromMe=false, only senderLid (waiting for phone discovery)`)
+                                    
+                                    // Check if we have a cached mapping
+                                    const phoneNumber = await lidHandler.getPhoneNumberFromLid(senderLid)
+                                    if (phoneNumber && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                        log(`[LID] Using cached mapping: ${remoteJid} -> ${phoneNumber}`)
+                                        msg.key.remoteJid = phoneNumber
+                                        jid = phoneNumber
+                                    }
+                                }
+                                // Pattern 4: Standard normalization for any remaining LID formats
+                                else if (remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                    const phoneNumber = await lidHandler.getPhoneNumberFromLid(remoteJid)
+                                    if (phoneNumber) {
+                                        log(`[LID] Standard normalization: ${remoteJid} -> ${phoneNumber}`)
+                                        msg.key.remoteJid = phoneNumber
+                                        jid = phoneNumber
                                     }
                                 }
                                 
-                                // Log LID mapping if discovered
-                                if (lidInfo.mappingStored) {
-                                    log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                                // Store debug info in message
+                                if ((remoteJid && lidHandler.isLidFormat(remoteJid)) || senderLid || (senderPn && lidHandler.isLidFormat(senderPn))) {
+                                    (msg as any).lidDebug = {
+                                        originalRemoteJid: remoteJid,
+                                        senderLid,
+                                        senderPn,
+                                        fromMe: isFromMe,
+                                        normalized: msg.key.remoteJid !== remoteJid,
+                                        timestamp: new Date().toISOString()
+                                    }
                                 }
                             }
                             
                             // Resolve quoted message before storing if present
                             if (msg.message?.extendedTextMessage?.contextInfo?.stanzaId && 
                                 (!msg.message.extendedTextMessage.contextInfo.quotedMessage || 
-                                 Object.keys(msg.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
+                                 Object.keys(msg.message.extendedTextMessage.contextInfo.quotedMessage).length === 0) &&
+                                jid) {
                                 
                                 const quotedMsg = await resolveQuotedMessage(msg, jid, collections, instanceId, log)
                                 if (quotedMsg && quotedMsg.message) {
@@ -2308,7 +2367,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             }
                             
                             // Store the message with normalized JID
-                            await storeImpl.upsertMessage(jid, msg)
+                            if (jid) {
+                                await storeImpl.upsertMessage(jid, msg)
+                            } else {
+                                log(`[Warning] Skipping message storage - no valid JID for message ${msg.key?.id}`)
+                            }
                             
                             // Handle media download if configured
                             if (config.media?.enabled) {
@@ -2354,7 +2417,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     const updateResult = await collections.messages.updateOne(
                                         { 
                                             instanceId, 
-                                            jid, 
+                                            jid: jid || undefined, 
                                             'key.id': msg.key.id 
                                         },
                                         { 

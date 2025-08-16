@@ -111,7 +111,7 @@ export class LidHandler {
     /**
      * Check if a JID is in @lid format (handles :XX suffixes)
      */
-    isLidFormat(jid: string | undefined | null): boolean {
+    isLidFormat(jid: string | undefined | null): jid is string {
         return isLidFormatUtil(jid)
     }
 
@@ -460,6 +460,83 @@ export class LidHandler {
      */
     areJidsEquivalent(jid1: string, jid2: string): boolean {
         return areJidsEquivalent(jid1, jid2)
+    }
+
+    /**
+     * Reverse lookup phone number from messages for a given LID
+     * Used when fromMe=true messages have LID in remoteJid
+     */
+    async reversePhoneLookupFromMessages(lid: string): Promise<string | null> {
+        if (!this.messagesCollection) {
+            console.warn('[LidHandler] Messages collection not available for reverse lookup')
+            return null
+        }
+        
+        const normalizedLid = normalizeJidForStorage(lid)
+        console.log(`[LidHandler] Attempting reverse lookup for LID: ${normalizedLid}`)
+        
+        try {
+            // Look for messages where this LID appears with a phone number
+            const message = await this.messagesCollection.findOne({
+                instanceId: this.instanceId,
+                $or: [
+                    // Case 1: LID in senderLid with phone in senderPn
+                    { 
+                        'key.senderLid': normalizedLid,
+                        'key.senderPn': { $exists: true, $not: { $regex: '@lid$' } }
+                    },
+                    // Case 2: LID in remoteJid with phone in senderPn (fromMe=false)
+                    {
+                        'key.remoteJid': normalizedLid,
+                        'key.fromMe': false,
+                        'key.senderPn': { $exists: true, $not: { $regex: '@lid$' } }
+                    }
+                ]
+            })
+            
+            if (message?.key?.senderPn && !this.isLidFormat(message.key.senderPn)) {
+                console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${message.key.senderPn}`)
+                return message.key.senderPn
+            }
+        } catch (error) {
+            console.error('[LidHandler] Error during reverse lookup:', error)
+        }
+        
+        return null
+    }
+
+    /**
+     * Update existing messages that have a LID to use the phone number
+     */
+    async updateExistingMessages(lid: string, phoneNumber: string): Promise<void> {
+        if (!this.messagesCollection) {
+            console.warn('[LidHandler] Messages collection not available for updates')
+            return
+        }
+        
+        try {
+            // Update messages where remoteJid is the LID
+            const result = await this.messagesCollection.updateMany(
+                {
+                    instanceId: this.instanceId,
+                    'key.remoteJid': lid
+                },
+                {
+                    $set: {
+                        'key.remoteJid': phoneNumber,
+                        jid: phoneNumber,
+                        'lidMapping.resolved': true,
+                        'lidMapping.resolvedAt': new Date()
+                    }
+                }
+            )
+            
+            if (result.modifiedCount > 0) {
+                console.log(`[LidHandler] Updated ${result.modifiedCount} messages from LID ${lid} to ${phoneNumber}`)
+            }
+        } catch (error) {
+            console.error('[LidHandler] Error updating existing messages:', error)
+        }
     }
 
     /**
