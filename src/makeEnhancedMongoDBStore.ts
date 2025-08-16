@@ -689,8 +689,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const { type, message, messageId, update, deleteIds, jid } = job.data
                 
                 if (type === 'upsert' && message) {
-                    // Note: LID processing is now done in upsertMessage before queuing
-                    // The message and jid here are already normalized
+                    // Note: JID normalization is done in upsertMessage before queuing
+                    // The jid here is already normalized through LID handler
                     
                     // Resolve quoted message if present
                     if (message.message?.extendedTextMessage?.contextInfo?.stanzaId && 
@@ -1284,6 +1284,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         async upsertChats(...chats: Chat[]): Promise<void> {
             if (chats.length === 0) return
             
+            // Normalize chat IDs through LID handler if available
+            const normalizedChats = await Promise.all(chats.map(async (chat) => {
+                if (lidHandler && chat.id) {
+                    const normalizedId = await lidHandler.normalizeJid(chat.id) || chat.id
+                    return { ...chat, id: normalizedId }
+                }
+                return chat
+            }))
+            
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.CHATS)) {
                 try {
@@ -1292,7 +1301,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         'upsert',
                         {
                             type: 'upsert',
-                            chats,
+                            chats: normalizedChats,
                             instanceId,
                             timestamp: Date.now()
                         },
@@ -1305,7 +1314,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct write
-            const bulkOps = chats.map(chat => ({
+            const bulkOps = normalizedChats.map(chat => ({
                 replaceOne: {
                     filter: { instanceId, id: chat.id },
                     replacement: { ...chat, instanceId, updatedAt: new Date() },
@@ -1317,6 +1326,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async updateChat(jid: string, update: Partial<Chat>): Promise<boolean> {
+            // Normalize JID through LID handler if available
+            let normalizedJid = jid
+            if (lidHandler) {
+                normalizedJid = await lidHandler.normalizeJid(jid) || jid
+            }
+            
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.CHATS)) {
                 try {
@@ -1325,7 +1340,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         'update',
                         {
                             type: 'update',
-                            chatId: jid,
+                            chatId: normalizedJid,
                             update,
                             instanceId,
                             timestamp: Date.now()
@@ -1340,7 +1355,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Fallback to direct update
             const result = await collections.chats.updateOne(
-                { instanceId, id: jid },
+                { instanceId, id: normalizedJid },
                 { $set: { ...update, updatedAt: new Date() } }
             )
             
@@ -1348,6 +1363,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async deleteChats(jids: string[]): Promise<void> {
+            // Normalize JIDs through LID handler if available
+            const normalizedJids = await Promise.all(jids.map(async (jid) => {
+                if (lidHandler) {
+                    return await lidHandler.normalizeJid(jid) || jid
+                }
+                return jid
+            }))
+            
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.CHATS)) {
                 try {
@@ -1356,7 +1379,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         'delete',
                         {
                             type: 'delete',
-                            deleteIds: jids,
+                            deleteIds: normalizedJids,
                             instanceId,
                             timestamp: Date.now()
                         },
@@ -1371,7 +1394,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Fallback to direct delete
             await collections.chats.deleteMany({
                 instanceId,
-                id: { $in: jids }
+                id: { $in: normalizedJids }
             })
         },
 
@@ -1510,6 +1533,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         log(`Updating existing messages from LID ${lidJid} to phone ${phoneJid}`)
                                         
                                         // Update messages that have the LID as remoteJid
+                                        // Only update remoteJid and jid fields, leave senderPn and senderLid as-is
                                         try {
                                             const updateResult = await collections.messages.updateMany(
                                                 {
@@ -1593,40 +1617,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // This prevents issues with Baileys' object references and multiple event emissions
                 const clonedMessage = JSON.parse(JSON.stringify(message))
                 
-                let validJid = safeValidateJID(jid)
-                
-                // Process LID if handler is available
-                if (lidHandler && clonedMessage.key?.remoteJid) {
-                    const { normalizedJid, lidInfo } = await lidHandler.processMessage(clonedMessage)
-                    
-                    // Store original JID for reference before updating
-                    const originalRemoteJid = clonedMessage.key.remoteJid
-                    
-                    // Use normalized JID (phone number) for storage
-                    if (normalizedJid !== jid) {
-                        validJid = safeValidateJID(normalizedJid)
-                    }
-                    
-                    // Update the cloned message's remoteJid to use the normalized phone number
-                    if (normalizedJid !== clonedMessage.key.remoteJid) {
-                        clonedMessage.key.remoteJid = normalizedJid
-                        log(`[upsertMessage LID Handler] Updated remoteJid from ${originalRemoteJid} to ${normalizedJid}`)
-                    }
-                    
-                    // Store LID info in the cloned message for reference
-                    if (lidInfo.lid || lidInfo.phoneNumber) {
-                        (clonedMessage as any).lidMapping = {
-                            lid: lidInfo.lid,
-                            phoneNumber: lidInfo.phoneNumber,
-                            originalJid: originalRemoteJid
-                        }
-                    }
-                    
-                    // Log LID mapping if discovered
-                    if (lidInfo.mappingStored) {
-                        log(`[upsertMessage LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
-                    }
+                // Normalize JID through LID handler if available
+                // Note: Message object LID processing is done in the messages.upsert event handler
+                let normalizedJid = jid
+                if (lidHandler) {
+                    normalizedJid = await lidHandler.normalizeJid(jid) || jid
                 }
+                const validJid = safeValidateJID(normalizedJid)
                 
                 // Check if this is an Official API message
                 const isOfficialAPI = (clonedMessage as any).official_api === true
@@ -1784,7 +1781,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async updateMessage(jid: string, id: string, update: Partial<proto.IWebMessageInfo>): Promise<boolean> {
-            const cacheKey = `msg_${instanceId}_${jid}_${id}`
+            // Normalize JID through LID handler if available
+            let normalizedJid = jid
+            if (lidHandler) {
+                normalizedJid = await lidHandler.normalizeJid(jid) || jid
+            }
+            
+            const cacheKey = `msg_${instanceId}_${normalizedJid}_${id}`
             binaryConversionCache.del(cacheKey)
             
             // Use Bull queue if available
@@ -1795,7 +1798,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         'update',
                         {
                             type: 'update',
-                            jid,
+                            jid: normalizedJid,
                             messageId: id,
                             update: convertBinaryToBuffer(update),
                             instanceId,
@@ -1812,7 +1815,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Fallback to direct update - preserve quoted message structure
             const existingMsg = await collections.messages.findOne({
                 instanceId,
-                jid,
+                jid: normalizedJid,
                 'key.id': id
             }) as any
             
@@ -1845,7 +1848,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             const result = await collections.messages.updateOne(
                 {
                     instanceId,
-                    jid,
+                    jid: normalizedJid,
                     'key.id': id
                 },
                 {
@@ -1858,7 +1861,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         async deleteMessages(jid: string, ids?: string[]): Promise<void> {
             try {
-                const validJid = safeValidateJID(jid)
+                // Normalize JID through LID handler if available
+                let normalizedJid = jid
+                if (lidHandler) {
+                    normalizedJid = await lidHandler.normalizeJid(jid) || jid
+                }
+                const validJid = safeValidateJID(normalizedJid)
                 
                 // For deletion, use safe validation for message IDs
                 const validIds = ids?.map(id => safeValidateMessageId(id, false))
@@ -2244,11 +2252,38 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
                 
                 for (const msg of messages) {
-                    const jid = msg.key.remoteJid
+                    let jid = msg.key.remoteJid
                     if (!jid) continue
                     
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {
+                            // Process LID if handler is available
+                            if (lidHandler) {
+                                const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
+                                
+                                // Update the message's remoteJid to use normalized (phone number) format
+                                if (normalizedJid && normalizedJid !== msg.key.remoteJid) {
+                                    log(`[LID Handler] Normalizing JID: ${msg.key.remoteJid} -> ${normalizedJid}`)
+                                    msg.key.remoteJid = normalizedJid
+                                    jid = normalizedJid
+                                }
+                                
+                                // Store LID info in the message for reference
+                                if (lidInfo.lid || lidInfo.phoneNumber) {
+                                    (msg as any).lidMapping = {
+                                        lid: lidInfo.lid,
+                                        phoneNumber: lidInfo.phoneNumber,
+                                        originalJid: msg.key.remoteJid,
+                                        mappingStored: lidInfo.mappingStored
+                                    }
+                                }
+                                
+                                // Log LID mapping if discovered
+                                if (lidInfo.mappingStored) {
+                                    log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                                }
+                            }
+                            
                             // Resolve quoted message before storing if present
                             if (msg.message?.extendedTextMessage?.contextInfo?.stanzaId && 
                                 (!msg.message.extendedTextMessage.contextInfo.quotedMessage || 
@@ -2272,7 +2307,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                             }
                             
-                            // Store the message first
+                            // Store the message with normalized JID
                             await storeImpl.upsertMessage(jid, msg)
                             
                             // Handle media download if configured
@@ -2365,8 +2400,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 if (enableMetrics) updateEventMetrics('messages.update', 'received')
                 
                 for (const update of updates) {
-                    const jid = update.key.remoteJid
+                    let jid = update.key.remoteJid
                     if (!jid) continue
+                    
+                    // Normalize JID through LID handler if available
+                    if (lidHandler) {
+                        jid = await lidHandler.normalizeJid(jid) || jid
+                    }
                     
                     if (await shouldStoreEvent('messages.update', update)) {
                         try {
@@ -2424,8 +2464,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 if (enableMetrics) updateEventMetrics('messages.delete', 'received')
                 
                 if ('keys' in item) {
-                    const jid = item.keys[0].remoteJid
+                    let jid = item.keys[0].remoteJid
                     if (!jid) return
+                    
+                    // Normalize JID through LID handler if available
+                    if (lidHandler) {
+                        jid = await lidHandler.normalizeJid(jid) || jid
+                    }
                     
                     const ids = item.keys.map(k => k.id).filter(id => id) as string[]
                     if (await shouldStoreEvent('messages.delete', item)) {
@@ -2440,9 +2485,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 } else if ('jid' in item && item.jid) {
                     // Delete all messages for JID
+                    let jid = item.jid
+                    
+                    // Normalize JID through LID handler if available
+                    if (lidHandler) {
+                        jid = await lidHandler.normalizeJid(jid) || jid
+                    }
+                    
                     if (await shouldStoreEvent('messages.delete', item)) {
                         try {
-                            await storeImpl.deleteMessages(item.jid)
+                            await storeImpl.deleteMessages(jid)
                             if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
                             if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
                         } catch (error) {
@@ -2681,8 +2733,31 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         if (newMessages?.length) {
                             // Process messages in batches
                             for (const msg of newMessages) {
-                                const jid = msg.key.remoteJid
+                                let jid = msg.key.remoteJid
                                 if (!jid) continue
+                                
+                                // Process LID if handler is available
+                                if (lidHandler) {
+                                    const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
+                                    
+                                    // Update the message's remoteJid to use normalized (phone number) format
+                                    if (normalizedJid && normalizedJid !== msg.key.remoteJid) {
+                                        log(`[History LID Handler] Normalizing JID: ${msg.key.remoteJid} -> ${normalizedJid}`)
+                                        msg.key.remoteJid = normalizedJid
+                                        jid = normalizedJid
+                                    }
+                                    
+                                    // Store LID info in the message for reference
+                                    if (lidInfo.lid || lidInfo.phoneNumber) {
+                                        (msg as any).lidMapping = {
+                                            lid: lidInfo.lid,
+                                            phoneNumber: lidInfo.phoneNumber,
+                                            originalJid: msg.key.remoteJid,
+                                            mappingStored: lidInfo.mappingStored
+                                        }
+                                    }
+                                }
+                                
                                 await storeImpl.upsertMessage(jid, msg)
                             }
                             log(`[${instanceId}] Synced ${newMessages.length} messages from history`)
@@ -2757,8 +2832,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 for (const { key, receipt } of updates) {
                     if (await shouldStoreEvent('message-receipt.update', { key, receipt })) {
                         try {
-                            const jid = key.remoteJid
+                            let jid = key.remoteJid
                             if (!jid) continue
+                            
+                            // Normalize JID through LID handler if available
+                            if (lidHandler) {
+                                jid = await lidHandler.normalizeJid(jid) || jid
+                            }
                             
                             const msg = await storeImpl.getMessage(jid, key.id!)
                             if (msg) {
@@ -2782,8 +2862,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 for (const { key, reaction } of reactions) {
                     if (await shouldStoreEvent('messages.reaction', { key, reaction })) {
                         try {
-                            const jid = key.remoteJid
+                            let jid = key.remoteJid
                             if (!jid) continue
+                            
+                            // Normalize JID through LID handler if available
+                            if (lidHandler) {
+                                jid = await lidHandler.normalizeJid(jid) || jid
+                            }
                             
                             const msg = await storeImpl.getMessage(jid, key.id!)
                             if (msg) {

@@ -31,7 +31,10 @@
       "Bash(cd:*)",
       "Bash(cd:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(grep:*)",
+      "Bash(sed:*)",
+      "mcp__ide__getDiagnostics"
     ],
     "deny": []
   }
