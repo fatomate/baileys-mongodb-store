@@ -714,6 +714,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
                     
+                    // Check if this is a MESSAGE_EDIT
+                    let preservedTimestamp = null
+                    if (message.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && message.message.protocolMessage.key) {
+                        const editTargetKey = message.message.protocolMessage.key
+                        log(`🔄 [Bull Queue] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
+                        
+                        // Fetch the original message to preserve its timestamp
+                        const originalMessage = await collections.messages.findOne({
+                            instanceId,
+                            jid,
+                            'key.id': editTargetKey.id
+                        })
+                        
+                        if (originalMessage && originalMessage.messageTimestamp) {
+                            preservedTimestamp = originalMessage.messageTimestamp
+                            log(`⏰ [Bull Queue] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
+                        }
+                    }
+                    
                     await collections.messages.replaceOne(
                         {
                             instanceId,
@@ -722,6 +741,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         },
                         {
                             ...message,
+                            // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
+                            ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
                             instanceId,
                             jid,
                             ...(pollVoteDecrypted && { pollVoteDecrypted }),
@@ -1682,6 +1703,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
+            // Check if this is a MESSAGE_EDIT
+            let preservedTimestamp = null
+            if (clonedMessage.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && clonedMessage.message.protocolMessage.key) {
+                const editTargetKey = clonedMessage.message.protocolMessage.key
+                log(`🔄 [Direct] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
+                
+                // Fetch the original message to preserve its timestamp
+                const originalMessage = await collections.messages.findOne({
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
+                    'key.id': editTargetKey.id
+                })
+                
+                if (originalMessage && originalMessage.messageTimestamp) {
+                    preservedTimestamp = originalMessage.messageTimestamp
+                    log(`⏰ [Direct] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
+                }
+            }
+            
             // Fallback to direct database operation
             await collections.messages.replaceOne(
                 {
@@ -1691,6 +1731,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 },
                 {
                     ...clonedMessage,
+                    // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
+                    ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
                     instanceId: validatedInstanceId,
                     jid: validJid,
                     ...(pollVoteDecrypted && { pollVoteDecrypted }),
