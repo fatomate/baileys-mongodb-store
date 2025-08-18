@@ -802,52 +802,82 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
                 } else if (type === 'update' && messageId && update) {
-                    // For message updates, preserve existing quoted message structure
+                    // For message updates, preserve existing quoted message structure AND messageTimestamp for edits
                     const existingMsg = await collections.messages.findOne({
                         instanceId,
                         jid,
                         'key.id': messageId
-                    })
+                    }) as any
                     
-                    if (existingMsg && existingMsg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
-                        // Deep merge to preserve quoted message
-                        const mergedMessage = {
-                            ...existingMsg.message,
-                            ...update.message
+                    if (existingMsg) {
+                        // Check if this is a MESSAGE_EDIT by looking for editedMessage field
+                        const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
+                        const originalTimestamp = existingMsg.messageTimestamp
+                        
+                        if (isMessageEdit) {
+                            log(`🔄 [Bull Queue Update] Detected MESSAGE_EDIT for ${messageId}`)
+                            log(`⏰ [Bull Queue Update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
                         }
                         
-                        // Ensure quoted message is preserved
-                        if (update.message?.extendedTextMessage && 
-                            existingMsg.message.extendedTextMessage.contextInfo?.quotedMessage &&
-                            mergedMessage.extendedTextMessage) {
-                            if (!mergedMessage.extendedTextMessage.contextInfo) {
-                                mergedMessage.extendedTextMessage.contextInfo = existingMsg.message.extendedTextMessage.contextInfo
-                            } else if (!mergedMessage.extendedTextMessage.contextInfo.quotedMessage) {
-                                mergedMessage.extendedTextMessage.contextInfo.quotedMessage = 
-                                    existingMsg.message.extendedTextMessage.contextInfo.quotedMessage
-                                mergedMessage.extendedTextMessage.contextInfo.stanzaId = 
-                                    existingMsg.message.extendedTextMessage.contextInfo.stanzaId
-                                mergedMessage.extendedTextMessage.contextInfo.participant = 
-                                    existingMsg.message.extendedTextMessage.contextInfo.participant
+                        // Prepare the update object, preserving original timestamp for edits
+                        const finalUpdate = { ...update }
+                        if (isMessageEdit && originalTimestamp) {
+                            finalUpdate.messageTimestamp = originalTimestamp
+                            log(`✅ [Bull Queue Update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                        }
+                        
+                        if (existingMsg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
+                            // Deep merge to preserve quoted message
+                            const mergedMessage = {
+                                ...existingMsg.message,
+                                ...update.message
                             }
-                        }
-                        
-                        await collections.messages.updateOne(
-                            {
-                                instanceId,
-                                jid,
-                                'key.id': messageId
-                            },
-                            {
-                                $set: { 
-                                    ...update,
-                                    message: mergedMessage,
-                                    updatedAt: new Date() 
+                            
+                            // Ensure quoted message is preserved
+                            if (update.message?.extendedTextMessage && 
+                                existingMsg.message.extendedTextMessage.contextInfo?.quotedMessage &&
+                                mergedMessage.extendedTextMessage) {
+                                if (!mergedMessage.extendedTextMessage.contextInfo) {
+                                    mergedMessage.extendedTextMessage.contextInfo = existingMsg.message.extendedTextMessage.contextInfo
+                                } else if (!mergedMessage.extendedTextMessage.contextInfo.quotedMessage) {
+                                    mergedMessage.extendedTextMessage.contextInfo.quotedMessage = 
+                                        existingMsg.message.extendedTextMessage.contextInfo.quotedMessage
+                                    mergedMessage.extendedTextMessage.contextInfo.stanzaId = 
+                                        existingMsg.message.extendedTextMessage.contextInfo.stanzaId
+                                    mergedMessage.extendedTextMessage.contextInfo.participant = 
+                                        existingMsg.message.extendedTextMessage.contextInfo.participant
                                 }
                             }
-                        )
+                            
+                            await collections.messages.updateOne(
+                                {
+                                    instanceId,
+                                    jid,
+                                    'key.id': messageId
+                                },
+                                {
+                                    $set: { 
+                                        ...finalUpdate,
+                                        message: mergedMessage,
+                                        updatedAt: new Date() 
+                                    }
+                                }
+                            )
+                        } else {
+                            // No existing quoted message, proceed with update
+                            await collections.messages.updateOne(
+                                {
+                                    instanceId,
+                                    jid,
+                                    'key.id': messageId
+                                },
+                                {
+                                    $set: { ...finalUpdate, updatedAt: new Date() }
+                                }
+                            )
+                        }
                     } else {
-                        // No existing quoted message, proceed with normal update
+                        // No existing message, just apply the update
                         await collections.messages.updateOne(
                             {
                                 instanceId,
@@ -1854,7 +1884,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
-            // Fallback to direct update - preserve quoted message structure
+            // Fallback to direct update - preserve quoted message structure AND messageTimestamp for edits
             const existingMsg = await collections.messages.findOne({
                 instanceId,
                 jid: normalizedJid,
@@ -1863,27 +1893,45 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             let finalUpdate = update
             
-            // If existing message has quoted message and update has message content, preserve quoted structure
-            if (existingMsg?.message?.extendedTextMessage?.contextInfo?.quotedMessage && 
-                update.message?.extendedTextMessage) {
+            if (existingMsg) {
+                // Check if this is a MESSAGE_EDIT by looking for editedMessage field
+                const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
+                const originalTimestamp = existingMsg.messageTimestamp
                 
-                const mergedMessage = {
-                    ...existingMsg.message,
-                    ...update.message
+                if (isMessageEdit) {
+                    log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
+                    log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
                 }
                 
-                // Preserve quoted message if not in update
-                if (!mergedMessage.extendedTextMessage.contextInfo || 
-                    !mergedMessage.extendedTextMessage.contextInfo.quotedMessage) {
-                    mergedMessage.extendedTextMessage.contextInfo = {
-                        ...existingMsg.message.extendedTextMessage.contextInfo,
-                        ...(mergedMessage.extendedTextMessage.contextInfo || {})
+                // Preserve original timestamp for edits
+                if (isMessageEdit && originalTimestamp) {
+                    finalUpdate = { ...update }
+                    finalUpdate.messageTimestamp = originalTimestamp
+                    log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                }
+                
+                // If existing message has quoted message and update has message content, preserve quoted structure
+                if (existingMsg.message?.extendedTextMessage?.contextInfo?.quotedMessage && 
+                    update.message?.extendedTextMessage) {
+                    
+                    const mergedMessage = {
+                        ...existingMsg.message,
+                        ...update.message
                     }
-                }
-                
-                finalUpdate = {
-                    ...update,
-                    message: mergedMessage
+                    
+                    // Preserve quoted message if not in update
+                    if (!mergedMessage.extendedTextMessage.contextInfo || 
+                        !mergedMessage.extendedTextMessage.contextInfo.quotedMessage) {
+                        mergedMessage.extendedTextMessage.contextInfo = {
+                            ...existingMsg.message.extendedTextMessage.contextInfo,
+                            ...(mergedMessage.extendedTextMessage.contextInfo || {})
+                        }
+                    }
+                    
+                    finalUpdate = {
+                        ...finalUpdate,
+                        message: mergedMessage
+                    }
                 }
             }
             
@@ -2520,6 +2568,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             const existingMessage = await storeImpl.getMessage(jid, update.key.id!)
                             
                             if (existingMessage) {
+                                // Check if this is a MESSAGE_EDIT by looking for editedMessage field
+                                const isMessageEdit = !!(update.update?.message?.editedMessage || (update.update as any)?.editedMessage)
+                                
+                                // Preserve original messageTimestamp for edits
+                                const originalTimestamp = existingMessage.messageTimestamp
+                                
+                                if (isMessageEdit) {
+                                    log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
+                                    log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                }
+                                
                                 // Deep merge the update with existing message to preserve quoted messages
                                 const mergedUpdate = {
                                     ...existingMessage,
@@ -2528,6 +2587,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         ...existingMessage.message,
                                         ...update.update?.message
                                     }
+                                }
+                                
+                                // CRITICAL: Preserve original messageTimestamp for MESSAGE_EDIT
+                                if (isMessageEdit && originalTimestamp) {
+                                    mergedUpdate.messageTimestamp = originalTimestamp
+                                    log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
                                 }
                                 
                                 // Preserve quoted message structure if it exists
@@ -2548,7 +2613,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 await storeImpl.updateMessage(jid, update.key.id!, mergedUpdate)
-                                log(`✅ Updated message ${update.key.id} preserving quoted message structure`)
+                                log(`✅ Updated message ${update.key.id} preserving quoted message structure${isMessageEdit ? ' and original timestamp' : ''}`)
                             } else {
                                 // If no existing message found, just apply the update
                                 await storeImpl.updateMessage(jid, update.key.id!, update.update!)
