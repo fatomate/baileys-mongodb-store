@@ -2421,7 +2421,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     let removedCount = 0
                     for (const conflictingJob of conflictingJobs) {
                         // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
-                        const jobAge = Date.now() - (conflictingJob.opts?.timestamp || conflictingJob.processedOn || Date.now())
+                        // Fix: Get timestamp from job.data.timestamp, not job.opts.timestamp
+                        const jobTimestamp = (conflictingJob.data as LabelAssociationJob)?.timestamp || 
+                                           conflictingJob.processedOn || 
+                                           conflictingJob.timestamp || 
+                                           0
+                        const jobAge = jobTimestamp > 0 ? Date.now() - jobTimestamp : Number.MAX_SAFE_INTEGER
                         if (jobAge < 10000) { // 10 seconds
                             await conflictingJob.remove()
                             removedCount++
@@ -2522,7 +2527,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     let removedCount = 0
                     for (const conflictingJob of conflictingJobs) {
                         // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
-                        const jobAge = Date.now() - (conflictingJob.opts?.timestamp || conflictingJob.processedOn || Date.now())
+                        // Fix: Get timestamp from job.data.timestamp, not job.opts.timestamp
+                        const jobTimestamp = (conflictingJob.data as LabelAssociationJob)?.timestamp || 
+                                           conflictingJob.processedOn || 
+                                           conflictingJob.timestamp || 
+                                           0
+                        const jobAge = jobTimestamp > 0 ? Date.now() - jobTimestamp : Number.MAX_SAFE_INTEGER
                         if (jobAge < 10000) { // 10 seconds
                             await conflictingJob.remove()
                             removedCount++
@@ -3383,14 +3393,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             })
             
+            // Note: Labels and label associations are excluded from clearAll()
+            // They should persist across history syncs to maintain label integrity
             await Promise.all([
                 collections.chats.deleteMany({ instanceId }),
                 collections.contacts.deleteMany({ instanceId }),
                 collections.messages.deleteMany({ instanceId }),
                 collections.groupMetadata.deleteMany({ instanceId }),
-                collections.presences.deleteMany({ instanceId }),
-                collections.labels.deleteMany({ instanceId }),
-                collections.labelAssociations.deleteMany({ instanceId })
+                collections.presences.deleteMany({ instanceId })
+                // Removed: collections.labels.deleteMany({ instanceId })
+                // Removed: collections.labelAssociations.deleteMany({ instanceId })
             ])
         },
 
