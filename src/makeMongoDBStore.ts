@@ -2237,6 +2237,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
                     const conflictingJobs = existingJobs.filter(job => {
                         const jobData = job.data as LabelAssociationJob
+                        // Skip jobs without association data (like cleanup jobs)
+                        if (!jobData || !jobData.association) return false
                         const jobMessageId = 'messageId' in jobData.association ? jobData.association.messageId : undefined
                         
                         // Only consider it conflicting if:
