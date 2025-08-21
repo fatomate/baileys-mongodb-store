@@ -553,6 +553,11 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             { upsert: true }
                         )
                         
+                        // Validate operation succeeded
+                        if (result.upsertedCount === 0 && result.modifiedCount === 0) {
+                            throw new Error(`[Label Queue] Failed to upsert label association for ${associationId} - no documents affected`)
+                        }
+                        
                         log(`[Label Queue] ✅ Completed upsert for ${associationId} - upserted: ${result.upsertedCount}, modified: ${result.modifiedCount}`)
                         
                         // Show what was actually stored
@@ -560,7 +565,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             log(`[Label Queue] New document created with ID: ${result.upsertedId}`)
                         }
                         
-                        // Track the add operation for automation
+                        // Track the add operation for automation AFTER successful DB operation
                         await trackLabelOperation('add', association)
                     } else if (type === 'delete') {
                         // Include type field for proper matching
@@ -584,11 +589,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         
                         if (result.deletedCount === 0) {
                             logWarn(`[Label Queue] ⚠️ No document found to delete for ${associationId}`)
+                            // For delete operations, warn but don't fail since the association might already be deleted
                         } else {
                             log(`[Label Queue] ✅ Deleted association for ${associationId}`)
                         }
                         
-                        // Track the remove operation for automation
+                        // Track the remove operation for automation AFTER successful DB operation
                         await trackLabelOperation('remove', association)
                     }
                     
@@ -1015,6 +1021,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const bulkOps = items.map(association => {
                     const filter: any = {
                         instanceId: validatedInstanceId,
+                        type: association.type, // Include type field for proper matching
                         chatId: association.chatId,
                         labelId: association.labelId
                     }
@@ -1157,6 +1164,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 // Build filter based on whether it's a message or contact label
                 const filter: any = {
                     instanceId,
+                    type: association.type, // Include type field for proper matching
                     chatId: association.chatId,
                     labelId: association.labelId
                 }
@@ -1320,7 +1328,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             { collection: 'state', spec: { instanceId: 1 }, options: { unique: true }, name: 'state_primary' },
             { collection: 'presences', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'presences_primary' },
             { collection: 'labels', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'labels_primary' },
-            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
+            { collection: 'labelAssociations', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
         ]
         
         const optimizationIndexes = [
@@ -2240,21 +2248,37 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     const jobId = `${association.labelId}-${association.chatId}${messageId ? `-${messageId}` : ''}`
                     const uniqueJobId = `upsert-${jobId}`
                     
-                    // Check for existing conflicting jobs and remove them
+                    // Check for existing conflicting jobs and remove only truly conflicting ones
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
                     const conflictingJobs = existingJobs.filter(job => {
                         const jobData = job.data as LabelAssociationJob
                         const jobMessageId = 'messageId' in jobData.association ? jobData.association.messageId : undefined
+                        
+                        // Only consider it conflicting if:
+                        // 1. Same labelId, chatId, and type
+                        // 2. Same messageId (or both are undefined)
+                        // 3. Same operation type (both upsert or both delete)
                         return jobData.association.labelId === association.labelId &&
                                jobData.association.chatId === association.chatId &&
-                               ((!messageId && !jobMessageId) ||
-                                (messageId === jobMessageId))
+                               jobData.association.type === association.type &&
+                               jobData.type === 'upsert' && // Current is upsert, only conflict with other upserts
+                               ((!messageId && !jobMessageId) || (messageId === jobMessageId))
                     })
                     
-                    // Remove conflicting jobs
+                    // Remove truly conflicting jobs (only recent duplicates)
+                    let removedCount = 0
                     for (const conflictingJob of conflictingJobs) {
-                        await conflictingJob.remove()
-                        log(`[Bull Label] Removed conflicting job ${conflictingJob.id} for ${jobId}`)
+                        // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
+                        const jobAge = Date.now() - (conflictingJob.opts?.timestamp || conflictingJob.processedOn || Date.now())
+                        if (jobAge < 10000) { // 10 seconds
+                            await conflictingJob.remove()
+                            removedCount++
+                            log(`[Bull Label] Removed recent duplicate job ${conflictingJob.id} (age: ${jobAge}ms) for ${jobId}`)
+                        }
+                    }
+                    
+                    if (conflictingJobs.length > 0) {
+                        log(`[Bull Label] Found ${conflictingJobs.length} potential conflicts, removed ${removedCount} recent duplicates for ${jobId}`)
                     }
                     
                     // Add the new job with unique ID
@@ -2391,6 +2415,19 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             if (result.deletedCount === 0) {
                 logWarn(`[Direct Delete] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, messageId: ${(association as any).messageId || 'none'}`)
             }
+        },
+
+        // Label Association Recovery and Consistency Methods
+        async recoverLabelAssociations(dryRun: boolean = true): Promise<any> {
+            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
+            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
+            return recovery.recoverLabelAssociations(dryRun)
+        },
+
+        async analyzeLabelConsistency(): Promise<any> {
+            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
+            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
+            return recovery.analyzeConsistency()
         },
 
         bind(ev: BaileysEventEmitter): void {

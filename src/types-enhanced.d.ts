@@ -432,5 +432,15 @@ export interface EnhancedMongoDBStore {
         error?: string
     }>
     
+    /**
+     * Recover missing label associations from labelOperations collection
+     */
+    recoverLabelAssociations(dryRun?: boolean): Promise<any>
+    
+    /**
+     * Analyze consistency between labelOperations and labelAssociations
+     */
+    analyzeLabelConsistency(): Promise<any>
+    
     close(): Promise<void>
 }

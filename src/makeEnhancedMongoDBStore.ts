@@ -1055,7 +1055,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Debug logging to understand what's being stored
                         log(`[Label Queue] Processing ${type} - Type: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}`)
                         log(`[Label Queue] Filter: ${JSON.stringify(filter)}`)
-                        log(`[Label Queue] Document: ${JSON.stringify({...association, instanceId, updatedAt: new Date()})}`)
+                        log(`[Label Queue] Document to upsert: ${JSON.stringify({...association, instanceId, updatedAt: new Date()})}`)
+                        
+                        // Enhanced debug logging - check existing documents before operation
+                        const existingDocs = await collections.labelAssociations.find({
+                            instanceId,
+                            chatId: association.chatId,
+                            labelId: association.labelId
+                        }).toArray()
+                        
+                        if (existingDocs.length > 0) {
+                            log(`[Label Queue] Found ${existingDocs.length} existing docs for ${association.chatId}/${association.labelId}:`)
+                            existingDocs.forEach((doc, index) => {
+                                log(`[Label Queue]   Doc ${index + 1}: type=${doc.type}, messageId=${(doc as any).messageId || 'none'}`)
+                            })
+                        } else {
+                            log(`[Label Queue] No existing documents found for ${association.chatId}/${association.labelId}`)
+                        }
                         
                         const result = await collections.labelAssociations.replaceOne(
                             filter,
@@ -1067,6 +1083,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             { upsert: true }
                         )
                         
+                        // Validate operation succeeded
+                        if (result.upsertedCount === 0 && result.modifiedCount === 0) {
+                            throw new Error(`[Label Queue] Failed to upsert label association for ${associationId} - no documents affected`)
+                        }
+                        
                         log(`[Label Queue] ✅ Completed upsert for ${associationId} - upserted: ${result.upsertedCount}, modified: ${result.modifiedCount}`)
                         
                         // Show what was actually stored
@@ -1074,7 +1095,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`[Label Queue] New document created with ID: ${result.upsertedId}`)
                         }
                         
-                        // Track the add operation for automation
+                        // Enhanced debug - verify final state
+                        const finalDocs = await collections.labelAssociations.find({
+                            instanceId,
+                            chatId: association.chatId,
+                            labelId: association.labelId
+                        }).toArray()
+                        
+                        log(`[Label Queue] Final state: ${finalDocs.length} docs exist for ${association.chatId}/${association.labelId}`)
+                        finalDocs.forEach((doc, index) => {
+                            log(`[Label Queue]   Final Doc ${index + 1}: type=${doc.type}, messageId=${(doc as any).messageId || 'none'}, id=${doc._id}`)
+                        })
+                        
+                        // Track the add operation for automation AFTER successful DB operation
                         await trackLabelOperation('add', association)
                     } else if (type === 'delete') {
                         const filter: any = {
@@ -1097,12 +1130,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         
                         if (result.deletedCount === 0) {
                             logWarn(`[Label Queue] ⚠️ No document found to delete for ${associationId}`)
+                            // For delete operations, warn but don't fail since the association might already be deleted
                         } else {
                             log(`[Label Queue] ✅ Deleted association for ${associationId}`)
+                            
+                            // Track the remove operation for automation AFTER successful DB operation
+                            await trackLabelOperation('remove', association)
                         }
-                        
-                        // Track the remove operation for automation
-                        await trackLabelOperation('remove', association)
                     }
                     
                     const processingTime = Date.now() - (timestamp || 0)
@@ -1344,7 +1378,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         const labelAssocTTL = getTTLForCollection('labelAssociations') * 24 * 60 * 60
         indexPromises.push(
-            collections.labelAssociations.createIndex({ instanceId: 1, chatId: 1, labelId: 1 }, { unique: true }).then(() => {}),
+            collections.labelAssociations.createIndex({ instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true }).then(() => {}),
             collections.labelAssociations.createIndex({ updatedAt: 1 }, { expireAfterSeconds: labelAssocTTL }).then(() => {})
         )
         
@@ -2366,21 +2400,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const jobId = `${association.labelId}-${association.chatId}${messageId ? `-${messageId}` : ''}`
                     const uniqueJobId = `upsert-${jobId}`
                     
-                    // Check for existing conflicting jobs and remove them
+                    // Check for existing conflicting jobs and remove only truly conflicting ones
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
                     const conflictingJobs = existingJobs.filter(job => {
                         const jobData = job.data as LabelAssociationJob
                         const jobMessageId = 'messageId' in jobData.association ? jobData.association.messageId : undefined
+                        
+                        // Only consider it conflicting if:
+                        // 1. Same labelId, chatId, and type
+                        // 2. Same messageId (or both are undefined)
+                        // 3. Same operation type (both upsert or both delete)
                         return jobData.association.labelId === association.labelId &&
                                jobData.association.chatId === association.chatId &&
-                               ((!messageId && !jobMessageId) ||
-                                (messageId === jobMessageId))
+                               jobData.association.type === association.type &&
+                               jobData.type === 'upsert' && // Current is upsert, only conflict with other upserts
+                               ((!messageId && !jobMessageId) || (messageId === jobMessageId))
                     })
                     
-                    // Remove conflicting jobs
+                    // Remove truly conflicting jobs (only recent duplicates)
+                    let removedCount = 0
                     for (const conflictingJob of conflictingJobs) {
-                        await conflictingJob.remove()
-                        log(`[Bull LabelAssociations] Removed conflicting job ${conflictingJob.id} for ${jobId}`)
+                        // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
+                        const jobAge = Date.now() - (conflictingJob.opts?.timestamp || conflictingJob.processedOn || Date.now())
+                        if (jobAge < 10000) { // 10 seconds
+                            await conflictingJob.remove()
+                            removedCount++
+                            log(`[Bull LabelAssociations] Removed recent duplicate job ${conflictingJob.id} (age: ${jobAge}ms) for ${jobId}`)
+                        }
+                    }
+                    
+                    if (conflictingJobs.length > 0) {
+                        log(`[Bull LabelAssociations] Found ${conflictingJobs.length} potential conflicts, removed ${removedCount} recent duplicates for ${jobId}`)
                     }
                     
                     // Add the new job with unique ID
@@ -2402,22 +2452,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`[Bull LabelAssociations] Queued upsert job ${job.id} for ${jobId}`)
                     return
                 } catch (error) {
-                    logError('[Bull LabelAssociations] Failed to queue, falling back:', error)
+                    logError('[Bull LabelAssociations] Failed to queue, falling back to direct write:', error)
+                    // Continue to direct write fallback
                 }
             }
             
-            // Fallback to direct write
+            // Fallback to direct write with comprehensive error handling
             const filter: any = {
                 instanceId,
+                type: association.type, // CRITICAL FIX: Include type field to differentiate label_jid vs label_message
                 chatId: association.chatId,
                 labelId: association.labelId
             }
             
-            if ('messageId' in association && association.messageId) {
+            // Only add messageId for message labels
+            if (association.type === 'label_message' && 'messageId' in association && association.messageId) {
                 filter.messageId = association.messageId
             }
             
-            await collections.labelAssociations.replaceOne(
+            const result = await collections.labelAssociations.replaceOne(
                 filter,
                 {
                     ...association,
@@ -2426,6 +2479,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 },
                 { upsert: true }
             )
+            
+            // Validate operation succeeded
+            if (result.upsertedCount === 0 && result.modifiedCount === 0) {
+                const errorMsg = `[Direct] Failed to upsert label association - chatId: ${association.chatId}, labelId: ${association.labelId}, type: ${association.type}`
+                logError(errorMsg)
+                throw new Error(errorMsg)
+            }
+            
+            log(`[Direct] ✅ Label association upserted - upserted: ${result.upsertedCount}, modified: ${result.modifiedCount}, type: ${association.type}`)
         },
 
         async deleteLabelAssociation(association: LabelAssociation): Promise<void> {
@@ -2439,21 +2501,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const jobId = `${association.labelId}-${association.chatId}${messageId ? `-${messageId}` : ''}`
                     const uniqueJobId = `delete-${jobId}`
                     
-                    // Check for existing conflicting jobs and remove them
+                    // Check for existing conflicting jobs and remove only truly conflicting ones
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
                     const conflictingJobs = existingJobs.filter(job => {
                         const jobData = job.data as LabelAssociationJob
                         const jobMessageId = 'messageId' in jobData.association ? jobData.association.messageId : undefined
+                        
+                        // Only consider it conflicting if:
+                        // 1. Same labelId, chatId, and type
+                        // 2. Same messageId (or both are undefined)
+                        // 3. Same operation type (both delete or both upsert)
                         return jobData.association.labelId === association.labelId &&
                                jobData.association.chatId === association.chatId &&
-                               ((!messageId && !jobMessageId) ||
-                                (messageId === jobMessageId))
+                               jobData.association.type === association.type &&
+                               jobData.type === 'delete' && // Current is delete, only conflict with other deletes
+                               ((!messageId && !jobMessageId) || (messageId === jobMessageId))
                     })
                     
-                    // Remove conflicting jobs
+                    // Remove truly conflicting jobs (only recent duplicates)
+                    let removedCount = 0
                     for (const conflictingJob of conflictingJobs) {
-                        await conflictingJob.remove()
-                        log(`[Bull LabelAssociations] Removed conflicting job ${conflictingJob.id} for ${jobId}`)
+                        // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
+                        const jobAge = Date.now() - (conflictingJob.opts?.timestamp || conflictingJob.processedOn || Date.now())
+                        if (jobAge < 10000) { // 10 seconds
+                            await conflictingJob.remove()
+                            removedCount++
+                            log(`[Bull LabelAssociations] Removed recent duplicate job ${conflictingJob.id} (age: ${jobAge}ms) for ${jobId}`)
+                        }
+                    }
+                    
+                    if (conflictingJobs.length > 0) {
+                        log(`[Bull LabelAssociations] Found ${conflictingJobs.length} potential conflicts, removed ${removedCount} recent duplicates for ${jobId}`)
                     }
                     
                     // Add the new job with unique ID
@@ -2475,22 +2553,44 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`[Bull LabelAssociations] Queued delete job ${job.id} for ${jobId}`)
                     return
                 } catch (error) {
-                    logError('[Bull LabelAssociations] Failed to queue delete, falling back:', error)
+                    logError('[Bull LabelAssociations] Failed to queue delete, falling back to direct delete:', error)
+                    // Continue to direct delete fallback
                 }
             }
             
-            // Fallback to direct delete
+            // Fallback to direct delete with comprehensive error handling
             const filter: any = {
                 instanceId,
+                type: association.type, // CRITICAL FIX: Include type field for proper matching
                 chatId: association.chatId,
                 labelId: association.labelId
             }
             
-            if ('messageId' in association && association.messageId) {
+            // Only add messageId for message labels
+            if (association.type === 'label_message' && 'messageId' in association && association.messageId) {
                 filter.messageId = association.messageId
             }
             
-            await collections.labelAssociations.deleteOne(filter)
+            const result = await collections.labelAssociations.deleteOne(filter)
+            
+            if (result.deletedCount === 0) {
+                logWarn(`[Direct] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, type: ${association.type}`)
+            } else {
+                log(`[Direct] ✅ Label association deleted - type: ${association.type}`)
+            }
+        },
+
+        // Label Association Recovery and Consistency Methods
+        async recoverLabelAssociations(dryRun: boolean = true): Promise<any> {
+            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
+            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
+            return recovery.recoverLabelAssociations(dryRun)
+        },
+
+        async analyzeLabelConsistency(): Promise<any> {
+            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
+            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
+            return recovery.analyzeConsistency()
         },
 
         // bind method continues with event handling...
@@ -3147,21 +3247,31 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             ev.on('labels.association', async ({ type, association }) => {
                 if (enableMetrics) updateEventMetrics('labels.association', 'received')
                 
+                // Enhanced debug logging for label association events
+                const messageId = 'messageId' in association ? association.messageId : undefined
+                log(`[Event Handler] labels.association received - Type: ${type}, Association: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}, MessageId: ${messageId || 'none'}`)
+                
                 const associationData = { type, association }
                 if (await shouldStoreEvent('labels.association', associationData)) {
                     try {
+                        log(`[Event Handler] Processing ${type} operation for ${association.chatId}/${association.labelId}`)
+                        
                         if (type === 'add') {
                             await storeImpl.upsertLabelAssociation(association)
+                            log(`[Event Handler] ✅ Add operation completed for ${association.chatId}/${association.labelId}`)
                         } else if (type === 'remove') {
                             await storeImpl.deleteLabelAssociation(association)
+                            log(`[Event Handler] ✅ Remove operation completed for ${association.chatId}/${association.labelId}`)
                         }
                         
                         if (enableMetrics) updateEventMetrics('labels.association', 'stored')
                         if (hooks.afterStore) await hooks.afterStore('labels.association', associationData)
                     } catch (error) {
-                        logError('Failed to process label association:', error)
+                        logError(`[Event Handler] Failed to process ${type} label association for ${association.chatId}/${association.labelId}:`, error)
                         if (enableMetrics) updateEventMetrics('labels.association', 'error')
                     }
+                } else {
+                    log(`[Event Handler] Skipping storage for ${type} label association (filtered out)`)
                 }
             })
 
