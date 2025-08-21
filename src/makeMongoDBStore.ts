@@ -70,6 +70,16 @@ interface LabelAssociationJob {
     operationId?: string
 }
 
+interface LabelOperation {
+    instanceId: string
+    chatId: string
+    normalizedChatId: string  // without @s.whatsapp.net or @lid
+    addLabelIds: string[]
+    removeLabelIds: string[]
+    updatedAt: Date
+    ttl: Date  // for automatic cleanup after 30 days
+}
+
 interface MessageJob {
     type: 'upsert' | 'update' | 'delete'
     jid: string
@@ -214,6 +224,7 @@ interface MongoCollections {
     presences: Collection<{ instanceId: string; id: string; presences: { [participant: string]: PresenceData }; updatedAt: Date }>
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
+    labelOperations: Collection<LabelOperation>  // Track add/remove operations for automation
 }
 
 export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<MongoDBStore> => {
@@ -514,18 +525,23 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 
                 try {
                     if (type === 'upsert') {
-                        // For contact labels, we don't include messageId in the filter
-                        // to prevent duplicate key errors during rapid add/remove operations
+                        // Include type field to properly differentiate label associations
                         const filter: any = {
                             instanceId,
+                            type: association.type, // Include type field (label_jid or label_message)
                             chatId: association.chatId,
                             labelId: association.labelId
                         }
                         
-                        // Only include messageId in filter if it's a message label (not a contact label)
-                        if ('messageId' in association && association.messageId) {
+                        // Only include messageId in filter if it's a message label
+                        if (association.type === 'label_message' && 'messageId' in association && association.messageId) {
                             filter.messageId = association.messageId
                         }
+                        
+                        // Debug logging to understand what's being stored
+                        log(`[Label Queue] Processing ${type} - Type: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}`)
+                        log(`[Label Queue] Filter: ${JSON.stringify(filter)}`)
+                        log(`[Label Queue] Document: ${JSON.stringify({...association, instanceId, updatedAt: new Date()})}`)
                         
                         const result = await collections.labelAssociations.replaceOne(
                             filter,
@@ -538,18 +554,31 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         )
                         
                         log(`[Label Queue] ✅ Completed upsert for ${associationId} - upserted: ${result.upsertedCount}, modified: ${result.modifiedCount}`)
+                        
+                        // Show what was actually stored
+                        if (result.upsertedCount > 0) {
+                            log(`[Label Queue] New document created with ID: ${result.upsertedId}`)
+                        }
+                        
+                        // Track the add operation for automation
+                        await trackLabelOperation('add', association)
                     } else if (type === 'delete') {
-                        // For delete operations, we need to be more flexible with messageId matching
+                        // Include type field for proper matching
                         const filter: any = {
                             instanceId,
+                            type: association.type, // Include type field
                             chatId: association.chatId,
                             labelId: association.labelId
                         }
                         
-                        // Only add messageId to filter if it exists in the association
-                        if ('messageId' in association && association.messageId) {
+                        // Only add messageId to filter if it's a message label
+                        if (association.type === 'label_message' && 'messageId' in association && association.messageId) {
                             filter.messageId = association.messageId
                         }
+                        
+                        // Debug logging
+                        log(`[Label Queue] Processing delete - Type: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}`)
+                        log(`[Label Queue] Delete filter: ${JSON.stringify(filter)}`)
                         
                         const result = await collections.labelAssociations.deleteOne(filter)
                         
@@ -558,6 +587,9 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         } else {
                             log(`[Label Queue] ✅ Deleted association for ${associationId}`)
                         }
+                        
+                        // Track the remove operation for automation
+                        await trackLabelOperation('remove', association)
                     }
                     
                     performanceMetrics.labelsProcessed++
@@ -887,6 +919,53 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     // Initialize Bull queues
     await initializeBullQueues()
     
+    // Helper function to track label operations for automation
+    const trackLabelOperation = async (operation: 'add' | 'remove', association: LabelAssociation) => {
+        try {
+            const normalizedChatId = association.chatId.replace('@s.whatsapp.net', '').replace('@lid', '')
+            
+            // Find or create operation tracking document
+            const filter = {
+                instanceId,
+                chatId: association.chatId,
+                normalizedChatId
+            }
+            
+            const existingDoc = await collections.labelOperations.findOne(filter)
+            
+            let addLabelIds = existingDoc?.addLabelIds || []
+            let removeLabelIds = existingDoc?.removeLabelIds || []
+            
+            if (operation === 'add') {
+                removeLabelIds = removeLabelIds.filter((id: string) => id !== association.labelId)
+                if (!addLabelIds.includes(association.labelId)) {
+                    addLabelIds.push(association.labelId)
+                }
+            } else {
+                addLabelIds = addLabelIds.filter((id: string) => id !== association.labelId)
+                if (!removeLabelIds.includes(association.labelId)) {
+                    removeLabelIds.push(association.labelId)
+                }
+            }
+            
+            await collections.labelOperations.replaceOne(
+                filter,
+                {
+                    ...filter,
+                    addLabelIds,
+                    removeLabelIds,
+                    updatedAt: new Date(),
+                    ttl: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+                },
+                { upsert: true }
+            )
+            
+            log(`[Label Operations] Tracked ${operation} operation for chat ${association.chatId}, label ${association.labelId}`)
+        } catch (error) {
+            logError(`[Label Operations] Failed to track ${operation} operation:`, error)
+        }
+    }
+    
     // Memory-aware batch processors
     let labelAssociationProcessor: MemoryAwareBatchProcessor<LabelAssociation> | null = null
     let messageProcessor: MemoryAwareBatchProcessor<proto.IWebMessageInfo & { jid: string }> | null = null
@@ -920,7 +999,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
             labels: db.collection(`${collectionPrefix}labels`),
-            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`),
+            labelOperations: db.collection(`${collectionPrefix}labelOperations`)
         }
     }
     
@@ -2959,6 +3039,7 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
                     `${conn.collectionPrefix}presences`,
                     `${conn.collectionPrefix}labels`,
                     `${conn.collectionPrefix}labelAssociations`,
+                    `${conn.collectionPrefix}labelOperations`,
                     `${conn.collectionPrefix}lidMappings`
                 ]
 

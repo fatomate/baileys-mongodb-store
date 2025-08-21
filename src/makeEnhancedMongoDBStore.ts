@@ -126,6 +126,16 @@ interface LabelAssociationJob {
     operationId?: string
 }
 
+interface LabelOperation {
+    instanceId: string
+    chatId: string
+    normalizedChatId: string  // without @s.whatsapp.net or @lid
+    addLabelIds: string[]
+    removeLabelIds: string[]
+    updatedAt: Date
+    ttl: Date  // for automatic cleanup after 30 days
+}
+
 // Event metrics storage
 const eventMetricsMap = new Map<string, EventMetrics>()
 
@@ -138,6 +148,7 @@ interface MongoCollections {
     presences: Collection<{ instanceId: string; id: string; presences: { [participant: string]: PresenceData }; updatedAt: Date }>
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
+    labelOperations: Collection<LabelOperation>  // Track add/remove operations for automation
 }
 
 // Cache for Binary conversions
@@ -566,7 +577,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
             labels: db.collection(`${collectionPrefix}labels`),
-            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`),
+            labelOperations: db.collection(`${collectionPrefix}labelOperations`)
         }
     }
     
@@ -1030,13 +1042,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (type === 'upsert') {
                         const filter: any = {
                             instanceId,
+                            type: association.type, // Include type field to differentiate label_jid vs label_message
                             chatId: association.chatId,
                             labelId: association.labelId
                         }
                         
-                        if ('messageId' in association && association.messageId) {
+                        // Only add messageId for message labels
+                        if (association.type === 'label_message' && 'messageId' in association && association.messageId) {
                             filter.messageId = association.messageId
                         }
+                        
+                        // Debug logging to understand what's being stored
+                        log(`[Label Queue] Processing ${type} - Type: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}`)
+                        log(`[Label Queue] Filter: ${JSON.stringify(filter)}`)
+                        log(`[Label Queue] Document: ${JSON.stringify({...association, instanceId, updatedAt: new Date()})}`)
                         
                         const result = await collections.labelAssociations.replaceOne(
                             filter,
@@ -1049,16 +1068,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         )
                         
                         log(`[Label Queue] ✅ Completed upsert for ${associationId} - upserted: ${result.upsertedCount}, modified: ${result.modifiedCount}`)
+                        
+                        // Show what was actually stored
+                        if (result.upsertedCount > 0) {
+                            log(`[Label Queue] New document created with ID: ${result.upsertedId}`)
+                        }
+                        
+                        // Track the add operation for automation
+                        await trackLabelOperation('add', association)
                     } else if (type === 'delete') {
                         const filter: any = {
                             instanceId,
+                            type: association.type, // Include type field for proper matching
                             chatId: association.chatId,
                             labelId: association.labelId
                         }
                         
-                        if ('messageId' in association && association.messageId) {
+                        // Only add messageId for message labels
+                        if (association.type === 'label_message' && 'messageId' in association && association.messageId) {
                             filter.messageId = association.messageId
                         }
+                        
+                        // Debug logging
+                        log(`[Label Queue] Processing delete - Type: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}`)
+                        log(`[Label Queue] Delete filter: ${JSON.stringify(filter)}`)
                         
                         const result = await collections.labelAssociations.deleteOne(filter)
                         
@@ -1067,6 +1100,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         } else {
                             log(`[Label Queue] ✅ Deleted association for ${associationId}`)
                         }
+                        
+                        // Track the remove operation for automation
+                        await trackLabelOperation('remove', association)
                     }
                     
                     const processingTime = Date.now() - (timestamp || 0)
@@ -1103,6 +1139,58 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Initialize Bull queues
     await initializeBullQueues()
+    
+    // Helper function to track label operations for automation
+    const trackLabelOperation = async (operation: 'add' | 'remove', association: LabelAssociation) => {
+        try {
+            const normalizedChatId = association.chatId.replace('@s.whatsapp.net', '').replace('@lid', '')
+            
+            // Find or create operation tracking document
+            const filter = {
+                instanceId,
+                chatId: association.chatId,
+                normalizedChatId
+            }
+            
+            const existingDoc = await collections.labelOperations.findOne(filter)
+            
+            let addLabelIds = existingDoc?.addLabelIds || []
+            let removeLabelIds = existingDoc?.removeLabelIds || []
+            
+            if (operation === 'add') {
+                removeLabelIds = removeLabelIds.filter((id: string) => id !== association.labelId)
+                if (!addLabelIds.includes(association.labelId)) {
+                    addLabelIds.push(association.labelId)
+                }
+            } else {
+                addLabelIds = addLabelIds.filter((id: string) => id !== association.labelId)
+                if (!removeLabelIds.includes(association.labelId)) {
+                    removeLabelIds.push(association.labelId)
+                }
+            }
+            
+            await collections.labelOperations.replaceOne(
+                filter,
+                {
+                    ...filter,
+                    addLabelIds,
+                    removeLabelIds,
+                    updatedAt: new Date(),
+                    ttl: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+                },
+                { upsert: true }
+            )
+            
+            log(`[Label Operations] Tracked ${operation} operation for chat ${association.chatId}, label ${association.labelId}`)
+            
+            // Trigger automation processing if hook is provided
+            if (hooks?.onLabelOperation) {
+                await hooks.onLabelOperation(instanceId, operation, association.chatId, association.labelId)
+            }
+        } catch (error) {
+            logError(`[Label Operations] Failed to track ${operation} operation:`, error)
+        }
+    }
     
     // Event configuration management
     const eventConfigs = new Map<string, EventStorageConfig>()

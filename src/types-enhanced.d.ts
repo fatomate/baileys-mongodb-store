@@ -277,6 +277,12 @@ export interface EnhancedMongoDBStoreConfig {
          * Called when an error occurs during storage
          */
         onError?: (eventType: string, error: Error, data: any) => void
+        
+        /**
+         * Called when a label operation (add/remove) is tracked
+         * Useful for triggering automation workflows
+         */
+        onLabelOperation?: (instanceId: string, operation: 'add' | 'remove', chatId: string, labelId: string) => void | Promise<void>
     }
     
     /**
