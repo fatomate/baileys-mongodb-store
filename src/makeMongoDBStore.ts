@@ -70,16 +70,6 @@ interface LabelAssociationJob {
     operationId?: string
 }
 
-interface LabelOperation {
-    instanceId: string
-    chatId: string
-    normalizedChatId: string  // without @s.whatsapp.net or @lid
-    addLabelIds: string[]
-    removeLabelIds: string[]
-    updatedAt: Date
-    ttl: Date  // for automatic cleanup after 30 days
-}
-
 interface MessageJob {
     type: 'upsert' | 'update' | 'delete'
     jid: string
@@ -224,7 +214,6 @@ interface MongoCollections {
     presences: Collection<{ instanceId: string; id: string; presences: { [participant: string]: PresenceData }; updatedAt: Date }>
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
-    labelOperations: Collection<LabelOperation>  // Track add/remove operations for automation
 }
 
 export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<MongoDBStore> => {
@@ -925,48 +914,45 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     // Initialize Bull queues
     await initializeBullQueues()
     
-    // Helper function to track label operations for automation
+    // Helper function to track label operations in Redis cache for automation  
     const trackLabelOperation = async (operation: 'add' | 'remove', association: LabelAssociation) => {
         try {
+            if (!redisConnection) {
+                log('[Label Operations] Redis not available, skipping cache tracking')
+                return
+            }
+
             const normalizedChatId = association.chatId.replace('@s.whatsapp.net', '').replace('@lid', '')
+            const hashKey = `labelsAssociation:${instanceId}`
             
-            // Find or create operation tracking document
-            const filter = {
-                instanceId,
+            // Get existing data from Redis
+            const existingData = await redisConnection.hget(hashKey, normalizedChatId)
+            let metadata = existingData ? JSON.parse(existingData) : {
                 chatId: association.chatId,
-                normalizedChatId
+                addLabelIds: [],
+                removeLabelIds: []
             }
             
-            const existingDoc = await collections.labelOperations.findOne(filter)
-            
-            let addLabelIds = existingDoc?.addLabelIds || []
-            let removeLabelIds = existingDoc?.removeLabelIds || []
-            
+            // Update metadata based on operation type (like waziper.js)
             if (operation === 'add') {
-                removeLabelIds = removeLabelIds.filter((id: string) => id !== association.labelId)
-                if (!addLabelIds.includes(association.labelId)) {
-                    addLabelIds.push(association.labelId)
+                metadata.removeLabelIds = metadata.removeLabelIds.filter((id: string) => id !== association.labelId)
+                if (!metadata.addLabelIds.includes(association.labelId)) {
+                    metadata.addLabelIds.push(association.labelId)
                 }
             } else {
-                addLabelIds = addLabelIds.filter((id: string) => id !== association.labelId)
-                if (!removeLabelIds.includes(association.labelId)) {
-                    removeLabelIds.push(association.labelId)
+                metadata.addLabelIds = metadata.addLabelIds.filter((id: string) => id !== association.labelId)
+                if (!metadata.removeLabelIds.includes(association.labelId)) {
+                    metadata.removeLabelIds.push(association.labelId)
                 }
             }
             
-            await collections.labelOperations.replaceOne(
-                filter,
-                {
-                    ...filter,
-                    addLabelIds,
-                    removeLabelIds,
-                    updatedAt: new Date(),
-                    ttl: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
-                },
-                { upsert: true }
-            )
+            // Store updated data in Redis with TTL
+            const pipeline = redisConnection.pipeline()
+            pipeline.hset(hashKey, normalizedChatId, JSON.stringify(metadata))
+            pipeline.expire(hashKey, 48 * 60 * 60) // 48 hours TTL for safety
+            await pipeline.exec()
             
-            log(`[Label Operations] Tracked ${operation} operation for chat ${association.chatId}, label ${association.labelId}`)
+            log(`[Label Operations] Tracked ${operation} operation in Redis for chat ${association.chatId}, label ${association.labelId}`)
         } catch (error) {
             logError(`[Label Operations] Failed to track ${operation} operation:`, error)
         }
@@ -1005,8 +991,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
             labels: db.collection(`${collectionPrefix}labels`),
-            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`),
-            labelOperations: db.collection(`${collectionPrefix}labelOperations`)
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
         }
     }
     
@@ -2417,19 +2402,6 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             }
         },
 
-        // Label Association Recovery and Consistency Methods
-        async recoverLabelAssociations(dryRun: boolean = true): Promise<any> {
-            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
-            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
-            return recovery.recoverLabelAssociations(dryRun)
-        },
-
-        async analyzeLabelConsistency(): Promise<any> {
-            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
-            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
-            return recovery.analyzeConsistency()
-        },
-
         bind(ev: BaileysEventEmitter): void {
             console.log(`[${instanceId}] store.bind() called - setting up event listeners`)
             
@@ -3076,7 +3048,6 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
                     `${conn.collectionPrefix}presences`,
                     `${conn.collectionPrefix}labels`,
                     `${conn.collectionPrefix}labelAssociations`,
-                    `${conn.collectionPrefix}labelOperations`,
                     `${conn.collectionPrefix}lidMappings`
                 ]
 

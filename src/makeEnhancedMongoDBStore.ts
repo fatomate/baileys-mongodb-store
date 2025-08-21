@@ -126,16 +126,6 @@ interface LabelAssociationJob {
     operationId?: string
 }
 
-interface LabelOperation {
-    instanceId: string
-    chatId: string
-    normalizedChatId: string  // without @s.whatsapp.net or @lid
-    addLabelIds: string[]
-    removeLabelIds: string[]
-    updatedAt: Date
-    ttl: Date  // for automatic cleanup after 30 days
-}
-
 // Event metrics storage
 const eventMetricsMap = new Map<string, EventMetrics>()
 
@@ -148,7 +138,6 @@ interface MongoCollections {
     presences: Collection<{ instanceId: string; id: string; presences: { [participant: string]: PresenceData }; updatedAt: Date }>
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
-    labelOperations: Collection<LabelOperation>  // Track add/remove operations for automation
 }
 
 // Cache for Binary conversions
@@ -577,8 +566,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
             labels: db.collection(`${collectionPrefix}labels`),
-            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`),
-            labelOperations: db.collection(`${collectionPrefix}labelOperations`)
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
         }
     }
     
@@ -1031,6 +1019,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
             
             createQueueAndWorker<LabelAssociationJob>(QueueType.LABEL_ASSOCIATIONS, async (job) => {
+                // Handle cleanup job
+                if (job.name === 'label-cache-cleanup') {
+                    log('[Label Cache Cleanup] Running scheduled cleanup job')
+                    await cleanupLabelCache()
+                    return { success: true }
+                }
+                
+                // Handle regular label association jobs
                 const { type, association, timestamp, operationId } = job.data
                 const jobId = job.id
                 const messageId = 'messageId' in association ? association.messageId : undefined
@@ -1174,48 +1170,140 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize Bull queues
     await initializeBullQueues()
     
-    // Helper function to track label operations for automation
+    // Daily cleanup function for Redis label cache
+    const cleanupLabelCache = async () => {
+        try {
+            if (!redisConnection) {
+                log('[Label Cache Cleanup] Redis not available, skipping cleanup')
+                return
+            }
+
+            log('[Label Cache Cleanup] Starting daily cleanup at 3AM')
+            const startTime = Date.now()
+            let cleanedCount = 0
+            let totalCount = 0
+
+            const hashKey = `labelsAssociation:${instanceId}`
+            const allFields = await redisConnection.hgetall(hashKey)
+            
+            for (const [chatId, dataStr] of Object.entries(allFields)) {
+                totalCount++
+                try {
+                    const metadata = JSON.parse(dataStr)
+                    
+                    // Check if all labels in this chat are already in MongoDB
+                    let allSynced = true
+                    
+                    // Check add labels
+                    for (const labelId of metadata.addLabelIds || []) {
+                        const exists = await collections.labelAssociations.findOne({
+                            instanceId,
+                            chatId: metadata.chatId,
+                            labelId,
+                            type: 'label_jid'
+                        })
+                        if (!exists) {
+                            allSynced = false
+                            break
+                        }
+                    }
+                    
+                    // If all add labels are synced and no remove labels pending, clean up
+                    if (allSynced && (!metadata.removeLabelIds || metadata.removeLabelIds.length === 0)) {
+                        await redisConnection.hdel(hashKey, chatId)
+                        cleanedCount++
+                        log(`[Label Cache Cleanup] Cleaned cache for chat ${chatId}`)
+                    }
+                } catch (error) {
+                    logError(`[Label Cache Cleanup] Error processing chat ${chatId}:`, error)
+                }
+            }
+            
+            const duration = Date.now() - startTime
+            log(`[Label Cache Cleanup] Completed - Cleaned ${cleanedCount}/${totalCount} entries in ${duration}ms`)
+        } catch (error) {
+            logError('[Label Cache Cleanup] Failed to run cleanup:', error)
+        }
+    }
+    
+    // Schedule daily cleanup at 3AM using Bull repeatable job
+    if (redisConnection && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
+        const labelQueue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
+        
+        // Add repeatable job for daily cleanup at 3AM UTC
+        await labelQueue.add(
+            'label-cache-cleanup',
+            { instanceId },
+            {
+                repeat: {
+                    pattern: '0 3 * * *', // Cron pattern for 3AM daily
+                    tz: 'UTC'
+                },
+                removeOnComplete: true,
+                removeOnFail: false
+            }
+        )
+        
+        // Process cleanup jobs
+        workers.get(QueueType.LABEL_ASSOCIATIONS)?.on('completed', (job: Job) => {
+            if (job.name === 'label-cache-cleanup') {
+                log('[Label Cache Cleanup] Daily cleanup job completed')
+            }
+        })
+        
+        // Add handler for cleanup job in the existing worker
+        const existingProcessor = workers.get(QueueType.LABEL_ASSOCIATIONS)
+        if (existingProcessor) {
+            // The worker already processes label jobs, we need to handle cleanup in the same processor
+            // This will be handled in the existing processor logic
+        }
+        
+        log('[Label Cache Cleanup] Scheduled daily cleanup at 3AM UTC using Bull repeatable job')
+    }
+    
+    // Helper function to track label operations in Redis cache for automation
     const trackLabelOperation = async (operation: 'add' | 'remove', association: LabelAssociation) => {
         try {
+            if (!redisConnection) {
+                log('[Label Operations] Redis not available, skipping cache tracking')
+                // Still trigger automation if hook is provided
+                if (hooks?.onLabelOperation) {
+                    await hooks.onLabelOperation(instanceId, operation, association.chatId, association.labelId)
+                }
+                return
+            }
+
             const normalizedChatId = association.chatId.replace('@s.whatsapp.net', '').replace('@lid', '')
+            const hashKey = `labelsAssociation:${instanceId}`
             
-            // Find or create operation tracking document
-            const filter = {
-                instanceId,
+            // Get existing data from Redis
+            const existingData = await redisConnection.hget(hashKey, normalizedChatId)
+            let metadata = existingData ? JSON.parse(existingData) : {
                 chatId: association.chatId,
-                normalizedChatId
+                addLabelIds: [],
+                removeLabelIds: []
             }
             
-            const existingDoc = await collections.labelOperations.findOne(filter)
-            
-            let addLabelIds = existingDoc?.addLabelIds || []
-            let removeLabelIds = existingDoc?.removeLabelIds || []
-            
+            // Update metadata based on operation type (like waziper.js)
             if (operation === 'add') {
-                removeLabelIds = removeLabelIds.filter((id: string) => id !== association.labelId)
-                if (!addLabelIds.includes(association.labelId)) {
-                    addLabelIds.push(association.labelId)
+                metadata.removeLabelIds = metadata.removeLabelIds.filter((id: string) => id !== association.labelId)
+                if (!metadata.addLabelIds.includes(association.labelId)) {
+                    metadata.addLabelIds.push(association.labelId)
                 }
             } else {
-                addLabelIds = addLabelIds.filter((id: string) => id !== association.labelId)
-                if (!removeLabelIds.includes(association.labelId)) {
-                    removeLabelIds.push(association.labelId)
+                metadata.addLabelIds = metadata.addLabelIds.filter((id: string) => id !== association.labelId)
+                if (!metadata.removeLabelIds.includes(association.labelId)) {
+                    metadata.removeLabelIds.push(association.labelId)
                 }
             }
             
-            await collections.labelOperations.replaceOne(
-                filter,
-                {
-                    ...filter,
-                    addLabelIds,
-                    removeLabelIds,
-                    updatedAt: new Date(),
-                    ttl: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
-                },
-                { upsert: true }
-            )
+            // Store updated data in Redis with TTL
+            const pipeline = redisConnection.pipeline()
+            pipeline.hset(hashKey, normalizedChatId, JSON.stringify(metadata))
+            pipeline.expire(hashKey, 48 * 60 * 60) // 48 hours TTL for safety
+            await pipeline.exec()
             
-            log(`[Label Operations] Tracked ${operation} operation for chat ${association.chatId}, label ${association.labelId}`)
+            log(`[Label Operations] Tracked ${operation} operation in Redis for chat ${association.chatId}, label ${association.labelId}`)
             
             // Trigger automation processing if hook is provided
             if (hooks?.onLabelOperation) {
@@ -2590,19 +2678,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         },
 
-        // Label Association Recovery and Consistency Methods
-        async recoverLabelAssociations(dryRun: boolean = true): Promise<any> {
-            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
-            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
-            return recovery.recoverLabelAssociations(dryRun)
-        },
-
-        async analyzeLabelConsistency(): Promise<any> {
-            const { LabelAssociationRecovery } = await import('./utils/labelAssociationRecovery')
-            const recovery = new LabelAssociationRecovery(db, instanceId, collectionPrefix)
-            return recovery.analyzeConsistency()
-        },
-
         // bind method continues with event handling...
         bind(ev: BaileysEventEmitter): void {
             log(`[${instanceId}] store.bind() called - setting up event listeners with selective storage`)
@@ -3623,6 +3698,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         
         async close(): Promise<void> {
+            // Remove repeatable job for cleanup if it exists
+            if (queues.has(QueueType.LABEL_ASSOCIATIONS)) {
+                const labelQueue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
+                try {
+                    await labelQueue.removeRepeatableByKey('label-cache-cleanup')
+                    log('[Label Cache Cleanup] Removed scheduled cleanup job')
+                } catch (error) {
+                    // Ignore if job doesn't exist
+                }
+            }
+            
             // Close Bull queues if initialized
             if (bullInitialized) {
                 log(`🛑 Closing Bull queues for instance ${instanceId}...`)
