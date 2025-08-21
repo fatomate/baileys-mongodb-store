@@ -10,6 +10,7 @@ import type {
     WAMessageCursor 
 } from 'baileys'
 import type { Label } from 'baileys/lib/Types/Label'
+import { LabelAssociationType } from 'baileys/lib/Types/LabelAssociation'
 import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 import type { 
     EnhancedMongoDBStoreConfig, 
@@ -1200,7 +1201,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             instanceId,
                             chatId: metadata.chatId,
                             labelId,
-                            type: 'label_jid'
+                            type: LabelAssociationType.Chat
                         })
                         if (!exists) {
                             allSynced = false
