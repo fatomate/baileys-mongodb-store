@@ -226,41 +226,57 @@ async clearAll(): Promise<void> {
 
 **Impact**: Prevents data loss during rapid label events by preserving label data across history syncs.
 
+### **Fix 8: Replace labelOperations with Redis Cache [v2.5.0]**
+
+**Files**: Both `src/makeEnhancedMongoDBStore.ts` and `src/makeMongoDBStore.ts`
+
+**Issue**: The labelOperations MongoDB collection was adding unnecessary complexity and not providing clear benefits after the clearAll() fix.
+
+**Solution**: Replaced with Redis cache following the proven waziper.js pattern:
+
+```typescript
+// BEFORE - MongoDB labelOperations collection
+await collections.labelOperations.replaceOne(
+    filter,
+    {
+        ...filter,
+        addLabelIds,
+        removeLabelIds,
+        updatedAt: new Date(),
+        ttl: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+    },
+    { upsert: true }
+)
+
+// AFTER - Redis cache with simpler logic
+const hashKey = `labelsAssociation:${instanceId}`
+const pipeline = redisConnection.pipeline()
+pipeline.hset(hashKey, normalizedChatId, JSON.stringify(metadata))
+pipeline.expire(hashKey, 48 * 60 * 60) // 48 hours TTL
+await pipeline.exec()
+```
+
+**Additional Changes**:
+- Added Bull repeatable job for daily cleanup at 3AM UTC
+- Removed labelAssociationRecovery.ts (no longer needed)
+- Fixed TypeScript compilation with LabelAssociationType enum
+
+**Impact**: 
+- Better performance for handling 10K+ rapid label events
+- Simpler, more maintainable code
+- Follows production-tested pattern from waziper.js
+
 ---
 
 ## 🆘 **Recovery Tools Implementation**
 
-To address existing data inconsistencies, comprehensive recovery tools were created:
+~~Recovery tools were initially created in v2.4.12 but were removed in v2.5.0 as they became obsolete after replacing labelOperations with Redis cache.~~
 
-### **New File**: `src/utils/labelAssociationRecovery.ts`
-
-**Features**:
-- **Data consistency analysis** between `labelOperations` and `labelAssociations` collections
-- **Automated recovery** from operations log to associations collection
-- **Dry-run capability** for safe preview of recovery operations
-- **Standalone script** functionality for external recovery
-- **Detailed logging and progress tracking**
-
-### **Enhanced Store Interface Updates**
-
-**File**: `src/types-enhanced.d.ts`
-
-```typescript
-// Added recovery methods to store interface
-recoverLabelAssociations(): Promise<{
-    analyzed: number
-    recovered: number  
-    errors: number
-    details: string[]
-}>
-
-analyzeLabelConsistency(): Promise<{
-    operationsCount: number
-    associationsCount: number
-    missingAssociations: number
-    details: any[]
-}>
-```
+**v2.5.0 Update**: The recovery tools (`labelAssociationRecovery.ts`) and related methods have been removed since:
+- The labelOperations collection no longer exists
+- Redis cache is temporary by design (48-hour TTL)
+- Daily cleanup at 3AM ensures Redis doesn't accumulate stale data
+- The clearAll() fix in v2.4.13 already solved the data persistence issue
 
 ---
 
@@ -281,6 +297,7 @@ npm run lint
 ### **Version Management**
 - **v2.4.12**: Fixed type field issues, rollback mechanism, and index improvements
 - **v2.4.13**: Fixed rapid events data loss by excluding labels from clearAll()
+- **v2.5.0**: Replaced labelOperations MongoDB collection with Redis cache
 
 ---
 
@@ -293,9 +310,13 @@ npm run lint
 | `src/types-enhanced.d.ts` | Recovery method signatures | +8 lines | v2.4.12 | Enhanced interface capabilities |
 | `src/utils/labelAssociationRecovery.ts` | Complete recovery utility | +380 lines | v2.4.12 | New comprehensive recovery tool |
 | `src/makeEnhancedMongoDBStore.ts` | Exclude labels from clearAll(), fix timestamp bug | ~20 lines | v2.4.13 | Rapid events data loss fix |
-| `package.json` | Version bumps | 1 line | v2.4.12-13 | Version management |
+| `src/makeEnhancedMongoDBStore.ts` | Replace labelOperations with Redis cache, add cron | ~200 lines | v2.5.0 | Performance optimization |
+| `src/makeMongoDBStore.ts` | Replace labelOperations with Redis cache | ~80 lines | v2.5.0 | Performance optimization |
+| `src/types-enhanced.d.ts` | Remove recovery methods | -8 lines | v2.5.0 | Cleanup obsolete interfaces |
+| `src/utils/labelAssociationRecovery.ts` | **DELETED** | -380 lines | v2.5.0 | No longer needed |
+| `package.json` | Version bumps | 1 line | v2.4.12-v2.5.0 | Version management |
 
-**Total**: 6 files modified across two versions, fixing all label association issues
+**Total**: 10 changes across three versions, evolving from fixes to optimization
 
 ---
 
