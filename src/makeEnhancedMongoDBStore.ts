@@ -123,6 +123,7 @@ interface LabelAssociationJob {
     association: LabelAssociation
     instanceId: string
     timestamp: number
+    operationId?: string
 }
 
 // Event metrics storage
@@ -1018,43 +1019,64 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
             
             createQueueAndWorker<LabelAssociationJob>(QueueType.LABEL_ASSOCIATIONS, async (job) => {
-                const { type, association } = job.data
+                const { type, association, timestamp, operationId } = job.data
+                const jobId = job.id
+                const messageId = 'messageId' in association ? association.messageId : undefined
+                const associationId = `${association.labelId}-${association.chatId}${messageId ? `-${messageId}` : ''}`
                 
-                if (type === 'upsert') {
-                    const filter: any = {
-                        instanceId,
-                        chatId: association.chatId,
-                        labelId: association.labelId
-                    }
-                    
-                    if ('messageId' in association && association.messageId) {
-                        filter.messageId = association.messageId
-                    }
-                    
-                    await collections.labelAssociations.replaceOne(
-                        filter,
-                        {
-                            ...association,
+                log(`[Label Queue] Processing ${type} job ${jobId} (op: ${operationId}) for ${associationId}`)
+                
+                try {
+                    if (type === 'upsert') {
+                        const filter: any = {
                             instanceId,
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
-                    )
-                } else if (type === 'delete') {
-                    const filter: any = {
-                        instanceId,
-                        chatId: association.chatId,
-                        labelId: association.labelId
+                            chatId: association.chatId,
+                            labelId: association.labelId
+                        }
+                        
+                        if ('messageId' in association && association.messageId) {
+                            filter.messageId = association.messageId
+                        }
+                        
+                        const result = await collections.labelAssociations.replaceOne(
+                            filter,
+                            {
+                                ...association,
+                                instanceId,
+                                updatedAt: new Date()
+                            },
+                            { upsert: true }
+                        )
+                        
+                        log(`[Label Queue] ✅ Completed upsert for ${associationId} - upserted: ${result.upsertedCount}, modified: ${result.modifiedCount}`)
+                    } else if (type === 'delete') {
+                        const filter: any = {
+                            instanceId,
+                            chatId: association.chatId,
+                            labelId: association.labelId
+                        }
+                        
+                        if ('messageId' in association && association.messageId) {
+                            filter.messageId = association.messageId
+                        }
+                        
+                        const result = await collections.labelAssociations.deleteOne(filter)
+                        
+                        if (result.deletedCount === 0) {
+                            logWarn(`[Label Queue] ⚠️ No document found to delete for ${associationId}`)
+                        } else {
+                            log(`[Label Queue] ✅ Deleted association for ${associationId}`)
+                        }
                     }
                     
-                    if ('messageId' in association && association.messageId) {
-                        filter.messageId = association.messageId
-                    }
+                    const processingTime = Date.now() - (timestamp || 0)
+                    log(`[Label Queue] Job ${jobId} completed in ${processingTime}ms`)
                     
-                    await collections.labelAssociations.deleteOne(filter)
+                    return { success: true, processingTime, timestamp: Date.now() }
+                } catch (error) {
+                    logError(`[Label Queue] ❌ Failed ${type} job ${jobId} for ${associationId}:`, error)
+                    throw error
                 }
-                
-                return { success: true }
             })
             
             bullInitialized = true
@@ -2250,16 +2272,46 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (bullInitialized && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
                 try {
                     const queue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
-                    await queue.add(
-                        'upsert',
+                    
+                    // Generate unique job ID for deduplication
+                    const messageId = 'messageId' in association ? association.messageId : undefined
+                    const jobId = `${association.labelId}-${association.chatId}${messageId ? `-${messageId}` : ''}`
+                    const uniqueJobId = `upsert-${jobId}`
+                    
+                    // Check for existing conflicting jobs and remove them
+                    const existingJobs = await queue.getJobs(['waiting', 'delayed'])
+                    const conflictingJobs = existingJobs.filter(job => {
+                        const jobData = job.data as LabelAssociationJob
+                        const jobMessageId = 'messageId' in jobData.association ? jobData.association.messageId : undefined
+                        return jobData.association.labelId === association.labelId &&
+                               jobData.association.chatId === association.chatId &&
+                               ((!messageId && !jobMessageId) ||
+                                (messageId === jobMessageId))
+                    })
+                    
+                    // Remove conflicting jobs
+                    for (const conflictingJob of conflictingJobs) {
+                        await conflictingJob.remove()
+                        log(`[Bull LabelAssociations] Removed conflicting job ${conflictingJob.id} for ${jobId}`)
+                    }
+                    
+                    // Add the new job with unique ID
+                    const job = await queue.add(
+                        uniqueJobId,
                         {
                             type: 'upsert',
                             association,
                             instanceId,
-                            timestamp: Date.now()
+                            timestamp: Date.now(),
+                            operationId: `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`
                         },
-                        defaultJobOptions
+                        {
+                            ...defaultJobOptions,
+                            jobId: uniqueJobId
+                        }
                     )
+                    
+                    log(`[Bull LabelAssociations] Queued upsert job ${job.id} for ${jobId}`)
                     return
                 } catch (error) {
                     logError('[Bull LabelAssociations] Failed to queue, falling back:', error)
@@ -2293,16 +2345,46 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (bullInitialized && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
                 try {
                     const queue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
-                    await queue.add(
-                        'delete',
+                    
+                    // Generate unique job ID for deduplication
+                    const messageId = 'messageId' in association ? association.messageId : undefined
+                    const jobId = `${association.labelId}-${association.chatId}${messageId ? `-${messageId}` : ''}`
+                    const uniqueJobId = `delete-${jobId}`
+                    
+                    // Check for existing conflicting jobs and remove them
+                    const existingJobs = await queue.getJobs(['waiting', 'delayed'])
+                    const conflictingJobs = existingJobs.filter(job => {
+                        const jobData = job.data as LabelAssociationJob
+                        const jobMessageId = 'messageId' in jobData.association ? jobData.association.messageId : undefined
+                        return jobData.association.labelId === association.labelId &&
+                               jobData.association.chatId === association.chatId &&
+                               ((!messageId && !jobMessageId) ||
+                                (messageId === jobMessageId))
+                    })
+                    
+                    // Remove conflicting jobs
+                    for (const conflictingJob of conflictingJobs) {
+                        await conflictingJob.remove()
+                        log(`[Bull LabelAssociations] Removed conflicting job ${conflictingJob.id} for ${jobId}`)
+                    }
+                    
+                    // Add the new job with unique ID
+                    const job = await queue.add(
+                        uniqueJobId,
                         {
                             type: 'delete',
                             association,
                             instanceId,
-                            timestamp: Date.now()
+                            timestamp: Date.now(),
+                            operationId: `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`
                         },
-                        defaultJobOptions
+                        {
+                            ...defaultJobOptions,
+                            jobId: uniqueJobId
+                        }
                     )
+                    
+                    log(`[Bull LabelAssociations] Queued delete job ${job.id} for ${jobId}`)
                     return
                 } catch (error) {
                     logError('[Bull LabelAssociations] Failed to queue delete, falling back:', error)
