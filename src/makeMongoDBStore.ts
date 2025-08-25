@@ -1315,7 +1315,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     // Index might not exist, ignore error
                 })
                 
-                log('🔄 Migrated: Removed TTL indexes from groupMetadata and labelAssociations')
+                // Drop TTL indexes for labels if they exist
+                await collections.labels.dropIndex('updatedAt_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
+                
+                log('🔄 Migrated: Removed TTL indexes from groupMetadata, labelAssociations, and labels')
             } catch (error) {
                 // Migration is best-effort, continue even if it fails
                 log('⚠️  TTL index migration completed (some indexes may not have existed)')
@@ -1351,8 +1356,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             { collection: 'contacts', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'contacts_ttl' },
             { collection: 'messages', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'messages_ttl' },
             // groupMetadata - removed from TTL indexes (will persist indefinitely)
-            { collection: 'presences', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'presences_ttl' },
-            { collection: 'labels', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'labels_ttl' }
+            { collection: 'presences', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'presences_ttl' }
+            // labels - removed from TTL indexes (will persist indefinitely)
             // labelAssociations - removed from TTL indexes (will persist indefinitely)
         ]
         
@@ -1433,8 +1438,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
                 // groupMetadata - removed from TTL verification (no TTL)
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`)
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`)
+                // labels - removed from TTL verification (no TTL)
                 // labelAssociations - removed from TTL verification (no TTL)
             ])
             

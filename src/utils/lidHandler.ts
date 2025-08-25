@@ -69,6 +69,13 @@ export class LidHandler {
         
         // Create indexes for lidMappings collection
         if (this.lidMappingsCollection) {
+            // Drop existing TTL index if it exists (migration from older versions)
+            promises.push(
+                this.lidMappingsCollection.dropIndex('lastSeen_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
+            )
+            
             promises.push(
                 // Compound index for instance + lid lookup
                 this.lidMappingsCollection.createIndex(
@@ -78,12 +85,8 @@ export class LidHandler {
                 // Compound index for instance + phone number lookup
                 this.lidMappingsCollection.createIndex(
                     { instanceId: 1, phoneNumber: 1 }
-                ),
-                // Index for TTL (auto-delete old mappings after 90 days)
-                this.lidMappingsCollection.createIndex(
-                    { lastSeen: 1 },
-                    { expireAfterSeconds: 90 * 24 * 60 * 60 }
                 )
+                // TTL index removed - lid mappings will persist until explicitly deleted
             )
         }
         

@@ -1465,10 +1465,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             collections.presences.createIndex({ updatedAt: 1 }, { expireAfterSeconds: presencesTTL }).then(() => {})
         )
         
-        const labelsTTL = getTTLForCollection('labels') * 24 * 60 * 60
+        // No TTL for labels - data persists indefinitely
+        // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true }).then(() => {}),
-            collections.labels.createIndex({ updatedAt: 1 }, { expireAfterSeconds: labelsTTL }).then(() => {})
+            collections.labels.dropIndex('updatedAt_1').catch(() => {
+                // Index might not exist, ignore error
+            }).then(() => {
+                // Create unique index without TTL
+                return collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true })
+            }).then(() => {})
+            // TTL index removed - labels will persist until explicitly deleted
         )
         
         // No TTL for labelAssociations - data persists indefinitely
@@ -1494,8 +1500,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
                 // groupMetadata - removed from TTL verification (no TTL)
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`)
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`)
+                // labels - removed from TTL verification (no TTL)
                 // labelAssociations - removed from TTL verification (no TTL)
             ])
             
