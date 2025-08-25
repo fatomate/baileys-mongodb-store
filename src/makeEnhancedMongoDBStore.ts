@@ -1441,10 +1441,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true }).then(() => {})
         )
         
-        const groupsTTL = getTTLForCollection('groupMetadata') * 24 * 60 * 60
+        // No TTL for groupMetadata - data persists indefinitely
+        // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true }).then(() => {}),
-            collections.groupMetadata.createIndex({ updatedAt: 1 }, { expireAfterSeconds: groupsTTL }).then(() => {})
+            collections.groupMetadata.dropIndex('updatedAt_1').catch(() => {
+                // Index might not exist, ignore error
+            }).then(() => {
+                // Create unique index without TTL
+                return collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true })
+            }).then(() => {})
+            // TTL index removed - groupMetadata will persist until explicitly deleted
         )
         
         const stateTTL = getTTLForCollection('state') * 24 * 60 * 60
@@ -1465,10 +1471,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             collections.labels.createIndex({ updatedAt: 1 }, { expireAfterSeconds: labelsTTL }).then(() => {})
         )
         
-        const labelAssocTTL = getTTLForCollection('labelAssociations') * 24 * 60 * 60
+        // No TTL for labelAssociations - data persists indefinitely
+        // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            collections.labelAssociations.createIndex({ instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true }).then(() => {}),
-            collections.labelAssociations.createIndex({ updatedAt: 1 }, { expireAfterSeconds: labelAssocTTL }).then(() => {})
+            collections.labelAssociations.dropIndex('updatedAt_1').catch(() => {
+                // Index might not exist, ignore error
+            }).then(() => {
+                // Create unique index without TTL
+                return collections.labelAssociations.createIndex({ instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true })
+            }).then(() => {})
+            // TTL index removed - labelAssociations will persist until explicitly deleted
         )
         
         await Promise.all(indexPromises)
@@ -1481,10 +1493,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}chats`),
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}groupMetadata`),
+                // groupMetadata - removed from TTL verification (no TTL)
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labelAssociations`)
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`)
+                // labelAssociations - removed from TTL verification (no TTL)
             ])
             
             const invalidTTL = verificationResults.filter(r => !r.isValid)

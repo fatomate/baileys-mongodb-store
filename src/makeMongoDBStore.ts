@@ -1302,6 +1302,29 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     const createIndexes = async () => {
         const ttlSeconds = ttlDays * 24 * 60 * 60
         
+        // Migration: Drop existing TTL indexes for collections that should persist indefinitely
+        const dropObsoleteTTLIndexes = async () => {
+            try {
+                // Drop TTL indexes for groupMetadata if they exist
+                await collections.groupMetadata.dropIndex('updatedAt_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
+                
+                // Drop TTL indexes for labelAssociations if they exist
+                await collections.labelAssociations.dropIndex('updatedAt_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
+                
+                log('🔄 Migrated: Removed TTL indexes from groupMetadata and labelAssociations')
+            } catch (error) {
+                // Migration is best-effort, continue even if it fails
+                log('⚠️  TTL index migration completed (some indexes may not have existed)')
+            }
+        }
+        
+        // Run migration before creating new indexes
+        await dropObsoleteTTLIndexes()
+        
         // Define indexes by priority - critical indexes must succeed
         const criticalIndexes = [
             // Primary lookup indexes - essential for query performance
@@ -1327,10 +1350,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             { collection: 'chats', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'chats_ttl' },
             { collection: 'contacts', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'contacts_ttl' },
             { collection: 'messages', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'messages_ttl' },
-            { collection: 'groupMetadata', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'groups_ttl' },
+            // groupMetadata - removed from TTL indexes (will persist indefinitely)
             { collection: 'presences', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'presences_ttl' },
-            { collection: 'labels', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'labels_ttl' },
-            { collection: 'labelAssociations', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'label_assoc_ttl' }
+            { collection: 'labels', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'labels_ttl' }
+            // labelAssociations - removed from TTL indexes (will persist indefinitely)
         ]
         
         const createIndexWithRetry = async (indexDef: any, maxRetries = 3): Promise<{ success: boolean; error?: Error }> => {
@@ -1409,10 +1432,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}chats`),
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}groupMetadata`),
+                // groupMetadata - removed from TTL verification (no TTL)
                 ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labelAssociations`)
+                ttlMonitor.verifyTTLIndex(`${collectionPrefix}labels`)
+                // labelAssociations - removed from TTL verification (no TTL)
             ])
             
             const invalidTTL = verificationResults.filter(r => !r.isValid)
