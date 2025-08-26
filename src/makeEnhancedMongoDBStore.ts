@@ -1,4 +1,4 @@
-import { MongoClient, Collection } from 'mongodb'
+import { MongoClient, Collection, Db } from 'mongodb'
 import { proto, getAggregateVotesInPollMessage, updateMessageWithReceipt, updateMessageWithReaction } from 'baileys'
 import type { 
     BaileysEventEmitter, 
@@ -535,9 +535,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
     // MongoDB connection
     let client: MongoClient
-    let db
+    let db: Db
     let connectionManager: ConnectionManager | null = null
     let isUsingSharedConnection = false
+    let isConnected = false
+    let isConnecting = false
+    let reconnectAttempts = 0
     
     // Helper function to track activity for shared connections
     const trackActivity = (responseTime?: number) => {
@@ -565,6 +568,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
+            isConnected = true
             
             log(`Using shared connection for instance ${instanceId}`)
         } catch (error) {
@@ -581,6 +585,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             db = client.db(dbName)
             isUsingSharedConnection = false
             connectionManager = null
+            isConnected = true
         }
     } else {
         // Use dedicated connection (original behavior)
@@ -592,6 +597,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         })
         await client.connect()
         db = client.db(dbName)
+        isConnected = true
     }
     
     // Initialize TTL monitor after DB connection
@@ -627,7 +633,159 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         }
     }
     
-    const collections = getCollections()
+    let collections = getCollections()
+    
+    // Ensure connection is active before operations
+    const ensureConnection = async (): Promise<void> => {
+        if (isConnected && client) {
+            try {
+                // Quick ping to check if connection is actually alive
+                await db.admin().ping()
+                return
+            } catch {
+                isConnected = false
+            }
+        }
+        
+        // If already connecting, wait for it
+        if (isConnecting) {
+            let waitAttempts = 0
+            while (isConnecting && waitAttempts < 50) {
+                await new Promise(resolve => setTimeout(resolve, 100))
+                waitAttempts++
+            }
+            if (isConnected) return
+        }
+        
+        // Mark as connecting
+        isConnecting = true
+        
+        try {
+            // For shared connections, we need to re-register
+            if (useSharedConnections && connectionManager) {
+                try {
+                    const connection = await connectionManager.registerInstance({
+                        instanceId: validatedInstanceId,
+                        uri,
+                        database: dbName,
+                        config: connectionConfig
+                    })
+                    
+                    client = connection.client
+                    db = connection.db
+                    isUsingSharedConnection = true
+                    
+                    // Refresh collections after reconnection
+                    collections = getCollections()
+                    
+                    // Re-initialize LID handler if needed
+                    if (lidHandler) {
+                        await lidHandler.initialize(db, collectionPrefix)
+                    }
+                    
+                    isConnected = true
+                    reconnectAttempts = 0
+                    log(`Reconnected to MongoDB (shared) for instance ${validatedInstanceId}`)
+                } catch (error) {
+                    // Fall back to dedicated connection if shared fails
+                    logWarn(`Failed to reconnect with shared connection, falling back to dedicated:`, error)
+                    
+                    client = new MongoClient(uri, {
+                        maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
+                        minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                        maxIdleTimeMS: 30000,
+                        writeConcern: { w: 1, j: false }
+                    })
+                    await client.connect()
+                    db = client.db(dbName)
+                    isUsingSharedConnection = false
+                    connectionManager = null
+                    
+                    // Refresh collections after reconnection
+                    collections = getCollections()
+                    
+                    // Re-initialize LID handler if needed
+                    if (lidHandler) {
+                        await lidHandler.initialize(db, collectionPrefix)
+                    }
+                    
+                    isConnected = true
+                    reconnectAttempts = 0
+                    log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
+                }
+            } else {
+                // For dedicated connections, reconnect directly
+                if (client) {
+                    try {
+                        await client.close()
+                    } catch (error) {
+                        // Ignore close errors
+                    }
+                }
+                
+                client = new MongoClient(uri, {
+                    maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
+                    minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                    maxIdleTimeMS: 30000,
+                    writeConcern: { w: 1, j: false }
+                })
+                await client.connect()
+                db = client.db(dbName)
+                
+                // Refresh collections after reconnection
+                collections = getCollections()
+                
+                // Re-initialize LID handler if needed
+                if (lidHandler) {
+                    await lidHandler.initialize(db, collectionPrefix)
+                }
+                
+                isConnected = true
+                reconnectAttempts = 0
+                log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
+            }
+        } catch (error) {
+            isConnected = false
+            reconnectAttempts++
+            logError(`Failed to reconnect to MongoDB for instance ${validatedInstanceId}:`, error)
+            throw new Error(`Failed to connect to MongoDB: ${(error as Error).message}`)
+        } finally {
+            isConnecting = false
+        }
+    }
+    
+    // Wrapper for operations that need connection
+    const withConnection = async <T>(operation: () => Promise<T>): Promise<T> => {
+        const startTime = Date.now()
+        try {
+            await ensureConnection()
+            
+            const result = await operation()
+            
+            // Track success metrics
+            const responseTime = Date.now() - startTime
+            trackActivity(responseTime)
+            
+            return result
+        } catch (error: any) {
+            // If it's a connection error, reset and try once more
+            if (error.message?.includes('Client must be connected') || 
+                error.message?.includes('Topology is closed') ||
+                error.message?.includes('Connection pool closed') ||
+                error.code === 'ECONNREFUSED') {
+                log(`Connection error detected for instance ${validatedInstanceId}, attempting reconnection...`)
+                isConnected = false
+                await ensureConnection()
+                return await operation()
+            }
+            
+            // Track error metrics
+            const responseTime = Date.now() - startTime
+            trackActivity(responseTime)
+            
+            throw error
+        }
+    }
     
     // Queue configuration
     const BATCH_SIZE = 100
@@ -1705,10 +1863,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             const startTime = Date.now()
             trackActivity() // Track request
             
-            const chats = await collections.chats
-                .find({ instanceId })
-                .sort({ conversationTimestamp: -1 })
-                .toArray()
+            const chats = await withConnection(async () =>
+                collections.chats
+                    .find({ instanceId })
+                    .sort({ conversationTimestamp: -1 })
+                    .toArray()
+            )
             
             trackActivity(Date.now() - startTime) // Track response time
             return chats.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...chat }) => chat as Chat)
@@ -1867,9 +2027,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getContacts(): Promise<{ [id: string]: Contact }> {
-            const contacts = await collections.contacts
-                .find({ instanceId })
-                .toArray()
+            const contacts = await withConnection(async () =>
+                collections.contacts
+                    .find({ instanceId })
+                    .toArray()
+            )
             
             const contactsMap: { [id: string]: Contact } = {}
             for (const contact of contacts) {
@@ -1964,22 +2126,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 // First try the standard query
-                let message = await collections.messages.findOne({
-                    instanceId: validatedInstanceId,
-                    jid: validJid,
-                    'key.id': validId
-                })
+                let message = await withConnection(async () => 
+                    collections.messages.findOne({
+                        instanceId: validatedInstanceId,
+                        jid: validJid,
+                        'key.id': validId
+                    })
+                )
                 
                 // If not found, try alternative queries for poll messages and other edge cases
                 if (!message) {
                     
                     // Try with key.remoteJid instead of jid field (common for poll messages)
                     log(`[getMessage] Primary query failed, trying fallback with key.remoteJid for ${validJid}/${validId}`)
-                    message = await collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        'key.remoteJid': validJid,
-                        'key.id': validId
-                    })
+                    message = await withConnection(async () =>
+                        collections.messages.findOne({
+                            instanceId: validatedInstanceId,
+                            'key.remoteJid': validJid,
+                            'key.id': validId
+                        })
+                    )
                     
                     if (message) {
                         log(`[getMessage] Found message using key.remoteJid fallback for ${validJid}/${validId}`)
@@ -1989,10 +2155,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // If still not found, try without the jid constraint at all (just instanceId and key.id)
                 // This handles edge cases like LID/phone number mismatches
                 if (!message) {
-                    message = await collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        'key.id': validId
-                    })
+                    message = await withConnection(async () =>
+                        collections.messages.findOne({
+                            instanceId: validatedInstanceId,
+                            'key.id': validId
+                        })
+                    )
                     
                     // Check if the JID mismatch is acceptable
                     if (message && message.key?.remoteJid !== validJid) {
@@ -2020,19 +2188,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         // Update messages that have the LID as remoteJid
                                         // Only update remoteJid and jid fields, leave senderPn and senderLid as-is
                                         try {
-                                            const updateResult = await collections.messages.updateMany(
-                                                {
-                                                    instanceId: validatedInstanceId,
-                                                    'key.remoteJid': lidJid
-                                                },
-                                                {
-                                                    $set: {
-                                                        'key.remoteJid': phoneJid,
-                                                        jid: phoneJid,
-                                                        'lidMapping.resolved': true,
-                                                        'lidMapping.resolvedAt': new Date()
+                                            const updateResult = await withConnection(async () =>
+                                                collections.messages.updateMany(
+                                                    {
+                                                        instanceId: validatedInstanceId,
+                                                        'key.remoteJid': lidJid
+                                                    },
+                                                    {
+                                                        $set: {
+                                                            'key.remoteJid': phoneJid,
+                                                            jid: phoneJid,
+                                                            'lidMapping.resolved': true,
+                                                            'lidMapping.resolvedAt': new Date()
+                                                        }
                                                     }
-                                                }
+                                                )
                                             )
                                             
                                             if (updateResult.modifiedCount > 0) {
@@ -2112,20 +2282,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         
                         try {
                             // Update the revoked message to mark it as deleted/revoked
-                            const updateResult = await collections.messages.updateOne(
-                                {
-                                    instanceId: validatedInstanceId,
-                                    jid: revokedKey.remoteJid || jid,
-                                    'key.id': revokedKey.id
-                                },
-                                {
-                                    $set: {
-                                        'message.protocolMessage': clonedMessage.message.protocolMessage,
-                                        revoked: true,
-                                        revokedAt: new Date(),
-                                        revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid
+                            const updateResult = await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    {
+                                        instanceId: validatedInstanceId,
+                                        jid: revokedKey.remoteJid || jid,
+                                        'key.id': revokedKey.id
+                                    },
+                                    {
+                                        $set: {
+                                            'message.protocolMessage': clonedMessage.message.protocolMessage,
+                                            revoked: true,
+                                            revokedAt: new Date(),
+                                            revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid
+                                        }
                                     }
-                                }
+                                )
                             )
                             
                             if (updateResult.matchedCount > 0) {
@@ -2241,22 +2413,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Fallback to direct database operation
             try {
-                await collections.messages.replaceOne(
-                    {
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        'key.id': clonedMessage.key?.id
-                    },
-                    {
-                        ...clonedMessage,
-                        // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
-                        ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        ...(pollVoteDecrypted && { pollVoteDecrypted }),
-                        updatedAt: new Date()
-                    },
-                    { upsert: true }
+                await withConnection(async () =>
+                    collections.messages.replaceOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid: validJid,
+                            'key.id': clonedMessage.key?.id
+                        },
+                        {
+                            ...clonedMessage,
+                            // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
+                            ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                            instanceId: validatedInstanceId,
+                            jid: validJid,
+                            ...(pollVoteDecrypted && { pollVoteDecrypted }),
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
                 )
             } catch (error: any) {
                 // Handle duplicate key errors gracefully
@@ -2264,20 +2438,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`⚠️ [Direct] Duplicate key error for message ${clonedMessage.key?.id} in chat ${validJid} - message already exists`)
                     // Try to update instead of replace
                     try {
-                        await collections.messages.updateOne(
-                            {
-                                instanceId: validatedInstanceId,
-                                jid: validJid,
-                                'key.id': clonedMessage.key?.id
-                            },
-                            {
-                                $set: {
-                                    ...clonedMessage,
-                                    ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
-                                    ...(pollVoteDecrypted && { pollVoteDecrypted }),
-                                    updatedAt: new Date()
+                        await withConnection(async () =>
+                            collections.messages.updateOne(
+                                {
+                                    instanceId: validatedInstanceId,
+                                    jid: validJid,
+                                    'key.id': clonedMessage.key?.id
+                                },
+                                {
+                                    $set: {
+                                        ...clonedMessage,
+                                        ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                        ...(pollVoteDecrypted && { pollVoteDecrypted }),
+                                        updatedAt: new Date()
+                                    }
                                 }
-                            }
+                            )
                         )
                         log(`✅ [Direct] Successfully updated existing message ${clonedMessage.key?.id} after duplicate key error`)
                     } catch (updateError) {
@@ -2403,11 +2579,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct update - preserve quoted message structure AND messageTimestamp for edits
-            const existingMsg = await collections.messages.findOne({
-                instanceId,
-                jid: normalizedJid,
-                'key.id': id
-            }) as any
+            const existingMsg = await withConnection(async () =>
+                collections.messages.findOne({
+                    instanceId,
+                    jid: normalizedJid,
+                    'key.id': id
+                })
+            ) as any
             
             let finalUpdate = update
             
@@ -2453,15 +2631,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
-            const result = await collections.messages.updateOne(
-                {
-                    instanceId,
-                    jid: normalizedJid,
+            const result = await withConnection(async () =>
+                collections.messages.updateOne(
+                    {
+                        instanceId,
+                        jid: normalizedJid,
                     'key.id': id
                 },
                 {
                     $set: { ...finalUpdate, updatedAt: new Date() }
                 }
+                )
             )
             
             return result.modifiedCount > 0
@@ -2537,7 +2717,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getGroupMetadata(jid: string): Promise<GroupMetadata | null> {
-            const metadata = await collections.groupMetadata.findOne({ instanceId, id: jid })
+            const metadata = await withConnection(async () =>
+                collections.groupMetadata.findOne({ instanceId, id: jid })
+            )
             if (!metadata) return null
             
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -4124,6 +4306,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Close dedicated connection
                 await client.close()
             }
+            
+            // Reset connection state
+            isConnected = false
+            isConnecting = false
+            reconnectAttempts = 0
         }
     }
 
