@@ -1881,22 +1881,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // If not found, try alternative queries for poll messages and other edge cases
                 if (!message) {
                     
-                    // Try with key.remoteJid instead of jid field
+                    // Try with key.remoteJid instead of jid field (common for poll messages)
+                    log(`[getMessage] Primary query failed, trying fallback with key.remoteJid for ${validJid}/${validId}`)
                     message = await collections.messages.findOne({
                         instanceId: validatedInstanceId,
                         'key.remoteJid': validJid,
                         'key.id': validId
                     })
                     
-                    if (!message) {
-                        // Try without the jid constraint at all (just instanceId and key.id)
-                        message = await collections.messages.findOne({
-                            instanceId: validatedInstanceId,
-                            'key.id': validId
-                        })
-                        
-                        // Check if the JID mismatch is acceptable
-                        if (message && message.key?.remoteJid !== validJid) {
+                    if (message) {
+                        log(`[getMessage] Found message using key.remoteJid fallback for ${validJid}/${validId}`)
+                    }
+                }
+                    
+                // If still not found, try without the jid constraint at all (just instanceId and key.id)
+                // This handles edge cases like LID/phone number mismatches
+                if (!message) {
+                    message = await collections.messages.findOne({
+                        instanceId: validatedInstanceId,
+                        'key.id': validId
+                    })
+                    
+                    // Check if the JID mismatch is acceptable
+                    if (message && message.key?.remoteJid !== validJid) {
                             const foundJid = message.key?.remoteJid || message.jid
                             
                             // Check if JIDs are equivalent (same JID with different format)
@@ -1976,7 +1983,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         
                         return null
                     }
-                }
                 
                 // Check access permissions
                 accessContext.validateAccess(message.instanceId, 'read')

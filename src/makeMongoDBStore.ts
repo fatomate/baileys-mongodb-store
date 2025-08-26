@@ -1854,11 +1854,26 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
                 if (cached) return cached
                 
-                const message = await collections.messages.findOne({
+                // Primary query using jid
+                let message = await collections.messages.findOne({
                     instanceId: validatedInstanceId,
                     jid: validJid,
                     'key.id': validId
                 })
+                
+                // Fallback query using key.remoteJid (for poll messages and edge cases)
+                if (!message) {
+                    console.log(`[getMessage] Primary query failed for jid: ${validJid}, id: ${validId}. Trying fallback with key.remoteJid`)
+                    message = await collections.messages.findOne({
+                        instanceId: validatedInstanceId,
+                        'key.remoteJid': validJid,
+                        'key.id': validId
+                    })
+                    
+                    if (message) {
+                        console.log(`[getMessage] ✅ Found message using fallback query with key.remoteJid`)
+                    }
+                }
                 
                 if (!message) return null
                 
