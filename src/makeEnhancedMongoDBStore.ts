@@ -926,11 +926,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             
                             try {
                                 // Update the revoked message to mark it as deleted/revoked
+                                const targetJid = revokedKey.remoteJid || jid
                                 const updateResult = await withConnection(async () =>
                                     collections.messages.updateOne(
                                         {
                                             instanceId,
-                                            jid: revokedKey.remoteJid || jid,
+                                            jid: targetJid,
                                             'key.id': revokedKey.id
                                         },
                                         {
@@ -1793,57 +1794,57 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         const chatsTTL = getTTLForCollection('chats') * 24 * 60 * 60
         indexPromises.push(
-            collections.chats.createIndex({ instanceId: 1, id: 1 }, { unique: true }).then(() => {}),
-            collections.chats.createIndex({ updatedAt: 1 }, { expireAfterSeconds: chatsTTL }).then(() => {})
+            withConnection(async () => collections.chats.createIndex({ instanceId: 1, id: 1 }, { unique: true })).then(() => {}),
+            withConnection(async () => collections.chats.createIndex({ updatedAt: 1 }, { expireAfterSeconds: chatsTTL })).then(() => {})
         )
         
         const contactsTTL = getTTLForCollection('contacts') * 24 * 60 * 60
         indexPromises.push(
-            collections.contacts.createIndex({ instanceId: 1, id: 1 }, { unique: true }).then(() => {}),
-            collections.contacts.createIndex({ updatedAt: 1 }, { expireAfterSeconds: contactsTTL }).then(() => {})
+            withConnection(async () => collections.contacts.createIndex({ instanceId: 1, id: 1 }, { unique: true })).then(() => {}),
+            withConnection(async () => collections.contacts.createIndex({ updatedAt: 1 }, { expireAfterSeconds: contactsTTL })).then(() => {})
         )
         
         const messagesTTL = getTTLForCollection('messages') * 24 * 60 * 60
         indexPromises.push(
-            collections.messages.createIndex({ instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true }).then(() => {}),
-            collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 }).then(() => {}),
-            collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: messagesTTL }).then(() => {}),
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true })).then(() => {}),
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 })).then(() => {}),
+            withConnection(async () => collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: messagesTTL })).then(() => {}),
             // Index for media deduplication
-            collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true }).then(() => {})
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true })).then(() => {})
         )
         
         // No TTL for groupMetadata - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            collections.groupMetadata.dropIndex('updatedAt_1').catch(() => {
+            withConnection(async () => collections.groupMetadata.dropIndex('updatedAt_1')).catch(() => {
                 // Index might not exist, ignore error
-            }).then(() => {
+            }).then(async () => {
                 // Create unique index without TTL
-                return collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true })
+                return withConnection(async () => collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true }))
             }).then(() => {})
             // TTL index removed - groupMetadata will persist until explicitly deleted
         )
         
         const stateTTL = getTTLForCollection('state') * 24 * 60 * 60
         indexPromises.push(
-            collections.state.createIndex({ instanceId: 1 }, { unique: true }).then(() => {}),
-            collections.state.createIndex({ updatedAt: 1 }, { expireAfterSeconds: stateTTL }).then(() => {})
+            withConnection(async () => collections.state.createIndex({ instanceId: 1 }, { unique: true })).then(() => {}),
+            withConnection(async () => collections.state.createIndex({ updatedAt: 1 }, { expireAfterSeconds: stateTTL })).then(() => {})
         )
         
         const presencesTTL = getTTLForCollection('presences') * 24 * 60 * 60
         indexPromises.push(
-            collections.presences.createIndex({ instanceId: 1, id: 1 }, { unique: true }).then(() => {}),
-            collections.presences.createIndex({ updatedAt: 1 }, { expireAfterSeconds: presencesTTL }).then(() => {})
+            withConnection(async () => collections.presences.createIndex({ instanceId: 1, id: 1 }, { unique: true })).then(() => {}),
+            withConnection(async () => collections.presences.createIndex({ updatedAt: 1 }, { expireAfterSeconds: presencesTTL })).then(() => {})
         )
         
         // No TTL for labels - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            collections.labels.dropIndex('updatedAt_1').catch(() => {
+            withConnection(async () => collections.labels.dropIndex('updatedAt_1')).catch(() => {
                 // Index might not exist, ignore error
-            }).then(() => {
+            }).then(async () => {
                 // Create unique index without TTL
-                return collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true })
+                return withConnection(async () => collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true }))
             }).then(() => {})
             // TTL index removed - labels will persist until explicitly deleted
         )
@@ -1851,11 +1852,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // No TTL for labelAssociations - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            collections.labelAssociations.dropIndex('updatedAt_1').catch(() => {
+            withConnection(async () => collections.labelAssociations.dropIndex('updatedAt_1')).catch(() => {
                 // Index might not exist, ignore error
-            }).then(() => {
+            }).then(async () => {
                 // Create unique index without TTL
-                return collections.labelAssociations.createIndex({ instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true })
+                return withConnection(async () => collections.labelAssociations.createIndex({ instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true }))
             }).then(() => {})
             // TTL index removed - labelAssociations will persist until explicitly deleted
         )
@@ -2007,7 +2008,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }))
             
-            await collections.chats.bulkWrite(bulkOps)
+            await withConnection(async () =>
+                collections.chats.bulkWrite(bulkOps)
+            )
             trackActivity(Date.now() - startTime) // Track response time
         },
 
@@ -2043,9 +2046,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct update
-            const result = await collections.chats.updateOne(
-                { instanceId, id: normalizedJid },
-                { $set: { ...update, updatedAt: new Date() } }
+            const result = await withConnection(async () =>
+                collections.chats.updateOne(
+                    { instanceId, id: normalizedJid },
+                    { $set: { ...update, updatedAt: new Date() } }
+                )
             )
             
             trackActivity(Date.now() - startTime) // Track response time
@@ -2085,10 +2090,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct delete
-            await collections.chats.deleteMany({
-                instanceId,
-                id: { $in: normalizedJids }
-            })
+            await withConnection(async () =>
+                collections.chats.deleteMany({
+                    instanceId,
+                    id: { $in: normalizedJids }
+                })
+            )
             trackActivity(Date.now() - startTime) // Track response time
         },
 
@@ -2110,7 +2117,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getContact(jid: string): Promise<Contact | null> {
-            const contact = await collections.contacts.findOne({ instanceId, id: jid })
+            const contact = await withConnection(async () =>
+                collections.contacts.findOne({ instanceId, id: jid })
+            )
             if (!contact) return null
             
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -2168,10 +2177,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getMessages(jid: string): Promise<proto.IWebMessageInfo[]> {
-            const messages = await collections.messages
-                .find({ instanceId, jid })
-                .sort({ messageTimestamp: -1 })
-                .toArray()
+            const messages = await withConnection(async () =>
+                collections.messages
+                    .find({ instanceId, jid })
+                    .sort({ messageTimestamp: -1 })
+                    .toArray()
+            )
             
             return messages.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => 
                 convertBinaryToBuffer(msg))
@@ -2293,9 +2304,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // After all attempts, if still not found, log debug and return null
                     if (!message) {
                         // Log more details to help debug
-                        const count = await collections.messages.countDocuments({
-                            instanceId: validatedInstanceId
-                        })
+                        const count = await withConnection(async () =>
+                            collections.messages.countDocuments({
+                                instanceId: validatedInstanceId
+                            })
+                        )
                         log(`Total messages for instance: ${count}`)
                         
                         // Try to find similar message IDs
@@ -2572,19 +2585,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         .then(async (mediaResult) => {
                             if (mediaResult.success && mediaResult.localPath) {
                                 // Update message with media URL
-                                await collections.messages.updateOne(
-                                    { 
-                                        instanceId: validatedInstanceId, 
-                                        jid: validJid, 
-                                        'key.id': clonedMessage.key?.id 
-                                    },
-                                    { 
-                                        $set: { 
-                                            mediaUrl: mediaResult.localPath,
-                                            mediaType: mediaResult.mediaType,
-                                            mediaHash: mediaResult.mediaHash
-                                        } 
-                                    }
+                                await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        { 
+                                            instanceId: validatedInstanceId, 
+                                            jid: validJid, 
+                                            'key.id': clonedMessage.key?.id 
+                                        },
+                                        { 
+                                            $set: { 
+                                                mediaUrl: mediaResult.localPath,
+                                                mediaType: mediaResult.mediaType,
+                                                mediaHash: mediaResult.mediaHash
+                                            } 
+                                        }
+                                    )
                                 )
                                 log(`✅ Official API media downloaded successfully: ${mediaResult.localPath}`)
                                 config.logger?.info({
@@ -2837,15 +2852,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct write
-            await collections.groupMetadata.replaceOne(
-                { instanceId, id: metadata.id },
-                { ...metadata, instanceId, updatedAt: new Date() },
-                { upsert: true }
+            await withConnection(async () =>
+                collections.groupMetadata.replaceOne(
+                    { instanceId, id: metadata.id },
+                    { ...metadata, instanceId, updatedAt: new Date() },
+                    { upsert: true }
+                )
             )
         },
 
         async getState(): Promise<ConnectionState> {
-            const state = await collections.state.findOne({ instanceId })
+            const state = await withConnection(async () =>
+                collections.state.findOne({ instanceId })
+            )
             if (!state) return { connection: 'close' }
             
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -2875,19 +2894,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct update
-            await collections.state.updateOne(
-                { instanceId },
-                { 
-                    $set: { ...update, instanceId, updatedAt: new Date() }
-                },
-                { upsert: true }
+            await withConnection(async () =>
+                collections.state.updateOne(
+                    { instanceId },
+                    { 
+                        $set: { ...update, instanceId, updatedAt: new Date() }
+                    },
+                    { upsert: true }
+                )
             )
         },
 
         async getPresences(): Promise<{ [id: string]: { [participant: string]: PresenceData } }> {
-            const presences = await collections.presences
-                .find({ instanceId })
-                .toArray()
+            const presences = await withConnection(async () =>
+                collections.presences
+                    .find({ instanceId })
+                    .toArray()
+            )
             
             const presencesMap: { [id: string]: { [participant: string]: PresenceData } } = {}
             for (const presence of presences) {
@@ -2920,19 +2943,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct update
-            await collections.presences.updateOne(
-                { instanceId, id },
-                {
-                    $set: { presences, updatedAt: new Date() }
-                },
-                { upsert: true }
+            await withConnection(async () =>
+                collections.presences.updateOne(
+                    { instanceId, id },
+                    {
+                        $set: { presences, updatedAt: new Date() }
+                    },
+                    { upsert: true }
+                )
             )
         },
 
         async getLabels(): Promise<{ [id: string]: Label }> {
-            const labels = await collections.labels
-                .find({ instanceId })
-                .toArray()
+            const labels = await withConnection(async () =>
+                collections.labels
+                    .find({ instanceId })
+                    .toArray()
+            )
             
             const labelsMap: { [id: string]: Label } = {}
             for (const label of labels) {
@@ -2967,10 +2994,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct write
-            await collections.labels.replaceOne(
-                { instanceId, id },
-                { ...label, instanceId, updatedAt: new Date() },
-                { upsert: true }
+            await withConnection(async () =>
+                collections.labels.replaceOne(
+                    { instanceId, id },
+                    { ...label, instanceId, updatedAt: new Date() },
+                    { upsert: true }
+                )
             )
         },
 
@@ -2996,29 +3025,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Fallback to direct delete
-            await collections.labels.deleteOne({ instanceId, id })
+            await withConnection(async () =>
+                collections.labels.deleteOne({ instanceId, id })
+            )
         },
 
         async getLabelAssociations(): Promise<LabelAssociation[]> {
-            const associations = await collections.labelAssociations
-                .find({ instanceId })
-                .toArray()
+            const associations = await withConnection(async () =>
+                collections.labelAssociations
+                    .find({ instanceId })
+                    .toArray()
+            )
             
             return associations.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...assoc }) => assoc as LabelAssociation)
         },
 
         async getChatLabels(chatId: string): Promise<LabelAssociation[]> {
-            const associations = await collections.labelAssociations
-                .find({ instanceId, chatId })
-                .toArray()
+            const associations = await withConnection(async () =>
+                collections.labelAssociations
+                    .find({ instanceId, chatId })
+                    .toArray()
+            )
             
             return associations.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...assoc }) => assoc as LabelAssociation)
         },
 
         async getMessageLabels(messageId: string): Promise<string[]> {
-            const associations = await collections.labelAssociations
-                .find({ instanceId, messageId })
-                .toArray()
+            const associations = await withConnection(async () =>
+                collections.labelAssociations
+                    .find({ instanceId, messageId })
+                    .toArray()
+            )
             
             return associations.map(assoc => assoc.labelId)
         },
@@ -3111,14 +3148,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 filter.messageId = association.messageId
             }
             
-            const result = await collections.labelAssociations.replaceOne(
-                filter,
-                {
-                    ...association,
-                    instanceId,
-                    updatedAt: new Date()
-                },
-                { upsert: true }
+            const result = await withConnection(async () =>
+                collections.labelAssociations.replaceOne(
+                    filter,
+                    {
+                        ...association,
+                        instanceId,
+                        updatedAt: new Date()
+                    },
+                    { upsert: true }
+                )
             )
             
             // Validate operation succeeded
@@ -3219,7 +3258,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 filter.messageId = association.messageId
             }
             
-            const result = await collections.labelAssociations.deleteOne(filter)
+            const result = await withConnection(async () =>
+                collections.labelAssociations.deleteOne(filter)
+            )
             
             if (result.deletedCount === 0) {
                 logWarn(`[Direct] Warning: No label association found to delete - chatId: ${association.chatId}, labelId: ${association.labelId}, type: ${association.type}`)
@@ -3261,20 +3302,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             
                             try {
                                 // Update the revoked message to mark it as deleted/revoked
-                                const updateResult = await collections.messages.updateOne(
-                                    {
-                                        instanceId,
-                                        jid: revokedKey.remoteJid || jid,
-                                        'key.id': revokedKey.id
-                                    },
-                                    {
-                                        $set: {
-                                            'message.protocolMessage': msg.message.protocolMessage,
-                                            revoked: true,
-                                            revokedAt: new Date(),
-                                            revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid
+                                const targetJid = revokedKey.remoteJid || jid
+                                const updateResult = await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        {
+                                            instanceId,
+                                            jid: targetJid,
+                                            'key.id': revokedKey.id
+                                        },
+                                        {
+                                            $set: {
+                                                'message.protocolMessage': msg.message?.protocolMessage,
+                                                revoked: true,
+                                                revokedAt: new Date(),
+                                                revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid
+                                            }
                                         }
-                                    }
+                                    )
                                 )
                                 
                                 if (updateResult.matchedCount > 0) {
@@ -3465,23 +3509,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 if (mediaResult.success && mediaResult.localPath) {
                                     // Update message with media URL
-                                    const updateResult = await collections.messages.updateOne(
-                                        { 
-                                            instanceId, 
-                                            jid: jid || undefined, 
-                                            'key.id': msg.key.id 
-                                        },
-                                        { 
-                                            $set: { 
-                                                mediaUrl: mediaResult.localPath,
-                                                mediaType: mediaResult.mediaType,
-                                                mediaFileName: mediaResult.fileName,
-                                                mediaFileSize: mediaResult.fileSize,
-                                                mediaHash: mediaResult.mediaHash,
-                                                mediaReused: mediaResult.reused || false,
-                                                mediaDownloadedAt: new Date()
-                                            } 
-                                        }
+                                    const updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { 
+                                                instanceId, 
+                                                jid: jid || undefined, 
+                                                'key.id': msg.key.id 
+                                            },
+                                            { 
+                                                $set: { 
+                                                    mediaUrl: mediaResult.localPath,
+                                                    mediaType: mediaResult.mediaType,
+                                                    mediaFileName: mediaResult.fileName,
+                                                    mediaFileSize: mediaResult.fileSize,
+                                                    mediaHash: mediaResult.mediaHash,
+                                                    mediaReused: mediaResult.reused || false,
+                                                    mediaDownloadedAt: new Date()
+                                                } 
+                                            }
+                                        )
                                     )
                                     
                                     if (mediaResult.reused) {
@@ -3914,10 +3960,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         if (label.deleted) {
                             await storeImpl.deleteLabel(label.id)
                             // Also delete all associations for this label
-                            const deleteResult = await collections.labelAssociations.deleteMany({
-                                instanceId,
-                                labelId: label.id
-                            })
+                            const deleteResult = await withConnection(async () =>
+                                collections.labelAssociations.deleteMany({
+                                    instanceId,
+                                    labelId: label.id
+                                })
+                            )
                             if (deleteResult.deletedCount > 0) {
                                 log(`[${instanceId}] Deleted ${deleteResult.deletedCount} label associations for deleted label ${label.id}`)
                             }
@@ -4043,12 +4091,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
                 
-                messages = await collections.messages
-                    .find(query)
-                    .sort({ messageTimestamp: -1 })
-                    .limit(count)
-                    .toArray()
-                    .then(msgs => msgs.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg)))
+                messages = await withConnection(async () =>
+                    collections.messages
+                        .find(query)
+                        .sort({ messageTimestamp: -1 })
+                        .limit(count)
+                        .toArray()
+                        .then(msgs => msgs.map(({ _id, instanceId: _instanceId, jid: _jid, updatedAt: _updatedAt, ...msg }) => convertBinaryToBuffer(msg)))
+                )
             }
             
             return messages
@@ -4159,7 +4209,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             for (const collName of collectionNames) {
                 try {
                     const collection = collections[collName as keyof MongoCollections]
-                    const indexes = await collection.listIndexes().toArray()
+                    const indexes = await withConnection(async () => 
+                        collection.listIndexes().toArray()
+                    )
                     indexStatus.push({
                         collection: `${collectionPrefix}${collName}`,
                         indexes: indexes.map(idx => ({
@@ -4243,11 +4295,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             try {
                 // Fetch the message from database
-                const message = await collections.messages.findOne({
-                    instanceId,
-                    jid,
-                    'key.id': messageId
-                })
+                const message = await withConnection(async () =>
+                    collections.messages.findOne({
+                        instanceId,
+                        jid,
+                        'key.id': messageId
+                    })
+                )
                 
                 if (!message) {
                     return { success: false, error: 'Message not found' }
@@ -4260,11 +4314,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Function to check for existing media by hash
                 const checkExistingMedia = async (hash: string): Promise<string | null> => {
-                    const existing = await collections.messages.findOne({
-                        instanceId,
-                        mediaHash: hash,
-                        mediaUrl: { $exists: true }
-                    }) as any
+                    const existing = await withConnection(async () =>
+                        collections.messages.findOne({
+                            instanceId,
+                            mediaHash: hash,
+                            mediaUrl: { $exists: true }
+                        })
+                    ) as any
                     return existing?.mediaUrl || null
                 }
                 
@@ -4273,23 +4329,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 if (mediaResult.success && mediaResult.localPath) {
                     // Update message with media URL
-                    await collections.messages.updateOne(
-                        { 
-                            instanceId, 
-                            jid, 
-                            'key.id': messageId 
-                        },
-                        { 
-                            $set: { 
-                                mediaUrl: mediaResult.localPath,
-                                mediaType: mediaResult.mediaType,
-                                mediaFileName: mediaResult.fileName,
-                                mediaFileSize: mediaResult.fileSize,
-                                mediaHash: mediaResult.mediaHash,
-                                mediaReused: mediaResult.reused || false,
-                                mediaDownloadedAt: new Date()
-                            } 
-                        }
+                    await withConnection(async () =>
+                        collections.messages.updateOne(
+                            { 
+                                instanceId, 
+                                jid, 
+                                'key.id': messageId 
+                            },
+                            { 
+                                $set: { 
+                                    mediaUrl: mediaResult.localPath,
+                                    mediaType: mediaResult.mediaType,
+                                    mediaFileName: mediaResult.fileName,
+                                    mediaFileSize: mediaResult.fileSize,
+                                    mediaHash: mediaResult.mediaHash,
+                                    mediaReused: mediaResult.reused || false,
+                                    mediaDownloadedAt: new Date()
+                                } 
+                            }
+                        )
                     )
                     
                     return { success: true, localPath: mediaResult.localPath }
