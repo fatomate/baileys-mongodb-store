@@ -38,6 +38,9 @@ import { TTLMonitor } from './utils/ttl'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
 import { LidHandler } from './utils/lidHandler'
 import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
+import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
+// @ts-ignore - Type is used in annotations
+import type { ConnectionConfig } from './types/connection'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -486,7 +489,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         memory,
         ttlMonitoring,
         meId,
-        lidHandler: lidHandlerConfig
+        lidHandler: lidHandlerConfig,
+        connectionConfig,
+        useSharedConnections = true
     } = config
     
     // Validate instance ID
@@ -529,14 +534,65 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let lidHandler: LidHandler | null = null
 
     // MongoDB connection
-    const client: MongoClient = new MongoClient(uri, {
-        maxPoolSize: 100,
-        minPoolSize: 10,
-        maxIdleTimeMS: 30000,
-        writeConcern: { w: 1, j: false }
-    })
-    await client.connect()
-    const db = client.db(dbName)
+    let client: MongoClient
+    let db
+    let connectionManager: ConnectionManager | null = null
+    let isUsingSharedConnection = false
+    
+    // Helper function to track activity for shared connections
+    const trackActivity = (responseTime?: number) => {
+        if (isUsingSharedConnection && connectionManager) {
+            connectionManager.recordActivity(validatedInstanceId, responseTime)
+        }
+    }
+    
+    // Check if we should use shared connections
+    if (useSharedConnections) {
+        try {
+            // Use ConnectionManager for shared connections
+            connectionManager = getConnectionManager({
+                logLevel: logLevel as any,
+                enableMetrics: enableMetrics
+            })
+            
+            const connection = await connectionManager.registerInstance({
+                instanceId: validatedInstanceId,
+                uri,
+                database: dbName,
+                config: connectionConfig
+            })
+            
+            client = connection.client
+            db = connection.db
+            isUsingSharedConnection = true
+            
+            log(`Using shared connection for instance ${instanceId}`)
+        } catch (error) {
+            logWarn(`Failed to use shared connection for instance ${instanceId}, falling back to dedicated connection:`, error)
+            
+            // Fallback to dedicated connection on error
+            client = new MongoClient(uri, {
+                maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
+                minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                maxIdleTimeMS: 30000,
+                writeConcern: { w: 1, j: false }
+            })
+            await client.connect()
+            db = client.db(dbName)
+            isUsingSharedConnection = false
+            connectionManager = null
+        }
+    } else {
+        // Use dedicated connection (original behavior)
+        client = new MongoClient(uri, {
+            maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
+            minPoolSize: connectionConfig?.minPoolSize ?? 10,
+            maxIdleTimeMS: 30000,
+            writeConcern: { w: 1, j: false }
+        })
+        await client.connect()
+        db = client.db(dbName)
+    }
     
     // Initialize TTL monitor after DB connection
     if (ttlMonitoring) {
@@ -688,6 +744,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Create queues for different event types
             createQueueAndWorker<MessageJob>(QueueType.MESSAGES, async (job) => {
+                const jobStartTime = Date.now()
+                trackActivity() // Track request
                 const { type, message, messageId, update, deleteIds, jid } = job.data
                 
                 if (type === 'upsert' && message) {
@@ -987,10 +1045,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
                 
+                trackActivity(Date.now() - jobStartTime) // Track response time
                 return { success: true }
             })
             
             createQueueAndWorker<ChatJob>(QueueType.CHATS, async (job) => {
+                const jobStartTime = Date.now()
+                trackActivity() // Track request
                 const { type, chats, chatId, update, deleteIds } = job.data
                 
                 if (type === 'upsert' && chats) {
@@ -1014,11 +1075,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     })
                 }
                 
+                trackActivity(Date.now() - jobStartTime) // Track response time
                 return { success: true }
             })
             
             createQueueAndWorker<ContactJob>(QueueType.CONTACTS, async (job) => {
                 const { type, contacts, contact } = job.data
+                const jobStartTime = Date.now()
+                trackActivity() // Track request
                 
                 if (type === 'upsert' && contacts) {
                     const bulkOps = contacts.map(contact => ({
@@ -1029,6 +1093,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }))
                     await collections.contacts.bulkWrite(bulkOps, { ordered: false })
+                    trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
                     await collections.contacts.replaceOne(
                         { instanceId, id: contact.id },
@@ -1637,11 +1702,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async getChats(): Promise<Chat[]> {
+            const startTime = Date.now()
+            trackActivity() // Track request
+            
             const chats = await collections.chats
                 .find({ instanceId })
                 .sort({ conversationTimestamp: -1 })
                 .toArray()
             
+            trackActivity(Date.now() - startTime) // Track response time
             return chats.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...chat }) => chat as Chat)
         },
 
@@ -1670,6 +1739,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         async upsertChats(...chats: Chat[]): Promise<void> {
             if (chats.length === 0) return
             
+            const startTime = Date.now()
+            trackActivity() // Track request
+            
             // Normalize chat IDs through LID handler if available
             const normalizedChats = await Promise.all(chats.map(async (chat) => {
                 if (lidHandler && chat.id) {
@@ -1693,6 +1765,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         },
                         defaultJobOptions
                     )
+                    trackActivity(Date.now() - startTime) // Track response time
                     return
                 } catch (error) {
                     logError('[Bull Chats] Failed to queue, falling back:', error)
@@ -1709,9 +1782,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }))
             
             await collections.chats.bulkWrite(bulkOps)
+            trackActivity(Date.now() - startTime) // Track response time
         },
 
         async updateChat(jid: string, update: Partial<Chat>): Promise<boolean> {
+            const startTime = Date.now()
+            trackActivity() // Track request
+            
             // Normalize JID through LID handler if available
             let normalizedJid = jid
             if (lidHandler) {
@@ -1745,10 +1822,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 { $set: { ...update, updatedAt: new Date() } }
             )
             
+            trackActivity(Date.now() - startTime) // Track response time
             return result.modifiedCount > 0
         },
 
         async deleteChats(jids: string[]): Promise<void> {
+            const startTime = Date.now()
+            trackActivity() // Track request
+            
             // Normalize JIDs through LID handler if available
             const normalizedJids = await Promise.all(jids.map(async (jid) => {
                 if (lidHandler) {
@@ -1782,6 +1863,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 instanceId,
                 id: { $in: normalizedJids }
             })
+            trackActivity(Date.now() - startTime) // Track response time
         },
 
         async getContacts(): Promise<{ [id: string]: Contact }> {
@@ -1811,6 +1893,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         async upsertContacts(contacts: Contact[]): Promise<void> {
             if (contacts.length === 0) return
             
+            const startTime = Date.now()
+            trackActivity() // Track request
+            
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.CONTACTS)) {
                 try {
@@ -1829,6 +1914,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             defaultJobOptions
                         )
                     }
+                    trackActivity(Date.now() - startTime) // Track response time for queued operation
                     return
                 } catch (error) {
                     logError('[Bull Contacts] Failed to queue, falling back:', error)
@@ -1863,13 +1949,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
             try {
+                const startTime = Date.now()
+                trackActivity() // Track request
+                
                 const validJid = safeValidateJID(jid)
                 const validId = safeValidateMessageId(id)
                 
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
                 
                 const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
-                if (cached) return cached
+                if (cached) {
+                    trackActivity(Date.now() - startTime) // Track cache hit
+                    return cached
+                }
                 
                 // First try the standard query
                 let message = await collections.messages.findOne({
@@ -3949,6 +4041,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         },
         
+        async getConnectionMetrics(): Promise<any> {
+            if (isUsingSharedConnection && connectionManager) {
+                // Get metrics from connection manager
+                return connectionManager.getMetrics()
+            } else if (client) {
+                // Return basic metrics for dedicated connection
+                return {
+                    type: 'dedicated',
+                    instanceId: validatedInstanceId,
+                    connected: true, // If client exists, it's connected
+                    connectionConfig: {
+                        maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
+                        minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                        maxIdleTimeMS: 30000
+                    }
+                }
+            } else {
+                return {
+                    type: 'none',
+                    error: 'No active connection'
+                }
+            }
+        },
+        
         async close(): Promise<void> {
             // Remove repeatable job for cleanup if it exists
             if (queues.has(QueueType.LABEL_ASSOCIATIONS)) {
@@ -3999,7 +4115,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 ttlMonitor = null
             }
             
-            if (client) {
+            // Handle connection cleanup based on connection type
+            if (isUsingSharedConnection && connectionManager) {
+                // Unregister from connection manager
+                await connectionManager.unregisterInstance(validatedInstanceId)
+                connectionManager = null
+            } else if (client && !isUsingSharedConnection) {
+                // Close dedicated connection
                 await client.close()
             }
         }

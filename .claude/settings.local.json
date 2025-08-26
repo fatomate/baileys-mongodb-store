@@ -34,7 +34,9 @@
       "Bash(git commit:*)",
       "Bash(grep:*)",
       "Bash(sed:*)",
-      "mcp__ide__getDiagnostics"
+      "mcp__ide__getDiagnostics",
+      "Bash(chmod:*)",
+      "Read(//Users/firdausazizi/Library/CloudStorage/GoogleDrive-firdaus@fames.my/My Drive/Fatomate/Wabot/Fatomate/Wabot/Baileys MongoDB Store Project/baileys-mongodb-store/src/**)"
     ],
     "deny": []
   }

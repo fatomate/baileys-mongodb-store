@@ -9,6 +9,7 @@ import type { AuthConfig } from './utils/auth'
 import type { MemoryConfig } from './utils/memory'
 import type { TTLConfig } from './utils/ttl'
 import type { LidHandlerConfig } from './utils/lidHandler'
+import type { ConnectionConfig } from './types/connection'
 
 export interface RedisConfig {
     /**
@@ -129,6 +130,18 @@ export interface MongoDBStoreConfig {
      * Enables automatic @lid to phone number mapping
      */
     lidHandler?: LidHandlerConfig
+    
+    /**
+     * Optional connection configuration for tiered pooling
+     * Controls how connections are shared and managed
+     */
+    connectionConfig?: ConnectionConfig
+    
+    /**
+     * Whether to use shared connections via ConnectionManager
+     * Default: true (recommended for multiple instances)
+     */
+    useSharedConnections?: boolean
 }
 
 export interface MongoDBStore {
@@ -353,6 +366,24 @@ export interface MongoDBStore {
         error?: string
         message?: string
     }>
+    
+    /**
+     * Get connection metrics
+     */
+    getConnectionMetrics(): {
+        type: 'shared' | 'dedicated'
+        instanceId: string
+        tier?: 'hot' | 'warm' | 'cold'
+        operationsPerMinute?: number
+        avgResponseTime?: number
+        poolSize?: number
+        global?: {
+            totalConnections: number
+            totalInstances: number
+            poolDistribution: { hot: number; warm: number; cold: number }
+            utilizationRate: number
+        }
+    }
     
     /**
      * Close the MongoDB connection

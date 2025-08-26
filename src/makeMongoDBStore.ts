@@ -28,6 +28,9 @@ import {
 } from './utils/security'
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController, MemoryAwareBatchProcessor, calculateOptimalBatchSize } from './utils/memory'
+import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
+// @ts-ignore - Type is used in annotations
+import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
 import { LidHandler } from './utils/lidHandler'
 
@@ -228,7 +231,9 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         auth,
         memory,
         ttlMonitoring,
-        lidHandler: lidHandlerConfig
+        lidHandler: lidHandlerConfig,
+        connectionConfig,
+        useSharedConnections = true
     } = config
     
     // Validate instance ID
@@ -278,6 +283,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     let reconnectAttempts = 0
     const MAX_RECONNECT_ATTEMPTS = 5
     const RECONNECT_DELAY_BASE = 1000 // 1 second base delay
+    let connectionManager: ConnectionManager | null = null
+    let isUsingSharedConnection = false
     
     // Bull queue instances - one per event type
     const queues: Map<QueueType, Queue<any>> = new Map()
@@ -310,16 +317,50 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     // Initialize connection
     const initializeConnection = async (): Promise<void> => {
         try {
-            client = new MongoClient(uri, {
-                // Optimize connection pool for high concurrency
-                maxPoolSize: 100,
-                minPoolSize: 10,
-                maxIdleTimeMS: 30000,
-                // Write concern for better performance
-                writeConcern: { w: 1, j: false }
-            })
-            await client.connect()
-            db = client.db(dbName)
+            // Check if we should use shared connections
+            if (useSharedConnections) {
+                // Use ConnectionManager for shared connections
+                connectionManager = getConnectionManager({
+                    logLevel: logLevel as any,
+                    enableMetrics: true
+                })
+                
+                const connection = await connectionManager.registerInstance({
+                    instanceId: validatedInstanceId,
+                    uri,
+                    database: dbName,
+                    config: connectionConfig
+                })
+                
+                client = connection.client
+                db = connection.db
+                isUsingSharedConnection = true
+                
+                // Track activity on operations
+                log(`Using shared connection for instance ${instanceId}`)
+            } else {
+                // Use dedicated connection (original behavior)
+                client = new MongoClient(uri, {
+                    // Optimize connection pool for high concurrency
+                    maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
+                    minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                    maxIdleTimeMS: 30000,
+                    // Write concern for better performance
+                    writeConcern: { w: 1, j: false }
+                })
+                await client.connect()
+                db = client.db(dbName)
+                
+                // Update active connections for dedicated connections
+                activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
+                activeConnections.push({
+                    client,
+                    database: dbName,
+                    instanceId,
+                    collectionPrefix
+                })
+            }
+            
             isConnected = true
             isConnecting = false
             connectionError = null
@@ -339,15 +380,6 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 await lidHandler.initialize(db, collectionPrefix)
                 log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
             }
-            
-            // Update active connections
-            activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
-            activeConnections.push({
-                client,
-                database: dbName,
-                instanceId,
-                collectionPrefix
-            })
             
             log(`MongoDB connected successfully for instance ${instanceId}`)
         } catch (error) {
@@ -1175,11 +1207,26 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     
     // Wrapper for MongoDB operations with automatic reconnection
     const withConnection = async <T>(operation: () => Promise<T>): Promise<T> => {
+        const startTime = Date.now()
         try {
             await ensureConnection()
             // Refresh collections after reconnection
             collections = getCollections()
-            return await operation()
+            
+            // Track activity for connection manager
+            if (isUsingSharedConnection && connectionManager) {
+                connectionManager.recordActivity(validatedInstanceId)
+            }
+            
+            const result = await operation()
+            
+            // Record response time
+            if (isUsingSharedConnection && connectionManager) {
+                const responseTime = Date.now() - startTime
+                connectionManager.recordActivity(validatedInstanceId, responseTime)
+            }
+            
+            return result
         } catch (error: any) {
             // If it's a connection error, reset and try once more
             if (error.message?.includes('Client must be connected') || 
@@ -3084,6 +3131,33 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             }
         },
         
+        getConnectionMetrics(): any {
+            if (!isUsingSharedConnection || !connectionManager) {
+                return {
+                    type: 'dedicated',
+                    poolSize: connectionConfig?.maxPoolSize ?? 100,
+                    instanceId: validatedInstanceId
+                }
+            }
+            
+            const instanceMetrics = connectionManager.getInstanceMetrics(validatedInstanceId)
+            const globalMetrics = connectionManager.getMetrics()
+            
+            return {
+                type: 'shared',
+                instanceId: validatedInstanceId,
+                tier: instanceMetrics?.tier,
+                operationsPerMinute: instanceMetrics?.operationsPerMinute,
+                avgResponseTime: instanceMetrics?.avgResponseTime,
+                global: {
+                    totalConnections: globalMetrics.totalConnections,
+                    totalInstances: globalMetrics.instances.total,
+                    poolDistribution: globalMetrics.pools,
+                    utilizationRate: globalMetrics.utilizationRate
+                }
+            }
+        },
+        
         async close(): Promise<void> {
             // Mark as disconnected
             isConnected = false
@@ -3170,10 +3244,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 messageProcessor = null
             }
             
-            if (client) {
+            // Handle connection cleanup based on connection type
+            if (isUsingSharedConnection && connectionManager) {
+                // Unregister from connection manager
+                await connectionManager.unregisterInstance(validatedInstanceId)
+                connectionManager = null
+            } else if (client && !isUsingSharedConnection) {
+                // Close dedicated connection
                 await client.close()
+                activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
             }
-            activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
         }
     }
 

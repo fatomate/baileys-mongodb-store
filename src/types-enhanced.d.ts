@@ -10,6 +10,7 @@ import type { MemoryConfig } from './utils/memory'
 import type { TTLConfig } from './utils/ttl'
 import type { MediaConfig } from './utils/media'
 import type { LidHandlerConfig } from './utils/lidHandler'
+import type { ConnectionConfig } from './types/connection'
 
 /**
  * Event types that can be stored in MongoDB
@@ -296,6 +297,18 @@ export interface EnhancedMongoDBStoreConfig {
      * Enables automatic @lid to phone number mapping
      */
     lidHandler?: LidHandlerConfig
+    
+    /**
+     * Optional connection configuration for tiered pooling
+     * Controls how connections are shared and managed
+     */
+    connectionConfig?: ConnectionConfig
+    
+    /**
+     * Whether to use shared connections via ConnectionManager
+     * Default: true (recommended for multiple instances)
+     */
+    useSharedConnections?: boolean
 }
 
 /**
@@ -411,6 +424,11 @@ export interface EnhancedMongoDBStore {
      * @param daysToKeep Number of days to keep media files (default: 30)
      */
     cleanupOldMedia(daysToKeep?: number): Promise<{ deleted: number; errors: number }>
+    
+    /**
+     * Get connection metrics for this instance
+     */
+    getConnectionMetrics(): Promise<any>
     
     /**
      * Get media statistics for this instance
