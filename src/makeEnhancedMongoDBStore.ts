@@ -191,7 +191,8 @@ const resolveQuotedMessage = async (
     jid: string,
     collections: MongoCollections,
     instanceId: string,
-    log: (...args: any[]) => void
+    log: (...args: any[]) => void,
+    withConnection: <T>(operation: () => Promise<T>) => Promise<T>
 ): Promise<proto.IWebMessageInfo | null> => {
     try {
         const extendedText = message.message?.extendedTextMessage
@@ -205,16 +206,18 @@ const resolveQuotedMessage = async (
         log(`🔍 Resolving quoted message with stanzaId: ${stanzaId} from participant: ${participant}`)
         
         // Fetch the quoted message from the database
-        const quotedMsg = await collections.messages.findOne({
-            instanceId,
-            'key.id': stanzaId,
-            $or: [
-                { jid: participant },
-                { 'key.remoteJid': participant },
-                { jid: jid },
-                { 'key.remoteJid': jid }
-            ]
-        }) as any
+        const quotedMsg = await withConnection(async () =>
+            collections.messages.findOne({
+                instanceId,
+                'key.id': stanzaId,
+                $or: [
+                    { jid: participant },
+                    { 'key.remoteJid': participant },
+                    { jid: jid },
+                    { 'key.remoteJid': jid }
+                ]
+            })
+        ) as any
         
         if (!quotedMsg) {
             log(`⚠️ Quoted message not found for stanzaId: ${stanzaId}`)
@@ -342,7 +345,8 @@ const decryptPollVote = async (
     collections: MongoCollections,
     instanceId: string,
     meId: string | undefined,
-    log: (...args: any[]) => void
+    log: (...args: any[]) => void,
+    withConnection: <T>(operation: () => Promise<T>) => Promise<T>
 ): Promise<any> => {
     try {
         // Check if this is a poll vote message
@@ -361,14 +365,18 @@ const decryptPollVote = async (
         log(`🗳️ Decrypting poll vote for poll message: ${pollKey.id}`)
         
         // Fetch the original poll creation message
-        const originalPoll = await collections.messages.findOne({
-            instanceId,
-            'key.id': pollKey.id,
-            $or: [
-                { jid: pollKey.remoteJid },
-                { 'key.remoteJid': pollKey.remoteJid }
-            ]
-        }) as any
+        const originalPoll = await withConnection(async () =>
+            collections.messages.findOne({
+                instanceId,
+                'key.id': pollKey.id,
+                ...(pollKey.remoteJid && {
+                    $or: [
+                        { jid: pollKey.remoteJid },
+                        { 'key.remoteJid': pollKey.remoteJid }
+                    ]
+                })
+            })
+        ) as any
         
         if (!originalPoll) {
             log(`⚠️ Original poll message not found for ID: ${pollKey.id}`)
@@ -918,20 +926,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             
                             try {
                                 // Update the revoked message to mark it as deleted/revoked
-                                const updateResult = await collections.messages.updateOne(
-                                    {
-                                        instanceId,
-                                        jid: revokedKey.remoteJid || jid,
-                                        'key.id': revokedKey.id
-                                    },
-                                    {
-                                        $set: {
-                                            'message.protocolMessage': message.message.protocolMessage,
-                                            revoked: true,
-                                            revokedAt: new Date(),
-                                            revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                const updateResult = await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        {
+                                            instanceId,
+                                            jid: revokedKey.remoteJid || jid,
+                                            'key.id': revokedKey.id
+                                        },
+                                        {
+                                            $set: {
+                                                'message.protocolMessage': message.message?.protocolMessage,
+                                                revoked: true,
+                                                revokedAt: new Date(),
+                                                revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                            }
                                         }
-                                    }
+                                    )
                                 )
                                 
                                 if (updateResult.matchedCount > 0) {
@@ -969,7 +979,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         (!message.message.extendedTextMessage.contextInfo.quotedMessage || 
                          Object.keys(message.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
                         
-                        const quotedMsg = await resolveQuotedMessage(message, jid, collections, instanceId, log)
+                        const quotedMsg = await resolveQuotedMessage(message, jid, collections, instanceId, log, withConnection)
                         if (quotedMsg && quotedMsg.message) {
                             // Update the message with the resolved quoted content
                             message.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
@@ -980,7 +990,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Decrypt poll vote if present
                     let pollVoteDecrypted = null
                     if (message.message?.pollUpdateMessage) {
-                        pollVoteDecrypted = await decryptPollVote(message, collections, instanceId, meId, log)
+                        pollVoteDecrypted = await decryptPollVote(message, collections, instanceId, meId, log, withConnection)
                         if (pollVoteDecrypted) {
                             log(`✅ [Bull Queue] Decrypted poll vote for ${message.key?.id}`)
                         }
@@ -993,11 +1003,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         log(`🔄 [Bull Queue] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
                         
                         // Fetch the original message to preserve its timestamp
-                        const originalMessage = await collections.messages.findOne({
-                            instanceId,
-                            jid,
-                            'key.id': editTargetKey.id
-                        })
+                        const originalMessage = await withConnection(async () =>
+                            collections.messages.findOne({
+                                instanceId,
+                                jid,
+                                'key.id': editTargetKey.id
+                            })
+                        )
                         
                         if (originalMessage && originalMessage.messageTimestamp) {
                             preservedTimestamp = originalMessage.messageTimestamp
@@ -1006,22 +1018,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     try {
-                        await collections.messages.replaceOne(
-                            {
-                                instanceId,
-                                jid,
-                                'key.id': message.key?.id
-                            },
-                            {
-                                ...message,
-                                // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
-                                ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
-                                instanceId,
-                                jid,
-                                ...(pollVoteDecrypted && { pollVoteDecrypted }),
-                                updatedAt: new Date()
-                            },
-                            { upsert: true }
+                        await withConnection(async () =>
+                            collections.messages.replaceOne(
+                                {
+                                    instanceId,
+                                    jid,
+                                    'key.id': message.key?.id
+                                },
+                                {
+                                    ...message,
+                                    // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
+                                    ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                    instanceId,
+                                    jid,
+                                    ...(pollVoteDecrypted && { pollVoteDecrypted }),
+                                    updatedAt: new Date()
+                                },
+                                { upsert: true }
+                            )
                         )
                     } catch (error: any) {
                         // Handle duplicate key errors gracefully
@@ -1029,20 +1043,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`⚠️ [Bull Queue] Duplicate key error for message ${message.key?.id} in chat ${jid} - message already exists`)
                             // Try to update instead of replace
                             try {
-                                await collections.messages.updateOne(
-                                    {
-                                        instanceId,
-                                        jid,
-                                        'key.id': message.key?.id
-                                    },
-                                    {
-                                        $set: {
-                                            ...message,
-                                            ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
-                                            ...(pollVoteDecrypted && { pollVoteDecrypted }),
-                                            updatedAt: new Date()
+                                await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        {
+                                            instanceId,
+                                            jid,
+                                            'key.id': message.key?.id
+                                        },
+                                        {
+                                            $set: {
+                                                ...message,
+                                                ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                                ...(pollVoteDecrypted && { pollVoteDecrypted }),
+                                                updatedAt: new Date()
+                                            }
                                         }
-                                    }
+                                    )
                                 )
                                 log(`✅ [Bull Queue] Successfully updated existing message ${message.key?.id} after duplicate key error`)
                             } catch (updateError) {
@@ -1066,11 +1082,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             
                             // Function to check for existing media by hash
                             const checkExistingMedia = async (hash: string): Promise<string | null> => {
-                                const existing = await collections.messages.findOne({
-                                    instanceId,
-                                    mediaHash: hash,
-                                    mediaUrl: { $exists: true }
-                                }) as any
+                                const existing = await withConnection(async () =>
+                                    collections.messages.findOne({
+                                        instanceId,
+                                        mediaHash: hash,
+                                        mediaUrl: { $exists: true }
+                                    })
+                                ) as any
                                 return existing?.mediaUrl || null
                             }
                             
@@ -1078,19 +1096,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const mediaResult = await downloadOfficialAPIMedia(message, instanceId, config.media, config.logger, checkExistingMedia)
                                 
                                 if (mediaResult.success && mediaResult.localPath) {
-                                    await collections.messages.updateOne(
-                                        { 
-                                            instanceId, 
-                                            jid, 
-                                            'key.id': message.key?.id 
-                                        },
-                                        { 
-                                            $set: { 
-                                                mediaUrl: mediaResult.localPath,
-                                                mediaType: mediaResult.mediaType,
-                                                mediaHash: mediaResult.mediaHash
-                                            } 
-                                        }
+                                    await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { 
+                                                instanceId, 
+                                                jid, 
+                                                'key.id': message.key?.id 
+                                            },
+                                            { 
+                                                $set: { 
+                                                    mediaUrl: mediaResult.localPath,
+                                                    mediaType: mediaResult.mediaType,
+                                                    mediaHash: mediaResult.mediaHash
+                                                } 
+                                            }
+                                        )
                                     )
                                     log(`✅ [Bull Queue] Official API media downloaded successfully: ${mediaResult.localPath}`)
                                 } else {
@@ -1105,11 +1125,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 } else if (type === 'update' && messageId && update) {
                     // For message updates, preserve existing quoted message structure AND messageTimestamp for edits
-                    const existingMsg = await collections.messages.findOne({
-                        instanceId,
-                        jid,
-                        'key.id': messageId
-                    }) as any
+                    const existingMsg = await withConnection(async () =>
+                        collections.messages.findOne({
+                            instanceId,
+                            jid,
+                            'key.id': messageId
+                        })
+                    ) as any
                     
                     if (existingMsg) {
                         // Check if this is a MESSAGE_EDIT by looking for editedMessage field
@@ -1151,55 +1173,65 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                             }
                             
-                            await collections.messages.updateOne(
-                                {
-                                    instanceId,
-                                    jid,
-                                    'key.id': messageId
-                                },
-                                {
-                                    $set: { 
-                                        ...finalUpdate,
-                                        message: mergedMessage,
-                                        updatedAt: new Date() 
+                            await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': messageId
+                                    },
+                                    {
+                                        $set: { 
+                                            ...finalUpdate,
+                                            message: mergedMessage,
+                                            updatedAt: new Date() 
+                                        }
                                     }
-                                }
+                                )
                             )
                         } else {
                             // No existing quoted message, proceed with update
-                            await collections.messages.updateOne(
-                                {
-                                    instanceId,
-                                    jid,
-                                    'key.id': messageId
-                                },
-                                {
-                                    $set: { ...finalUpdate, updatedAt: new Date() }
-                                }
+                            await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': messageId
+                                    },
+                                    {
+                                        $set: { ...finalUpdate, updatedAt: new Date() }
+                                    }
+                                )
                             )
                         }
                     } else {
                         // No existing message, just apply the update
-                        await collections.messages.updateOne(
-                            {
-                                instanceId,
-                                jid,
-                                'key.id': messageId
-                            },
-                            {
-                                $set: { ...update, updatedAt: new Date() }
-                            }
+                        await withConnection(async () =>
+                            collections.messages.updateOne(
+                                {
+                                    instanceId,
+                                    jid,
+                                    'key.id': messageId
+                                },
+                                {
+                                    $set: { ...update, updatedAt: new Date() }
+                                }
+                            )
                         )
                     }
                 } else if (type === 'delete') {
                     if (deleteIds && deleteIds.length > 0) {
-                        await collections.messages.deleteMany({
-                            instanceId,
-                            jid,
-                            'key.id': { $in: deleteIds }
-                        })
+                        await withConnection(async () =>
+                            collections.messages.deleteMany({
+                                instanceId,
+                                jid,
+                                'key.id': { $in: deleteIds }
+                            })
+                        )
                     } else {
-                        await collections.messages.deleteMany({ instanceId, jid })
+                        await withConnection(async () =>
+                            collections.messages.deleteMany({ instanceId, jid })
+                        )
                     }
                 }
                 
@@ -1220,17 +1252,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             upsert: true
                         }
                     }))
-                    await collections.chats.bulkWrite(bulkOps)
+                    await withConnection(async () =>
+                        collections.chats.bulkWrite(bulkOps)
+                    )
                 } else if (type === 'update' && chatId && update) {
-                    await collections.chats.updateOne(
-                        { instanceId, id: chatId },
-                        { $set: { ...update, updatedAt: new Date() } }
+                    await withConnection(async () =>
+                        collections.chats.updateOne(
+                            { instanceId, id: chatId },
+                            { $set: { ...update, updatedAt: new Date() } }
+                        )
                     )
                 } else if (type === 'delete' && deleteIds) {
-                    await collections.chats.deleteMany({
-                        instanceId,
-                        id: { $in: deleteIds }
-                    })
+                    await withConnection(async () =>
+                        collections.chats.deleteMany({
+                            instanceId,
+                            id: { $in: deleteIds }
+                        })
+                    )
                 }
                 
                 trackActivity(Date.now() - jobStartTime) // Track response time
@@ -1250,13 +1288,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             upsert: true
                         }
                     }))
-                    await collections.contacts.bulkWrite(bulkOps, { ordered: false })
+                    await withConnection(async () =>
+                        collections.contacts.bulkWrite(bulkOps, { ordered: false })
+                    )
                     trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
-                    await collections.contacts.replaceOne(
-                        { instanceId, id: contact.id },
-                        { ...contact, instanceId, updatedAt: new Date() },
-                        { upsert: true }
+                    await withConnection(async () =>
+                        collections.contacts.replaceOne(
+                            { instanceId, id: contact.id },
+                            { ...contact, instanceId, updatedAt: new Date() },
+                            { upsert: true }
+                        )
                     )
                 }
                 
@@ -1267,15 +1309,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const { type, jid, metadata, update } = job.data
                 
                 if (type === 'upsert') {
-                    await collections.groupMetadata.replaceOne(
-                        { instanceId, id: metadata.id },
-                        { ...metadata, instanceId, updatedAt: new Date() },
-                        { upsert: true }
+                    await withConnection(async () =>
+                        collections.groupMetadata.replaceOne(
+                            { instanceId, id: metadata.id },
+                            { ...metadata, instanceId, updatedAt: new Date() },
+                            { upsert: true }
+                        )
                     )
                 } else if (type === 'update' && update) {
-                    await collections.groupMetadata.updateOne(
-                        { instanceId, id: jid },
-                        { $set: { ...update, updatedAt: new Date() } }
+                    await withConnection(async () =>
+                        collections.groupMetadata.updateOne(
+                            { instanceId, id: jid },
+                            { $set: { ...update, updatedAt: new Date() } }
+                        )
                     )
                 }
                 
@@ -1285,12 +1331,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             createQueueAndWorker<PresenceJob>(QueueType.PRESENCES, async (job) => {
                 const { id, presences } = job.data
                 
-                await collections.presences.updateOne(
-                    { instanceId, id },
-                    {
-                        $set: { presences, updatedAt: new Date() }
-                    },
-                    { upsert: true }
+                await withConnection(async () =>
+                    collections.presences.updateOne(
+                        { instanceId, id },
+                        {
+                            $set: { presences, updatedAt: new Date() }
+                        },
+                        { upsert: true }
+                    )
                 )
                 
                 return { success: true }
@@ -1299,12 +1347,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             createQueueAndWorker<StateJob>(QueueType.STATE, async (job) => {
                 const { update } = job.data
                 
-                await collections.state.updateOne(
-                    { instanceId },
-                    { 
-                        $set: { ...update, instanceId, updatedAt: new Date() }
-                    },
-                    { upsert: true }
+                await withConnection(async () =>
+                    collections.state.updateOne(
+                        { instanceId },
+                        { 
+                            $set: { ...update, instanceId, updatedAt: new Date() }
+                        },
+                        { upsert: true }
+                    )
                 )
                 
                 return { success: true }
@@ -1314,13 +1364,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const { type, id, label } = job.data
                 
                 if (type === 'upsert' && label) {
-                    await collections.labels.replaceOne(
-                        { instanceId, id },
-                        { ...label, instanceId, updatedAt: new Date() },
-                        { upsert: true }
+                    await withConnection(async () =>
+                        collections.labels.replaceOne(
+                            { instanceId, id },
+                            { ...label, instanceId, updatedAt: new Date() },
+                            { upsert: true }
+                        )
                     )
                 } else if (type === 'delete') {
-                    await collections.labels.deleteOne({ instanceId, id })
+                    await withConnection(async () =>
+                        collections.labels.deleteOne({ instanceId, id })
+                    )
                 }
                 
                 return { success: true }
@@ -1362,11 +1416,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         log(`[Label Queue] Document to upsert: ${JSON.stringify({...association, instanceId, updatedAt: new Date()})}`)
                         
                         // Enhanced debug logging - check existing documents before operation
-                        const existingDocs = await collections.labelAssociations.find({
-                            instanceId,
-                            chatId: association.chatId,
-                            labelId: association.labelId
-                        }).toArray()
+                        const existingDocs = await withConnection(async () =>
+                            collections.labelAssociations.find({
+                                instanceId,
+                                chatId: association.chatId,
+                                labelId: association.labelId
+                            }).toArray()
+                        )
                         
                         if (existingDocs.length > 0) {
                             log(`[Label Queue] Found ${existingDocs.length} existing docs for ${association.chatId}/${association.labelId}:`)
@@ -1377,14 +1433,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`[Label Queue] No existing documents found for ${association.chatId}/${association.labelId}`)
                         }
                         
-                        const result = await collections.labelAssociations.replaceOne(
-                            filter,
-                            {
-                                ...association,
-                                instanceId,
-                                updatedAt: new Date()
-                            },
-                            { upsert: true }
+                        const result = await withConnection(async () =>
+                            collections.labelAssociations.replaceOne(
+                                filter,
+                                {
+                                    ...association,
+                                    instanceId,
+                                    updatedAt: new Date()
+                                },
+                                { upsert: true }
+                            )
                         )
                         
                         // Validate operation succeeded
@@ -1400,11 +1458,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                         
                         // Enhanced debug - verify final state
-                        const finalDocs = await collections.labelAssociations.find({
-                            instanceId,
-                            chatId: association.chatId,
-                            labelId: association.labelId
-                        }).toArray()
+                        const finalDocs = await withConnection(async () =>
+                            collections.labelAssociations.find({
+                                instanceId,
+                                chatId: association.chatId,
+                                labelId: association.labelId
+                            }).toArray()
+                        )
                         
                         log(`[Label Queue] Final state: ${finalDocs.length} docs exist for ${association.chatId}/${association.labelId}`)
                         finalDocs.forEach((doc, index) => {
@@ -1430,7 +1490,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         log(`[Label Queue] Processing delete - Type: ${association.type}, ChatId: ${association.chatId}, LabelId: ${association.labelId}`)
                         log(`[Label Queue] Delete filter: ${JSON.stringify(filter)}`)
                         
-                        const result = await collections.labelAssociations.deleteOne(filter)
+                        const result = await withConnection(async () =>
+                            collections.labelAssociations.deleteOne(filter)
+                        )
                         
                         if (result.deletedCount === 0) {
                             logWarn(`[Label Queue] ⚠️ No document found to delete for ${associationId}`)
@@ -1504,12 +1566,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Check add labels
                     for (const labelId of metadata.addLabelIds || []) {
-                        const exists = await collections.labelAssociations.findOne({
-                            instanceId,
-                            chatId: metadata.chatId,
-                            labelId,
-                            type: LabelAssociationType.Chat
-                        })
+                        const exists = await withConnection(async () =>
+                            collections.labelAssociations.findOne({
+                                instanceId,
+                                chatId: metadata.chatId,
+                                labelId,
+                                type: LabelAssociationType.Chat
+                            })
+                        )
                         if (!exists) {
                             allSynced = false
                             break
@@ -1878,7 +1942,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             try {
                 const validJid = validateJID(jid)
                 
-                const chat = await collections.chats.findOne({ instanceId: validatedInstanceId, id: validJid })
+                const chat = await withConnection(async () =>
+                    collections.chats.findOne({ instanceId: validatedInstanceId, id: validJid })
+                )
                 if (!chat) return null
                 
                 // Check access permissions
@@ -2095,7 +2161,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE)
-                await collections.contacts.bulkWrite(chunk, { ordered: false })
+                await withConnection(async () =>
+                    collections.contacts.bulkWrite(chunk, { ordered: false })
+                )
             }
         },
 
@@ -2231,10 +2299,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         log(`Total messages for instance: ${count}`)
                         
                         // Try to find similar message IDs
-                        const similarMessages = await collections.messages.find({
-                            instanceId: validatedInstanceId,
-                            'key.id': { $regex: validId.substring(0, 10) }
-                        }).limit(5).toArray()
+                        const similarMessages = await withConnection(async () =>
+                            collections.messages.find({
+                                instanceId: validatedInstanceId,
+                                'key.id': { $regex: validId.substring(0, 10) }
+                            }).limit(5).toArray()
+                        )
                         
                         if (similarMessages.length > 0) {
                             log(`Found ${similarMessages.length} messages with similar IDs:`)
@@ -2375,7 +2445,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 (!clonedMessage.message.extendedTextMessage.contextInfo.quotedMessage || 
                  Object.keys(clonedMessage.message.extendedTextMessage.contextInfo.quotedMessage).length === 0)) {
                 
-                const quotedMsg = await resolveQuotedMessage(clonedMessage, validJid, collections, validatedInstanceId, log)
+                const quotedMsg = await resolveQuotedMessage(clonedMessage, validJid, collections, validatedInstanceId, log, withConnection)
                 if (quotedMsg && quotedMsg.message) {
                     // Update the cloned message with the resolved quoted content
                     clonedMessage.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
@@ -2386,7 +2456,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Decrypt poll vote if present
             let pollVoteDecrypted = null
             if (clonedMessage.message?.pollUpdateMessage) {
-                pollVoteDecrypted = await decryptPollVote(clonedMessage, collections, validatedInstanceId, meId, log)
+                pollVoteDecrypted = await decryptPollVote(clonedMessage, collections, validatedInstanceId, meId, log, withConnection)
                 if (pollVoteDecrypted) {
                     log(`✅ Decrypted poll vote for ${clonedMessage.key?.id}`)
                 }
@@ -2399,11 +2469,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`🔄 [Direct] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
                 
                 // Fetch the original message to preserve its timestamp
-                const originalMessage = await collections.messages.findOne({
-                    instanceId: validatedInstanceId,
-                    jid: validJid,
-                    'key.id': editTargetKey.id
-                })
+                const originalMessage = await withConnection(async () =>
+                    collections.messages.findOne({
+                        instanceId: validatedInstanceId,
+                        jid: validJid,
+                        'key.id': editTargetKey.id
+                    })
+                )
                 
                 if (originalMessage && originalMessage.messageTimestamp) {
                     preservedTimestamp = originalMessage.messageTimestamp
@@ -2485,11 +2557,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Function to check for existing media by hash
                     const checkExistingMedia = async (hash: string): Promise<string | null> => {
-                        const existing = await collections.messages.findOne({
-                            instanceId: validatedInstanceId,
-                            mediaHash: hash,
-                            mediaUrl: { $exists: true }
-                        }) as any
+                        const existing = await withConnection(async () =>
+                            collections.messages.findOne({
+                                instanceId: validatedInstanceId,
+                                mediaHash: hash,
+                                mediaUrl: { $exists: true }
+                            })
+                        ) as any
                         return existing?.mediaUrl || null
                     }
                     
@@ -2706,7 +2780,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 filter['key.id'] = { $in: validIds }
             }
             
-            await collections.messages.deleteMany(filter)
+            await withConnection(async () =>
+                collections.messages.deleteMany(filter)
+            )
             } catch (error) {
                 if (error instanceof ValidationError || error instanceof AuthorizationError) {
                     throw error
@@ -2728,7 +2804,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         
         async getAllGroupMetadata(): Promise<GroupMetadata[]> {
-            const groups = await collections.groupMetadata.find({ instanceId }).toArray()
+            const groups = await withConnection(async () =>
+                collections.groupMetadata.find({ instanceId }).toArray()
+            )
             return groups.map(({ _id, instanceId: _instanceId, updatedAt: _updatedAt, ...metadata }) => metadata as GroupMetadata)
         },
 
@@ -3319,7 +3397,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                  Object.keys(msg.message.extendedTextMessage.contextInfo.quotedMessage).length === 0) &&
                                 jid) {
                                 
-                                const quotedMsg = await resolveQuotedMessage(msg, jid, collections, instanceId, log)
+                                const quotedMsg = await resolveQuotedMessage(msg, jid, collections, instanceId, log, withConnection)
                                 if (quotedMsg && quotedMsg.message) {
                                     // Update the message with the resolved quoted content
                                     msg.message.extendedTextMessage.contextInfo.quotedMessage = quotedMsg.message
@@ -3329,7 +3407,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             
                             // Decrypt poll vote before storing if present
                             if (msg.message?.pollUpdateMessage) {
-                                const pollVoteDecrypted = await decryptPollVote(msg, collections, instanceId, meId, log)
+                                const pollVoteDecrypted = await decryptPollVote(msg, collections, instanceId, meId, log, withConnection)
                                 if (pollVoteDecrypted) {
                                     // Add decrypted poll vote data to the message
                                     (msg as any).pollVoteDecrypted = pollVoteDecrypted
@@ -3348,11 +3426,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             if (config.media?.enabled) {
                                 // Function to check for existing media by hash
                                 const checkExistingMedia = async (hash: string): Promise<string | null> => {
-                                    const existing = await collections.messages.findOne({
-                                        instanceId,
-                                        mediaHash: hash,
-                                        mediaUrl: { $exists: true }
-                                    }) as any
+                                    const existing = await withConnection(async () =>
+                                        collections.messages.findOne({
+                                            instanceId,
+                                            mediaHash: hash,
+                                            mediaUrl: { $exists: true }
+                                        })
+                                    ) as any
                                     return existing?.mediaUrl || null
                                 }
                                 
