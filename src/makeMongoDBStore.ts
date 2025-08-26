@@ -620,20 +620,103 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const { type, jid, message, messageId, update, deleteIds } = job.data
                 
                 if (type === 'upsert' && message) {
-                    await collections.messages.replaceOne(
-                        {
-                            instanceId,
-                            jid,
-                            'key.id': message.key?.id
-                        },
-                        {
-                            ...message,
-                            instanceId,
-                            jid,
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
-                    )
+                    // Skip protocol messages that shouldn't be stored as regular messages
+                    if (message.message?.protocolMessage) {
+                        const protoType = message.message.protocolMessage.type
+                        
+                        // Handle REVOKE messages - update the revoked message instead of storing the revoke message
+                        if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
+                            const revokedKey = message.message.protocolMessage.key
+                            log(`🔄 [Bull Queue REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                            
+                            try {
+                                // Update the revoked message to mark it as deleted/revoked
+                                const updateResult = await collections.messages.updateOne(
+                                    {
+                                        instanceId,
+                                        jid: revokedKey.remoteJid || jid,
+                                        'key.id': revokedKey.id
+                                    },
+                                    {
+                                        $set: {
+                                            'message.protocolMessage': message.message.protocolMessage,
+                                            revoked: true,
+                                            revokedAt: new Date(),
+                                            revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                        }
+                                    }
+                                )
+                                
+                                if (updateResult.matchedCount > 0) {
+                                    log(`✅ [Bull Queue REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
+                                } else {
+                                    log(`⚠️ [Bull Queue REVOKE] Message ${revokedKey.id} not found to revoke`)
+                                }
+                            } catch (error) {
+                                logError(`[Bull Queue REVOKE] Failed to process revoke for message ${revokedKey.id}:`, error)
+                            }
+                            
+                            // Skip storing the REVOKE message itself
+                            return { success: true }
+                        }
+                        
+                        // Skip other protocol message types that shouldn't be stored
+                        const skipTypes = [
+                            proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                            proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE,
+                            proto.Message.ProtocolMessage.Type.INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+                            proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_REQUEST
+                        ]
+                        
+                        if (protoType && skipTypes.includes(protoType)) {
+                            log(`⏭️ [Bull Queue Protocol] Skipping protocol message of type ${protoType} for instance ${instanceId}`)
+                            return { success: true }
+                        }
+                    }
+                    
+                    try {
+                        await collections.messages.replaceOne(
+                            {
+                                instanceId,
+                                jid,
+                                'key.id': message.key?.id
+                            },
+                            {
+                                ...message,
+                                instanceId,
+                                jid,
+                                updatedAt: new Date()
+                            },
+                            { upsert: true }
+                        )
+                    } catch (error: any) {
+                        // Handle duplicate key errors gracefully
+                        if (error.code === 11000 || error.message?.includes('duplicate key')) {
+                            log(`⚠️ [Bull Queue] Duplicate key error for message ${message.key?.id} in chat ${jid} - message already exists`)
+                            // Try to update instead of replace
+                            try {
+                                await collections.messages.updateOne(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': message.key?.id
+                                    },
+                                    {
+                                        $set: {
+                                            ...message,
+                                            updatedAt: new Date()
+                                        }
+                                    }
+                                )
+                                log(`✅ [Bull Queue] Successfully updated existing message ${message.key?.id} after duplicate key error`)
+                            } catch (updateError) {
+                                logError(`[Bull Queue] Failed to update message after duplicate key error:`, updateError)
+                                throw updateError
+                            }
+                        } else {
+                            throw error
+                        }
+                    }
                     performanceMetrics.messagesProcessed++
                 } else if (type === 'update' && messageId && update) {
                     await collections.messages.updateOne(
@@ -927,7 +1010,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Get existing data from Redis
             const existingData = await redisConnection.hget(hashKey, normalizedChatId)
-            let metadata = existingData ? JSON.parse(existingData) : {
+            const metadata = existingData ? JSON.parse(existingData) : {
                 chatId: association.chatId,
                 addLabelIds: [],
                 removeLabelIds: []
@@ -1820,6 +1903,60 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
         async upsertMessage(jid: string, message: proto.IWebMessageInfo, useBatch: boolean = false): Promise<void> {
             try {
+                // Handle protocol messages before validation
+                if (message.message?.protocolMessage) {
+                    const protoType = message.message.protocolMessage.type
+                    
+                    // Handle REVOKE messages - update the revoked message instead of storing the revoke message
+                    if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
+                        const revokedKey = message.message.protocolMessage.key
+                        log(`🔄 [Direct REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                        
+                        try {
+                            // Update the revoked message to mark it as deleted/revoked
+                            const updateResult = await collections.messages.updateOne(
+                                {
+                                    instanceId: validatedInstanceId,
+                                    jid: revokedKey.remoteJid || jid,
+                                    'key.id': revokedKey.id
+                                },
+                                {
+                                    $set: {
+                                        'message.protocolMessage': message.message.protocolMessage,
+                                        revoked: true,
+                                        revokedAt: new Date(),
+                                        revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                    }
+                                }
+                            )
+                            
+                            if (updateResult.matchedCount > 0) {
+                                log(`✅ [Direct REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
+                            } else {
+                                log(`⚠️ [Direct REVOKE] Message ${revokedKey.id} not found to revoke`)
+                            }
+                        } catch (error) {
+                            logError(`[Direct REVOKE] Failed to process revoke for message ${revokedKey.id}:`, error)
+                        }
+                        
+                        // Skip storing the REVOKE message itself
+                        return
+                    }
+                    
+                    // Skip other protocol message types that shouldn't be stored
+                    const skipTypes = [
+                        proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                        proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE,
+                        proto.Message.ProtocolMessage.Type.INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+                        proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_REQUEST
+                    ]
+                    
+                    if (protoType && skipTypes.includes(protoType)) {
+                        log(`⏭️ [Direct Protocol] Skipping protocol message of type ${protoType} for instance ${validatedInstanceId}`)
+                        return
+                    }
+                }
+                
                 const validJid = validateJID(jid)
                 
                 // Validate message ID if present
@@ -1871,20 +2008,49 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 binaryConversionCache.del(cacheKey)
                 
                 await pMessageQueue.add(async () => {
-                    await collections.messages.replaceOne(
-                        {
-                            instanceId: validatedInstanceId,
-                            jid: validJid,
-                            'key.id': message.key?.id
-                        },
-                        {
-                            ...message,
-                            instanceId: validatedInstanceId,
-                            jid: validJid,
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
-                    )
+                    try {
+                        await collections.messages.replaceOne(
+                            {
+                                instanceId: validatedInstanceId,
+                                jid: validJid,
+                                'key.id': message.key?.id
+                            },
+                            {
+                                ...message,
+                                instanceId: validatedInstanceId,
+                                jid: validJid,
+                                updatedAt: new Date()
+                            },
+                            { upsert: true }
+                        )
+                    } catch (error: any) {
+                        // Handle duplicate key errors gracefully
+                        if (error.code === 11000 || error.message?.includes('duplicate key')) {
+                            log(`⚠️ [Direct] Duplicate key error for message ${message.key?.id} in chat ${validJid} - message already exists`)
+                            // Try to update instead of replace
+                            try {
+                                await collections.messages.updateOne(
+                                    {
+                                        instanceId: validatedInstanceId,
+                                        jid: validJid,
+                                        'key.id': message.key?.id
+                                    },
+                                    {
+                                        $set: {
+                                            ...message,
+                                            updatedAt: new Date()
+                                        }
+                                    }
+                                )
+                                log(`✅ [Direct] Successfully updated existing message ${message.key?.id} after duplicate key error`)
+                            } catch (updateError) {
+                                logError(`[Direct] Failed to update message after duplicate key error:`, updateError)
+                                throw updateError
+                            }
+                        } else {
+                            throw error
+                        }
+                    }
                 })
             }
             } catch (error) {
