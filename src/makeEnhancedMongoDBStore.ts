@@ -45,6 +45,7 @@ import { safeDropIndex, safeCreateIndex } from './utils/indexHelper'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
 import { EventEmitter } from 'events'
+import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -910,6 +911,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const queues: Map<QueueType, Queue<any>> = new Map()
     const workers: Map<QueueType, Worker<any>> = new Map()
     let redisConnection: Redis | null = null
+    let sharedQueueManager: SharedQueueManager | null = null
+    const useSharedQueues = redis?.useSharedQueues !== false // Default to true if Redis is provided
     
     // Default job options for automatic cleanup
     const defaultJobOptions = {
@@ -927,12 +930,617 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         }
     }
     
+    // Helper function to queue jobs for both shared and per-instance modes
+    // @ts-ignore - Function is used conditionally
+    const queueJob = async (jobType: JobType, queueType: QueueType, data: any, priority: number = 5): Promise<boolean> => {
+        try {
+            if (sharedQueueManager && useSharedQueues) {
+                // Use shared queue manager
+                await sharedQueueManager.addJob(jobType, data, validatedInstanceId, priority)
+                log(`✅ Job queued via shared queue: ${jobType}`)
+                return true
+            } else if (bullInitialized && queues.has(queueType)) {
+                // Use per-instance queue
+                const queue = queues.get(queueType)!
+                await queue.add(
+                    jobType,
+                    {
+                        ...data,
+                        instanceId: validatedInstanceId,
+                        timestamp: Date.now()
+                    },
+                    defaultJobOptions
+                )
+                log(`✅ Job queued via per-instance queue: ${jobType}`)
+                return true
+            }
+            return false
+        } catch (error) {
+            logError(`❌ Failed to queue job ${jobType}:`, error)
+            return false
+        }
+    }
+    
+    // Register processors for shared queue manager
+    const registerSharedQueueProcessors = async () => {
+        if (!sharedQueueManager) return
+        
+        // Messages processor
+        sharedQueueManager.registerProcessor(JobType.MESSAGES, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            // Only process jobs for this instance
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { type, message, messageId, update, deleteIds, jid } = data as MessageJob
+            
+            trackActivity() // Track request
+            
+            if (type === 'upsert' && message) {
+                // [Message processing logic - same as existing]
+                // Skip protocol messages that shouldn't be stored
+                if (message.message?.protocolMessage) {
+                    const protoType = message.message.protocolMessage.type
+                    
+                    // Handle REVOKE messages
+                    if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
+                        const revokedKey = message.message.protocolMessage.key
+                        const targetJid = revokedKey.remoteJid || jid
+                        
+                        await withConnection(async () =>
+                            collections.messages.updateOne(
+                                {
+                                    instanceId: validatedInstanceId,
+                                    jid: targetJid,
+                                    'key.id': revokedKey.id
+                                },
+                                {
+                                    $set: {
+                                        'message.protocolMessage': message.message?.protocolMessage,
+                                        revoked: true,
+                                        revokedAt: new Date(),
+                                        revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                    }
+                                }
+                            )
+                        )
+                        return { success: true, type: 'revoke' }
+                    }
+                    
+                    // Skip other protocol messages
+                    const skipTypes = [
+                        proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                        proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE,
+                        proto.Message.ProtocolMessage.Type.INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+                        proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_REQUEST
+                    ]
+                    
+                    if (protoType && skipTypes.includes(protoType)) {
+                        return { success: true, skipped: true }
+                    }
+                }
+                
+                // Store the message
+                await withConnection(async () =>
+                    collections.messages.replaceOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid,
+                            'key.id': message.key?.id
+                        },
+                        {
+                            ...message,
+                            instanceId: validatedInstanceId,
+                            jid,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
+                )
+                
+                return { success: true, type: 'upsert' }
+            } else if (type === 'update' && update) {
+                // Update message
+                await withConnection(async () =>
+                    collections.messages.updateOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid,
+                            'key.id': messageId
+                        },
+                        { $set: { ...update, updatedAt: new Date() } }
+                    )
+                )
+                return { success: true, type: 'update' }
+            } else if (type === 'delete' && deleteIds) {
+                // Delete messages
+                await withConnection(async () =>
+                    collections.messages.deleteMany({
+                        instanceId: validatedInstanceId,
+                        jid,
+                        'key.id': { $in: deleteIds }
+                    })
+                )
+                return { success: true, type: 'delete', count: deleteIds.length }
+            }
+            
+            return { success: false, error: 'Unknown message job type' }
+        })
+        
+        // Contacts processor
+        sharedQueueManager.registerProcessor(JobType.CONTACTS, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { type, contacts, contact } = data as ContactJob
+            
+            trackActivity()
+            
+            if (type === 'upsert' && contacts) {
+                // Bulk upsert
+                const bulkOps = contacts.map((contact: Contact) => ({
+                    replaceOne: {
+                        filter: { instanceId: validatedInstanceId, id: contact.id },
+                        replacement: {
+                            ...contact,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        upsert: true
+                    }
+                }))
+                
+                await withConnection(async () =>
+                    collections.contacts.bulkWrite(bulkOps)
+                )
+                
+                return { success: true, count: contacts.length }
+            } else if (type === 'update' && contact) {
+                // Single update
+                await withConnection(async () =>
+                    collections.contacts.replaceOne(
+                        { instanceId: validatedInstanceId, id: contact.id },
+                        {
+                            ...contact,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
+                )
+                
+                return { success: true }
+            }
+            
+            return { success: false, error: 'Unknown contact job type' }
+        })
+        
+        // Chats processor
+        sharedQueueManager.registerProcessor(JobType.CHATS, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { type, chats, chatId, update, deleteIds } = data as ChatJob
+            
+            trackActivity()
+            
+            if (type === 'upsert' && chats) {
+                const bulkOps = chats.map((chat: Chat) => ({
+                    replaceOne: {
+                        filter: { instanceId: validatedInstanceId, id: chat.id },
+                        replacement: {
+                            ...chat,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        upsert: true
+                    }
+                }))
+                
+                await withConnection(async () =>
+                    collections.chats.bulkWrite(bulkOps)
+                )
+                
+                return { success: true, count: chats.length }
+            } else if (type === 'update' && update && chatId) {
+                await withConnection(async () =>
+                    collections.chats.updateOne(
+                        { instanceId: validatedInstanceId, id: chatId },
+                        { $set: { ...update, updatedAt: new Date() } }
+                    )
+                )
+                
+                return { success: true }
+            } else if (type === 'delete' && deleteIds) {
+                await withConnection(async () =>
+                    collections.chats.deleteMany({
+                        instanceId: validatedInstanceId,
+                        id: { $in: deleteIds }
+                    })
+                )
+                
+                return { success: true, count: deleteIds.length }
+            }
+            
+            return { success: false, error: 'Unknown chat job type' }
+        })
+        
+        // Group metadata processor
+        sharedQueueManager.registerProcessor(JobType.GROUP_METADATA, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { type, jid, metadata, update } = data as GroupMetadataJob
+            
+            trackActivity()
+            
+            if (type === 'upsert' && metadata) {
+                await withConnection(async () =>
+                    collections.groupMetadata.replaceOne(
+                        { instanceId: validatedInstanceId, id: jid },
+                        {
+                            ...metadata,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
+                )
+                
+                return { success: true }
+            } else if (type === 'update' && update) {
+                await withConnection(async () =>
+                    collections.groupMetadata.updateOne(
+                        { instanceId: validatedInstanceId, id: jid },
+                        { $set: { ...update, updatedAt: new Date() } }
+                    )
+                )
+                
+                return { success: true }
+            }
+            
+            return { success: false, error: 'Unknown group metadata job type' }
+        })
+        
+        // Profile pictures processor
+        sharedQueueManager.registerProcessor(JobType.PROFILE_PICTURES, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { contactId, retryCount = 0 } = data as ProfilePictureJob
+            
+            if (!sock || !profilePictureConfig?.enabled) {
+                return { success: false, error: 'Profile picture fetching not configured' }
+            }
+            
+            const maxRetries = profilePictureConfig.retryAttempts || 3
+            const requestDelay = profilePictureConfig.requestDelay || 500
+            
+            // Add delay between requests to avoid rate limiting
+            if (requestDelay > 0) {
+                await new Promise(resolve => setTimeout(resolve, requestDelay))
+            }
+            
+            try {
+                // Fetch profile picture URL using Baileys sock
+                const profilePictureUrl = await sock.profilePictureUrl(contactId)
+                
+                if (profilePictureUrl) {
+                    await withConnection(async () =>
+                        collections.contacts.updateOne(
+                            { instanceId: validatedInstanceId, id: contactId },
+                            { 
+                                $set: { 
+                                    profilePic: profilePictureUrl,
+                                    profilePicUpdatedAt: new Date(),
+                                    updatedAt: new Date()
+                                } 
+                            }
+                        )
+                    )
+                    
+                    return { success: true, profilePictureUrl }
+                } else {
+                    return { success: true, profilePictureUrl: null }
+                }
+            } catch (error: any) {
+                // Handle privacy errors silently
+                const isPrivacyError = error.message?.includes('privacy') || 
+                                      error.message?.includes('401') ||
+                                      error.message?.includes('not authorized')
+                
+                if (isPrivacyError) {
+                    return { success: true, privacyRestricted: true }
+                }
+                
+                // For other errors, retry if attempts remaining
+                if (retryCount < maxRetries - 1) {
+                    // Re-queue with incremented retry count
+                    await sharedQueueManager!.addJob(
+                        JobType.PROFILE_PICTURES,
+                        {
+                            ...data,
+                            retryCount: retryCount + 1,
+                            lastError: error.message
+                        },
+                        validatedInstanceId,
+                        3 // Lower priority for retries
+                    )
+                    return { success: true, requeued: true }
+                }
+                
+                throw error
+            }
+        })
+        
+        // Media download processor (NEW)
+        sharedQueueManager.registerProcessor(JobType.MEDIA_DOWNLOAD, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { message } = data
+            
+            if (!config.media?.enabled) {
+                return { success: false, error: 'Media download not configured' }
+            }
+            
+            try {
+                // Check for existing media by hash
+                const checkExistingMedia = async (fileHash: string) => {
+                    const existingMessage = await withConnection(async () =>
+                        collections.messages.findOne({
+                            'mediaInfo.fileHash': fileHash
+                        })
+                    )
+                    
+                    return (existingMessage as any)?.mediaUrl || null
+                }
+                
+                // Determine if this is Official API media
+                const isOfficialAPI = (message as any).official_api === true
+                
+                let mediaResult
+                if (isOfficialAPI) {
+                    mediaResult = await downloadOfficialAPIMedia(
+                        message,
+                        validatedInstanceId,
+                        config.media,
+                        config.logger,
+                        checkExistingMedia
+                    )
+                } else {
+                    mediaResult = await downloadMedia(
+                        message,
+                        validatedInstanceId,
+                        config.media,
+                        config.logger,
+                        checkExistingMedia
+                    )
+                }
+                
+                if (mediaResult.success && mediaResult.localPath) {
+                    // Update message with media URL
+                    await withConnection(async () =>
+                        collections.messages.updateOne(
+                            {
+                                instanceId: validatedInstanceId,
+                                'key.id': message.key?.id
+                            },
+                            {
+                                $set: {
+                                    mediaUrl: mediaResult.localPath,
+                                    mediaDownloadedAt: new Date()
+                                }
+                            }
+                        )
+                    )
+                    
+                    return { success: true, mediaUrl: mediaResult.localPath }
+                } else {
+                    return { success: false, error: mediaResult.error || 'Download failed' }
+                }
+            } catch (error: any) {
+                logError(`❌ [Media Download Queue] Failed to download media:`, error)
+                throw error
+            }
+        })
+        
+        // State processor
+        sharedQueueManager.registerProcessor(JobType.STATE, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { update } = data as StateJob
+            
+            trackActivity()
+            
+            await withConnection(async () =>
+                collections.state.replaceOne(
+                    { instanceId: validatedInstanceId },
+                    {
+                        ...update,
+                        instanceId: validatedInstanceId,
+                        updatedAt: new Date()
+                    } as any,
+                    { upsert: true }
+                )
+            )
+            
+            return { success: true }
+        })
+        
+        // Presences processor
+        sharedQueueManager.registerProcessor(JobType.PRESENCES, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { id, presences } = data as PresenceJob
+            
+            trackActivity()
+            
+            await withConnection(async () =>
+                collections.presences.replaceOne(
+                    { instanceId: validatedInstanceId, id },
+                    {
+                        instanceId: validatedInstanceId,
+                        id,
+                        presences,
+                        updatedAt: new Date()
+                    },
+                    { upsert: true }
+                )
+            )
+            
+            return { success: true }
+        })
+        
+        // Labels processor
+        sharedQueueManager.registerProcessor(JobType.LABELS, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { type, id, label } = data as LabelJob
+            
+            trackActivity()
+            
+            if (type === 'upsert' && label) {
+                await withConnection(async () =>
+                    collections.labels.replaceOne(
+                        { instanceId: validatedInstanceId, id },
+                        {
+                            ...label,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
+                )
+                
+                return { success: true }
+            } else if (type === 'delete') {
+                await withConnection(async () =>
+                    collections.labels.deleteOne({
+                        instanceId: validatedInstanceId,
+                        id
+                    })
+                )
+                
+                return { success: true }
+            }
+            
+            return { success: false, error: 'Unknown label job type' }
+        })
+        
+        // Label associations processor
+        sharedQueueManager.registerProcessor(JobType.LABEL_ASSOCIATIONS, async (job) => {
+            const { data, instanceId: jobInstanceId } = job.data
+            
+            if (jobInstanceId !== validatedInstanceId) {
+                return { skipped: true, reason: 'Different instance' }
+            }
+            
+            const { type, association } = data as LabelAssociationJob
+            
+            trackActivity()
+            
+            // const associationId = `${association.labelId}_${association.chatId || (association as any).messageId}`
+            
+            if (type === 'upsert') {
+                await withConnection(async () =>
+                    collections.labelAssociations.replaceOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            labelId: association.labelId,
+                            chatId: association.chatId,
+                            messageId: (association as any).messageId
+                        },
+                        {
+                            ...association,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
+                )
+                
+                return { success: true }
+            } else if (type === 'delete') {
+                await withConnection(async () =>
+                    collections.labelAssociations.deleteOne({
+                        instanceId: validatedInstanceId,
+                        labelId: association.labelId,
+                        chatId: association.chatId,
+                        messageId: (association as any).messageId
+                    })
+                )
+                
+                return { success: true }
+            }
+            
+            return { success: false, error: 'Unknown label association job type' }
+        })
+        
+        log(`✅ Registered all shared queue processors for instance ${instanceId}`)
+    }
+    
     // Initialize Bull queues if Redis config provided
     const initializeBullQueues = async () => {
         if (!redis) return
         
         try {
-            log(`🐂 Initializing Bull queues for instance ${instanceId}...`)
+            // Check if we should use shared queues
+            if (useSharedQueues) {
+                log(`🚀 Initializing shared queue manager for instance ${instanceId}...`)
+                
+                // Configure shared queue manager
+                const sharedConfig: SharedQueueManagerConfig = {
+                    redis: {
+                        connection: redis.connection
+                    },
+                    queueConcurrency: redis.queueConcurrency,
+                    enableMetrics: enableMetrics,
+                    logLevel: logLevel as any
+                }
+                
+                // Get or create singleton instance
+                sharedQueueManager = SharedQueueManager.getInstance(sharedConfig)
+                
+                // Register processors for shared queues
+                await registerSharedQueueProcessors()
+                
+                bullInitialized = true
+                log(`✅ Shared queue manager initialized successfully for instance ${instanceId}`)
+                return
+            }
+            
+            // Fall back to per-instance queues (original implementation)
+            log(`🐂 Initializing per-instance Bull queues for instance ${instanceId}...`)
             
             // Create Redis connection with BullMQ requirements
             if (typeof redis.connection === 'string') {
@@ -949,6 +1557,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     lazyConnect: false
                 })
             }
+            
+            // Fix EventEmitter memory leak warning for per-instance mode
+            redisConnection.setMaxListeners(0)
             
             // Test Redis connection
             await redisConnection.ping()
@@ -1408,8 +2019,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     )
                     
                     // Queue profile picture retrieval for contacts if enabled
-                    if (sock && profilePictureConfig?.enabled && queues.has(QueueType.PROFILE_PICTURES)) {
-                        const profilePicQueue = queues.get(QueueType.PROFILE_PICTURES)!
+                    if (sock && profilePictureConfig?.enabled && (sharedQueueManager || queues.has(QueueType.PROFILE_PICTURES))) {
                         const refreshIntervalDays = profilePictureConfig.refreshIntervalDays || 7
                         const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
                         
@@ -1442,6 +2052,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 if (shouldFetchProfilePic) {
                                     // Queue the profile picture fetch job
+                                    const profilePicQueue = queues.get(QueueType.PROFILE_PICTURES)!
                                     await profilePicQueue.add(
                                         `profile-pic-${contact.id}`,
                                         {
@@ -2854,67 +3465,97 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const mediaMessage = mediaInfo.message as any
                     log(`🆔 Media ID: ${mediaMessage.id}, Type: ${mediaInfo.type}, Mimetype: ${mediaInfo.mimetype}`)
                     
-                    config.logger?.info({
-                        messageId: clonedMessage.key?.id,
-                        jid: validJid,
-                        mediaType: mediaInfo.type,
-                        mediaId: mediaMessage.id,
-                        isOfficialAPI
-                    }, '📥 Triggering Official API media download from upsertMessage')
-                    
-                    // Function to check for existing media by hash
-                    const checkExistingMedia = async (hash: string): Promise<string | null> => {
-                        const existing = await withConnection(async () =>
-                            collections.messages.findOne({
-                                instanceId: validatedInstanceId,
-                                mediaHash: hash,
-                                mediaUrl: { $exists: true }
-                            })
-                        ) as any
-                        return existing?.mediaUrl || null
+                    // Queue media download using shared queue manager
+                    if (sharedQueueManager && useSharedQueues) {
+                        try {
+                            await sharedQueueManager.addJob(
+                                JobType.MEDIA_DOWNLOAD,
+                                {
+                                    message: clonedMessage,
+                                    mediaInfo,
+                                    jid: validJid
+                                },
+                                validatedInstanceId,
+                                5 // Medium priority
+                            )
+                            log(`✅ Media download queued for message ${clonedMessage.key?.id}`)
+                            config.logger?.info({
+                                messageId: clonedMessage.key?.id,
+                                jid: validJid,
+                                mediaType: mediaInfo.type,
+                                mediaId: mediaMessage.id,
+                                isOfficialAPI
+                            }, '📥 Media download queued via shared queue')
+                        } catch (error) {
+                            logError(`❌ Failed to queue media download, falling back to inline:`, error)
+                            // Fall back to inline download
+                            performInlineMediaDownload()
+                        }
+                    } else if (bullInitialized && queues.has(QueueType.MESSAGES)) {
+                        // Queue via per-instance queue (for backward compatibility)
+                        // Media download will be handled in the message queue processor
+                        log(`📥 Media download will be handled by message queue processor`)
+                    } else {
+                        // Fall back to inline download
+                        performInlineMediaDownload()
                     }
                     
-                    // Download media asynchronously
-                    downloadOfficialAPIMedia(clonedMessage, validatedInstanceId, config.media, config.logger, checkExistingMedia)
-                        .then(async (mediaResult) => {
-                            if (mediaResult.success && mediaResult.localPath) {
-                                // Update message with media URL
-                                await withConnection(async () =>
-                                    collections.messages.updateOne(
-                                        { 
-                                            instanceId: validatedInstanceId, 
-                                            jid: validJid, 
-                                            'key.id': clonedMessage.key?.id 
-                                        },
-                                        { 
-                                            $set: { 
-                                                mediaUrl: mediaResult.localPath,
-                                                mediaType: mediaResult.mediaType,
-                                                mediaHash: mediaResult.mediaHash
-                                            } 
-                                        }
+                    // Helper function for inline media download (fallback)
+                    async function performInlineMediaDownload() {
+                        // Function to check for existing media by hash
+                        const checkExistingMedia = async (hash: string): Promise<string | null> => {
+                            const existing = await withConnection(async () =>
+                                collections.messages.findOne({
+                                    instanceId: validatedInstanceId,
+                                    mediaHash: hash,
+                                    mediaUrl: { $exists: true }
+                                })
+                            ) as any
+                            return existing?.mediaUrl || null
+                        }
+                        
+                        // Download media asynchronously
+                        downloadOfficialAPIMedia(clonedMessage, validatedInstanceId, config.media!, config.logger, checkExistingMedia)
+                            .then(async (mediaResult) => {
+                                if (mediaResult.success && mediaResult.localPath) {
+                                    // Update message with media URL
+                                    await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { 
+                                                instanceId: validatedInstanceId, 
+                                                jid: validJid, 
+                                                'key.id': clonedMessage.key?.id 
+                                            },
+                                            { 
+                                                $set: { 
+                                                    mediaUrl: mediaResult.localPath,
+                                                    mediaType: mediaResult.mediaType,
+                                                    mediaHash: mediaResult.mediaHash
+                                                } 
+                                            }
+                                        )
                                     )
-                                )
-                                log(`✅ Official API media downloaded successfully: ${mediaResult.localPath}`)
-                                config.logger?.info({
+                                    log(`✅ Official API media downloaded successfully: ${mediaResult.localPath}`)
+                                    config.logger?.info({
+                                        messageId: clonedMessage.key?.id,
+                                        mediaUrl: mediaResult.localPath
+                                    }, '✅ Official API media downloaded and URL updated')
+                                } else {
+                                    log(`❌ Failed to download Official API media: ${mediaResult.error}`)
+                                    config.logger?.warn({
+                                        messageId: clonedMessage.key?.id,
+                                        error: mediaResult.error
+                                    }, '❌ Failed to download Official API media')
+                                }
+                            })
+                            .catch(error => {
+                                log(`❌ Error downloading Official API media: ${error instanceof Error ? error.message : 'Unknown error'}`)
+                                config.logger?.error({
                                     messageId: clonedMessage.key?.id,
-                                    mediaUrl: mediaResult.localPath
-                                }, '✅ Official API media downloaded and URL updated')
-                            } else {
-                                log(`❌ Failed to download Official API media: ${mediaResult.error}`)
-                                config.logger?.warn({
-                                    messageId: clonedMessage.key?.id,
-                                    error: mediaResult.error
-                                }, '❌ Failed to download Official API media')
-                            }
-                        })
-                        .catch(error => {
-                            log(`❌ Error downloading Official API media: ${error instanceof Error ? error.message : 'Unknown error'}`)
-                            config.logger?.error({
-                                messageId: clonedMessage.key?.id,
-                                error: error instanceof Error ? error.message : 'Unknown error'
-                            }, '❌ Error downloading Official API media')
-                        })
+                                    error: error instanceof Error ? error.message : 'Unknown error'
+                                }, '❌ Error downloading Official API media')
+                            })
+                    }
                 } else {
                     log(`⚠️ No media info extracted from Official API message ${clonedMessage.key?.id}`)
                 }

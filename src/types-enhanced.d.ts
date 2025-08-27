@@ -118,7 +118,7 @@ export interface RedisConfig {
      * Redis connection options for Bull queue
      * Can be a connection string or RedisOptions object
      */
-    connection: string | RedisOptions
+    connection: string | RedisOptions | any
     
     /**
      * Optional queue name prefix (default: 'baileys')
@@ -149,6 +149,23 @@ export interface RedisConfig {
      * Remove failed jobs after this many seconds (default: 86400)
      */
     removeOnFail?: number
+    
+    /**
+     * Use shared queues across all instances
+     * Default: true (recommended for multi-instance setups)
+     */
+    useSharedQueues?: boolean
+    
+    /**
+     * Concurrency settings for shared queues
+     * Only applies when useSharedQueues is true
+     */
+    queueConcurrency?: {
+        highPriority?: number
+        dataSync?: number
+        media?: number
+        lowPriority?: number
+    }
 }
 
 /**
