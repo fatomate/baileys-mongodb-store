@@ -1810,7 +1810,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             withConnection(async () => collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 })).then(() => {}),
             withConnection(async () => collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: messagesTTL })).then(() => {}),
             // Index for media deduplication
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true })).then(() => {})
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true })).then(() => {}),
+            // Compound index for fallback queries using key.remoteJid (optimized for poll messages and edge cases)
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 })).then(() => {})
         )
         
         // No TTL for groupMetadata - data persists indefinitely
