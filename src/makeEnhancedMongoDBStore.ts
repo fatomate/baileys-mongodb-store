@@ -733,9 +733,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     reject(error)
                 }
                 
-                // Clean up any existing listeners before adding new ones
-                connectionStateEmitter.removeAllListeners('connected')
-                connectionStateEmitter.removeAllListeners('failed')
+                // Add listeners without removing all - the off() calls above handle cleanup
                 connectionStateEmitter.once('connected', onConnected)
                 connectionStateEmitter.once('failed', onFailed)
             })
@@ -5102,8 +5100,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`[${instanceId}] Already reconnecting, waiting for completion...`)
                 return new Promise((resolve, reject) => {
                     const timeout = setTimeout(() => {
-                        connectionStateEmitter.removeAllListeners('connected')
-                        connectionStateEmitter.removeAllListeners('failed')
+                        connectionStateEmitter.off('connected', onConnected)
+                        connectionStateEmitter.off('failed', onFailed)
                         reject(new Error('Reconnection timeout'))
                     }, 30000)
                     
