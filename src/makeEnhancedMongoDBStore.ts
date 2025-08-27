@@ -1607,25 +1607,42 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 )
                 
+                // Increase max listeners to prevent warnings
+                if (typeof (worker as any).setMaxListeners === 'function') {
+                    (worker as any).setMaxListeners(20)
+                }
+                
                 log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`)
                 
-                // Set up event handlers
-                worker.on('completed', (job) => {
+                // Store event handler functions for cleanup
+                const completedHandler = (job: Job<T>) => {
                     if (queueType !== QueueType.LABEL_ASSOCIATIONS) {
                         log(`✅ ${queueType} job ${job.id} completed`)
                     }
-                })
+                }
                 
-                worker.on('failed', (job, err) => {
+                const failedHandler = (job: Job<T> | undefined, err: Error) => {
                     logError(`❌ ${queueType} job ${job?.id} failed:`, err.message)
                     if (enableMetrics) {
                         updateEventMetrics(queueType, 'error')
                     }
-                })
+                }
                 
-                worker.on('stalled', (jobId) => {
+                const stalledHandler = (jobId: string) => {
                     logWarn(`⚠️ ${queueType} job ${jobId} stalled`)
-                })
+                }
+                
+                // Set up event handlers
+                ;(worker as any).on('completed', completedHandler)
+                ;(worker as any).on('failed', failedHandler)
+                ;(worker as any).on('stalled', stalledHandler)
+                
+                // Store handlers for cleanup
+                (worker as any).__eventHandlers = {
+                    completed: completedHandler,
+                    failed: failedHandler,
+                    stalled: stalledHandler
+                }
                 
                 workers.set(queueType, worker)
                 
@@ -5336,8 +5353,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (bullInitialized) {
                 log(`🛑 Closing Bull queues for instance ${instanceId}...`)
                 try {
-                    // Close all workers
+                    // Close all workers and remove event listeners
                     for (const worker of workers.values()) {
+                        // Remove event listeners if they exist
+                        if ((worker as any).__eventHandlers) {
+                            const handlers = (worker as any).__eventHandlers
+                            worker.removeListener('completed', handlers.completed)
+                            worker.removeListener('failed', handlers.failed)
+                            worker.removeListener('stalled', handlers.stalled)
+                            delete (worker as any).__eventHandlers
+                        }
                         await worker.close()
                     }
                     // Close all queues

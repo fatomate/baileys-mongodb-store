@@ -29,8 +29,6 @@ import {
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController, MemoryAwareBatchProcessor, calculateOptimalBatchSize } from './utils/memory'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
-import { retryWithBackoff, isRetryableError } from './utils/connectionRetry'
-import { safeDropIndex } from './utils/indexHelper'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
@@ -510,24 +508,41 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                 )
                 
+                // Increase max listeners to prevent warnings
+                if (typeof (worker as any).setMaxListeners === 'function') {
+                    (worker as any).setMaxListeners(20)
+                }
+                
                 log(`🔧 Created ${queueType} queue with concurrency: ${concurrency}`)
                 
-                // Set up event handlers
-                worker.on('completed', (job) => {
+                // Store event handler functions for cleanup
+                const completedHandler = (job: Job<T>) => {
                     // Only log for label associations in debug mode
                     if (queueType !== QueueType.LABEL_ASSOCIATIONS) {
                         log(`✅ ${queueType} job ${job.id} completed`)
                     }
-                })
+                }
                 
-                worker.on('failed', (job, err) => {
+                const failedHandler = (job: Job<T> | undefined, err: Error) => {
                     logError(`❌ ${queueType} job ${job?.id} failed:`, err.message)
                     performanceMetrics.errors++
-                })
+                }
                 
-                worker.on('stalled', (jobId) => {
+                const stalledHandler = (jobId: string) => {
                     logWarn(`⚠️ ${queueType} job ${jobId} stalled`)
-                })
+                }
+                
+                // Set up event handlers
+                ;(worker as any).on('completed', completedHandler)
+                ;(worker as any).on('failed', failedHandler)
+                ;(worker as any).on('stalled', stalledHandler)
+                
+                // Store handlers for cleanup
+                (worker as any).__eventHandlers = {
+                    completed: completedHandler,
+                    failed: failedHandler,
+                    stalled: stalledHandler
+                }
                 
                 workers.set(queueType, worker)
                 
@@ -818,13 +833,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             upsert: true
                         }
                     }))
-                    await withConnection(() => collections.contacts.bulkWrite(bulkOps, { ordered: false }))
+                    await collections.contacts.bulkWrite(bulkOps, { ordered: false })
                 } else if (type === 'update' && contact) {
-                    await withConnection(() => collections.contacts.replaceOne(
+                    await collections.contacts.replaceOne(
                         { instanceId, id: contact.id },
                         { ...contact, instanceId, updatedAt: new Date() },
                         { upsert: true }
-                    ))
+                    )
                 }
                 
                 return { success: true }
@@ -839,11 +854,11 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     console.log(`[${instanceId}] Processing upsert for group ${metadata.id}`)
                     config.logger?.debug({ instanceId, groupId: metadata.id }, 'Processing group metadata upsert job')
                     try {
-                        const result = await withConnection(() => collections.groupMetadata.replaceOne(
+                        const result = await collections.groupMetadata.replaceOne(
                             { instanceId, id: metadata.id },
                             { ...metadata, instanceId, updatedAt: new Date() },
                             { upsert: true }
-                        ))
+                        )
                         console.log(`[${instanceId}] Bull worker result for group ${metadata.id}: upserted=${result.upsertedCount}, modified=${result.modifiedCount}`)
                         config.logger?.info({ instanceId, groupId: metadata.id, upserted: result.upsertedCount, modified: result.modifiedCount }, 'Group metadata processed by queue')
                     } catch (error) {
@@ -852,10 +867,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                 } else if (type === 'update' && update) {
                     console.log(`[${instanceId}] Processing update for group ${jid}`)
-                    await withConnection(() => collections.groupMetadata.updateOne(
+                    await collections.groupMetadata.updateOne(
                         { instanceId, id: jid },
                         { $set: { ...update, updatedAt: new Date() } }
-                    ))
+                    )
                 }
                 
                 return { success: true }
@@ -865,13 +880,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             createQueueAndWorker<PresenceJob>(QueueType.PRESENCES, async (job) => {
                 const { id, presences } = job.data
                 
-                await withConnection(() => collections.presences.updateOne(
+                await collections.presences.updateOne(
                     { instanceId, id },
                     {
                         $set: { presences, updatedAt: new Date() }
                     },
                     { upsert: true }
-                ))
+                )
                 
                 return { success: true }
             })
@@ -880,13 +895,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             createQueueAndWorker<StateJob>(QueueType.STATE, async (job) => {
                 const { update } = job.data
                 
-                await withConnection(() => collections.state.updateOne(
+                await collections.state.updateOne(
                     { instanceId },
                     { 
                         $set: { ...update, instanceId, updatedAt: new Date() }
                     },
                     { upsert: true }
-                ))
+                )
                 
                 return { success: true }
             })
@@ -1207,50 +1222,41 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         )
     }
     
-    // Enhanced wrapper for MongoDB operations with retry logic
+    // Wrapper for MongoDB operations with automatic reconnection
     const withConnection = async <T>(operation: () => Promise<T>): Promise<T> => {
         const startTime = Date.now()
-        
-        const result = await retryWithBackoff(
-            async () => {
-                await ensureConnection()
-                // Refresh collections after reconnection
-                collections = getCollections()
-                
-                // Track activity for connection manager
-                if (isUsingSharedConnection && connectionManager) {
-                    connectionManager.recordActivity(validatedInstanceId)
-                }
-                
-                const opResult = await operation()
-                
-                // Record response time
-                if (isUsingSharedConnection && connectionManager) {
-                    const responseTime = Date.now() - startTime
-                    connectionManager.recordActivity(validatedInstanceId, responseTime)
-                }
-                
-                return opResult
-            },
-            {
-                maxAttempts: 3,
-                initialDelay: 100,
-                maxDelay: 5000,
-                factor: 2,
-                jitter: true,
-                shouldRetry: (error: any) => isRetryableError(error)
-            },
-            (attempt, error, delay) => {
-                log(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+        try {
+            await ensureConnection()
+            // Refresh collections after reconnection
+            collections = getCollections()
+            
+            // Track activity for connection manager
+            if (isUsingSharedConnection && connectionManager) {
+                connectionManager.recordActivity(validatedInstanceId)
             }
-        )
-        
-        if (!result.success) {
-            logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
-            throw result.error
+            
+            const result = await operation()
+            
+            // Record response time
+            if (isUsingSharedConnection && connectionManager) {
+                const responseTime = Date.now() - startTime
+                connectionManager.recordActivity(validatedInstanceId, responseTime)
+            }
+            
+            return result
+        } catch (error: any) {
+            // If it's a connection error, reset and try once more
+            if (error.message?.includes('Client must be connected') || 
+                error.message?.includes('Topology is closed') ||
+                error.code === 'ECONNREFUSED') {
+                log(`Connection error detected for instance ${instanceId}, attempting reconnection...`)
+                isConnected = false
+                await ensureConnection()
+                collections = getCollections()
+                return await operation()
+            }
+            throw error
         }
-        
-        return result.result as T
     }
 
     // Batch processing functions
@@ -1447,13 +1453,19 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         const dropObsoleteTTLIndexes = async () => {
             try {
                 // Drop TTL indexes for groupMetadata if they exist
-                await withConnection(() => safeDropIndex(collections.groupMetadata, 'updatedAt_1'))
+                await collections.groupMetadata.dropIndex('updatedAt_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
                 
                 // Drop TTL indexes for labelAssociations if they exist
-                await withConnection(() => safeDropIndex(collections.labelAssociations, 'updatedAt_1'))
+                await collections.labelAssociations.dropIndex('updatedAt_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
                 
                 // Drop TTL indexes for labels if they exist
-                await withConnection(() => safeDropIndex(collections.labels, 'updatedAt_1'))
+                await collections.labels.dropIndex('updatedAt_1').catch(() => {
+                    // Index might not exist, ignore error
+                })
                 
                 log('🔄 Migrated: Removed TTL indexes from groupMetadata, labelAssociations, and labels')
             } catch (error) {
@@ -1907,24 +1919,20 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 if (cached) return cached
                 
                 // Primary query using jid
-                let message = await withConnection(() => 
-                    collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        'key.id': validId
-                    })
-                )
+                let message = await collections.messages.findOne({
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
+                    'key.id': validId
+                })
                 
                 // Fallback query using key.remoteJid (for poll messages and edge cases)
                 if (!message) {
                     console.log(`[getMessage] Primary query failed for jid: ${validJid}, id: ${validId}. Trying fallback with key.remoteJid`)
-                    message = await withConnection(() => 
-                        collections.messages.findOne({
-                            instanceId: validatedInstanceId,
-                            'key.remoteJid': validJid,
-                            'key.id': validId
-                        })
-                    )
+                    message = await collections.messages.findOne({
+                        instanceId: validatedInstanceId,
+                        'key.remoteJid': validJid,
+                        'key.id': validId
+                    })
                     
                     if (message) {
                         console.log(`[getMessage] ✅ Found message using fallback query with key.remoteJid`)
@@ -3201,8 +3209,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         healthCheckInterval = null
                     }
                     
-                    // Close all workers
+                    // Close all workers and remove event listeners
                     for (const worker of workers.values()) {
+                        // Remove event listeners if they exist
+                        if ((worker as any).__eventHandlers) {
+                            const handlers = (worker as any).__eventHandlers
+                            worker.removeListener('completed', handlers.completed)
+                            worker.removeListener('failed', handlers.failed)
+                            worker.removeListener('stalled', handlers.stalled)
+                            delete (worker as any).__eventHandlers
+                        }
                         await worker.close()
                     }
                     // Close all queues

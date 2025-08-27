@@ -1,0 +1,135 @@
+Store config prepared for 6860DCA0E2819, will create after socket initialization
+Using shared connection for instance 6860DCA0E2819
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[LidHandler] All indexes created successfully
+[LID Handler] Initialized for instance 6860DCA0E2819
+🚀 Initializing shared queue manager for instance 6860DCA0E2819...
+✅ Registered all shared queue processors for instance 6860DCA0E2819
+✅ Shared queue manager initialized successfully for instance 6860DCA0E2819
+(node:3723692) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 connected listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3723692) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 failed listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+[TTL Monitor] Warning: TTL index missing for collection chats
+[TTL Monitor] Warning: TTL index missing for collection contacts
+[TTL Monitor] Warning: TTL index missing for collection messages
+[TTL Monitor] Warning: TTL index missing for collection groupMetadata
+[TTL Monitor] Warning: TTL index missing for collection state
+[TTL Monitor] Warning: TTL index missing for collection presences
+[TTL Monitor] Warning: TTL index missing for collection labels
+[TTL Monitor] Warning: TTL index missing for collection labelAssociations
+[LidHandler] All indexes created successfully
+Reconnected to MongoDB (shared) for instance 6860DCA0E2819
+ℹ️ Index updatedAt_1 does not exist in collection wabot_groupMetadata, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labels, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labelAssociations, skipping drop
+✅ Created index on collection wabot_labels
+✅ Created index on collection wabot_groupMetadata
+✅ Created index on collection wabot_labelAssociations
+✅ Indexes created with custom TTL settings for instance 6860DCA0E2819
+[TTL Monitor] Verifying TTL indexes...
+[TTL Monitor] All TTL indexes verified successfully
+Store created for 6860DCA0E2819: Index TTL=30d, User retention=7d, Media=true
+Store created with config: { useSharedQueues: true, hasRedis: true, redisConnection: 'string' }
+[6860DCA0E2819] store.bind() called - setting up event listeners with selective storage
+new session created for instance id 6860DCA0E2819
+Current version: 2.3000.1026386251
+Cached permissions for instance 66639568C68AF
+permissions for module whatsapp_poll_template is defined for 66639568C68AF
+permissions for module whatsapp_live_chat is defined for 66639568C68AF (from cache)
+Returning full permissions for 66639568C68AF (from cache)
+User retention preference: 7 days for instance 66639568C68AF
+Cached retention preference: 7 days for instance 66639568C68AF
+Media download enabled for instance 66639568C68AF
+Store config prepared for 66639568C68AF, will create after socket initialization
+Using shared connection for instance 66639568C68AF
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection chats
+[LidHandler] All indexes created successfully
+[LID Handler] Initialized for instance 66639568C68AF
+🚀 Initializing shared queue manager for instance 66639568C68AF...
+✅ Registered all shared queue processors for instance 66639568C68AF
+✅ Shared queue manager initialized successfully for instance 66639568C68AF
+(node:3723692) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 connected listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+(node:3723692) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 failed listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection contacts
+[LidHandler] All indexes created successfully
+Reconnected to MongoDB (shared) for instance 66639568C68AF
+ℹ️ Index updatedAt_1 does not exist in collection wabot_groupMetadata, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labels, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labelAssociations, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection messages
+✅ Created index on collection wabot_labels
+✅ Created index on collection wabot_groupMetadata
+✅ Created index on collection wabot_labelAssociations
+[TTL Monitor] Warning: TTL index missing for collection groupMetadata
+[TTL Monitor] Warning: TTL index missing for collection state
+[TTL Monitor] Warning: TTL index missing for collection presences
+[TTL Monitor] Warning: TTL index missing for collection labels
+[TTL Monitor] Warning: TTL index missing for collection labelAssociations
+✅ Indexes created with custom TTL settings for instance 66639568C68AF
+[TTL Monitor] Verifying TTL indexes...
+[TTL Monitor] All TTL indexes verified successfully
+Store created for 66639568C68AF: Index TTL=30d, User retention=7d, Media=true
+Store created with config: { useSharedQueues: true, hasRedis: true, redisConnection: 'string' }
+[66639568C68AF] store.bind() called - setting up event listeners with selective storage
+new session created for instance id 66639568C68AF
+Current version: 2.3000.1026386251
+Cached permissions for instance 672874B2A7484
+permissions for module whatsapp_poll_template is defined for 672874B2A7484
+permissions for module whatsapp_live_chat is defined for 672874B2A7484 (from cache)
+Returning full permissions for 672874B2A7484 (from cache)
+User retention preference: 30 days for instance 672874B2A7484
+Cached retention preference: 30 days for instance 672874B2A7484
+Media download enabled for instance 672874B2A7484
+Store config prepared for 672874B2A7484, will create after socket initialization
+Using shared connection for instance 672874B2A7484
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection chats
+[LidHandler] All indexes created successfully
+[LID Handler] Initialized for instance 672874B2A7484
+🚀 Initializing shared queue manager for instance 672874B2A7484...
+✅ Registered all shared queue processors for instance 672874B2A7484
+✅ Shared queue manager initialized successfully for instance 672874B2A7484
+(node:3723692) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 connected listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+(node:3723692) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 failed listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+[TTL Monitor] Warning: TTL index missing for collection contacts
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[LidHandler] All indexes created successfully
+Reconnected to MongoDB (shared) for instance 672874B2A7484
+[TTL Monitor] Warning: TTL index missing for collection messages
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labels, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labelAssociations, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection groupMetadata
+ℹ️ Index updatedAt_1 does not exist in collection wabot_groupMetadata, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection state
+✅ Created index on collection wabot_labelAssociations
+✅ Created index on collection wabot_labels
+✅ Created index on collection wabot_groupMetadata
+✅ Indexes created with custom TTL settings for instance 672874B2A7484
+[TTL Monitor] Verifying TTL indexes...
+[TTL Monitor] All TTL indexes verified successfully
+Store created for 672874B2A7484: Index TTL=30d, User retention=30d, Media=true
+Store created with config: { useSharedQueues: true, hasRedis: true, redisConnection: 'string' }
+[672874B2A7484] store.bind() called - setting up event listeners with selective storage
+new session created for instance id 672874B2A7484
+[TTL Monitor] Warning: TTL index missing for collection presences
+[TTL Monitor] Warning: TTL index missing for collection labels
+[TTL Monitor] Warning: TTL index missing for collection labelAssociations
