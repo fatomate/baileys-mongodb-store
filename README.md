@@ -14,6 +14,7 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - **🔧 Runtime Configuration**: Update storage settings without restarting
 - **🚀 Redis Bull Queue**: Full Redis Bull queue support for reliable background processing
 - **📸 Media Download**: Automatic download and storage of media files with URL tracking
+- **👤 Profile Picture Auto-Retrieval**: Automatically fetch and update contact profile pictures
 
 ### Existing Features
 - **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes

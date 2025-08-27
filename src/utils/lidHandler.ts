@@ -8,6 +8,7 @@ import {
     areJidsEquivalent,
     extractLidPhonePair
 } from './jidUtils'
+import { retryWithBackoff } from './connectionRetry'
 
 export interface LidMapping {
     instanceId: string
@@ -57,14 +58,37 @@ export class LidHandler {
         this.messagesCollection = db.collection(messagesCollectionName)
         
         
-        // Create indexes for efficient lookups
+        // Create indexes for efficient lookups with retry logic
         await this.createIndexes()
     }
 
     /**
-     * Create MongoDB indexes for efficient lookups
+     * Create MongoDB indexes for efficient lookups with retry logic
      */
     private async createIndexes(): Promise<void> {
+        const createIndexWithRetry = async (collection: Collection<any>, indexSpec: any, options?: any) => {
+            const result = await retryWithBackoff(
+                () => collection.createIndex(indexSpec, options),
+                {
+                    maxAttempts: 5,
+                    initialDelay: 200,
+                    maxDelay: 10000,
+                    factor: 2,
+                    jitter: true
+                },
+                (attempt, error, delay) => {
+                    console.log(`[LID Handler] Retry attempt ${attempt} for index creation after error: ${error.message}. Waiting ${delay}ms...`)
+                }
+            )
+            
+            if (!result.success) {
+                console.error(`[LID Handler] Failed to create index after ${result.attempts} attempts:`, result.error)
+                // Don't throw - indexes are optimization, not critical for operation
+            }
+            
+            return result
+        }
+        
         const promises: Promise<any>[] = []
         
         // Create indexes for lidMappings collection
@@ -78,13 +102,16 @@ export class LidHandler {
             
             promises.push(
                 // Compound index for instance + lid lookup
-                this.lidMappingsCollection.createIndex(
+                createIndexWithRetry(
+                    this.lidMappingsCollection,
                     { instanceId: 1, lid: 1 },
-                    { unique: true }
+                    { unique: true, background: true }
                 ),
                 // Compound index for instance + phone number lookup
-                this.lidMappingsCollection.createIndex(
-                    { instanceId: 1, phoneNumber: 1 }
+                createIndexWithRetry(
+                    this.lidMappingsCollection,
+                    { instanceId: 1, phoneNumber: 1 },
+                    { background: true }
                 )
                 // TTL index removed - lid mappings will persist until explicitly deleted
             )
@@ -94,20 +121,23 @@ export class LidHandler {
         if (this.messagesCollection) {
             promises.push(
                 // Compound index for reverse lookup: find messages by senderLid
-                this.messagesCollection.createIndex(
+                createIndexWithRetry(
+                    this.messagesCollection,
                     { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 },
                     { background: true }
                 )
             )
         }
         
+        // Wait for all index operations to complete
         try {
             if (promises.length > 0) {
                 await Promise.all(promises)
-                console.log('[LidHandler] Indexes created successfully')
+                console.log('[LidHandler] All indexes created successfully')
             }
         } catch (error) {
-            console.error('Failed to create LID handler indexes:', error)
+            console.error('[LidHandler] Some indexes failed to create, but continuing:', error)
+            // Don't throw - indexes are optimization, not critical
         }
     }
 

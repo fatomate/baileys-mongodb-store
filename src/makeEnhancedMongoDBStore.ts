@@ -39,8 +39,11 @@ import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats
 import { LidHandler } from './utils/lidHandler'
 import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
+import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
+import { ConnectionHealthMonitor } from './utils/connectionHealth'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
+import { EventEmitter } from 'events'
 
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
@@ -57,7 +60,8 @@ enum QueueType {
     CONTACTS = 'contacts',
     GROUP_METADATA = 'group-metadata',
     PRESENCES = 'presences',
-    STATE = 'state'
+    STATE = 'state',
+    PROFILE_PICTURES = 'profile-pictures'
 }
 
 // Bull job data types
@@ -128,6 +132,14 @@ interface LabelAssociationJob {
     instanceId: string
     timestamp: number
     operationId?: string
+}
+
+interface ProfilePictureJob {
+    contactId: string
+    instanceId: string
+    timestamp: number
+    retryCount?: number
+    lastError?: string
 }
 
 // Event metrics storage
@@ -499,7 +511,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         meId,
         lidHandler: lidHandlerConfig,
         connectionConfig,
-        useSharedConnections = true
+        useSharedConnections = true,
+        sock,
+        profilePictureConfig
     } = config
     
     // Validate instance ID
@@ -546,9 +560,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let db: Db
     let connectionManager: ConnectionManager | null = null
     let isUsingSharedConnection = false
-    let isConnected = false
-    let isConnecting = false
     let reconnectAttempts = 0
+    
+    // Connection state management
+    enum MongoConnectionState {
+        DISCONNECTED = 'disconnected',
+        CONNECTING = 'connecting',
+        CONNECTED = 'connected',
+        RECONNECTING = 'reconnecting',
+        FAILED = 'failed'
+    }
+    
+    let mongoConnectionState = MongoConnectionState.DISCONNECTED
+    const connectionStateEmitter = new EventEmitter()
+    
+    // Initialize health monitor
+    const healthMonitor = new ConnectionHealthMonitor({
+        checkInterval: 30000, // 30 seconds
+        unhealthyThreshold: 3,
+        healthyThreshold: 2
+    })
     
     // Helper function to track activity for shared connections
     const trackActivity = (responseTime?: number) => {
@@ -576,7 +607,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
-            isConnected = true
             
             log(`Using shared connection for instance ${instanceId}`)
         } catch (error) {
@@ -593,7 +623,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             db = client.db(dbName)
             isUsingSharedConnection = false
             connectionManager = null
-            isConnected = true
         }
     } else {
         // Use dedicated connection (original behavior)
@@ -605,7 +634,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         })
         await client.connect()
         db = client.db(dbName)
-        isConnected = true
+        mongoConnectionState = MongoConnectionState.CONNECTED
+        
+        // Start health monitoring
+        healthMonitor.startMonitoring(db)
     }
     
     // Initialize TTL monitor after DB connection
@@ -617,11 +649,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         })
     }
     
-    // Initialize LID handler after DB connection
+    // Initialize LID handler after DB connection with retry logic
     if (lidHandlerConfig) {
         lidHandler = new LidHandler(validatedInstanceId, lidHandlerConfig)
-        await lidHandler.initialize(db, collectionPrefix)
-        log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
+        const initResult = await retryWithBackoff(
+            () => lidHandler!.initialize(db, collectionPrefix),
+            {
+                maxAttempts: 3,
+                initialDelay: 500,
+                maxDelay: 5000,
+                factor: 2,
+                jitter: true
+            },
+            (attempt, error, delay) => {
+                logWarn(`[LID Handler] Retry attempt ${attempt} for initialization after error: ${error.message}. Waiting ${delay}ms...`)
+            }
+        )
+        
+        if (initResult.success) {
+            log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
+        } else {
+            logError(`[LID Handler] Failed to initialize after ${initResult.attempts} attempts:`, initResult.error)
+            // Don't throw - LID handler is optional
+        }
     }
     
     // Get collections
@@ -643,30 +693,47 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     let collections = getCollections()
     
-    // Ensure connection is active before operations
+    // Ensure connection is active before operations with enhanced error handling
     const ensureConnection = async (): Promise<void> => {
-        if (isConnected && client) {
+        // Quick check if already connected
+        if (mongoConnectionState === MongoConnectionState.CONNECTED && client) {
             try {
-                // Quick ping to check if connection is actually alive
+                // Quick ping to verify connection is alive
                 await db.admin().ping()
                 return
-            } catch {
-                isConnected = false
+            } catch (error) {
+                log(`Connection check failed for instance ${validatedInstanceId}: ${error}`)
+                mongoConnectionState = MongoConnectionState.DISCONNECTED
+                    connectionStateEmitter.emit('disconnected', error)
             }
         }
         
-        // If already connecting, wait for it
-        if (isConnecting) {
-            let waitAttempts = 0
-            while (isConnecting && waitAttempts < 50) {
-                await new Promise(resolve => setTimeout(resolve, 100))
-                waitAttempts++
-            }
-            if (isConnected) return
+        // If already connecting or reconnecting, wait for it
+        if (mongoConnectionState === MongoConnectionState.CONNECTING || mongoConnectionState === MongoConnectionState.RECONNECTING) {
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    connectionStateEmitter.off('connected', onConnected)
+                    connectionStateEmitter.off('failed', onFailed)
+                    reject(new Error('Connection timeout'))
+                }, 30000) // 30 second timeout
+                
+                const onConnected = () => {
+                    clearTimeout(timeout)
+                    resolve()
+                }
+                
+                const onFailed = (error: Error) => {
+                    clearTimeout(timeout)
+                    reject(error)
+                }
+                
+                connectionStateEmitter.once('connected', onConnected)
+                connectionStateEmitter.once('failed', onFailed)
+            })
         }
         
-        // Mark as connecting
-        isConnecting = true
+        // Mark as connecting/reconnecting
+        mongoConnectionState = reconnectAttempts > 0 ? MongoConnectionState.RECONNECTING : MongoConnectionState.CONNECTING
         
         try {
             // For shared connections, we need to re-register
@@ -686,13 +753,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Refresh collections after reconnection
                     collections = getCollections()
                     
-                    // Re-initialize LID handler if needed
+                    // Re-initialize LID handler if needed with retry
                     if (lidHandler) {
-                        await lidHandler.initialize(db, collectionPrefix)
+                        const reinitResult = await retryWithBackoff(
+                            () => lidHandler!.initialize(db, collectionPrefix),
+                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+                            (attempt, error, delay) => {
+                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+                            }
+                        )
+                        if (!reinitResult.success) {
+                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+                        }
                     }
                     
-                    isConnected = true
                     reconnectAttempts = 0
+                    mongoConnectionState = MongoConnectionState.CONNECTED
+                    connectionStateEmitter.emit('connected')
+                    healthMonitor.updateConnectionState('connected')
                     log(`Reconnected to MongoDB (shared) for instance ${validatedInstanceId}`)
                 } catch (error) {
                     // Fall back to dedicated connection if shared fails
@@ -712,13 +790,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Refresh collections after reconnection
                     collections = getCollections()
                     
-                    // Re-initialize LID handler if needed
+                    // Re-initialize LID handler if needed with retry
                     if (lidHandler) {
-                        await lidHandler.initialize(db, collectionPrefix)
+                        const reinitResult = await retryWithBackoff(
+                            () => lidHandler!.initialize(db, collectionPrefix),
+                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+                            (attempt, error, delay) => {
+                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+                            }
+                        )
+                        if (!reinitResult.success) {
+                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+                        }
                     }
                     
-                    isConnected = true
                     reconnectAttempts = 0
+                    mongoConnectionState = MongoConnectionState.CONNECTED
+                    connectionStateEmitter.emit('connected')
+                    healthMonitor.updateConnectionState('connected')
                     log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
                 }
             } else {
@@ -748,51 +837,68 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     await lidHandler.initialize(db, collectionPrefix)
                 }
                 
-                isConnected = true
                 reconnectAttempts = 0
+                mongoConnectionState = MongoConnectionState.CONNECTED
+                connectionStateEmitter.emit('connected')
+                healthMonitor.updateConnectionState('connected')
                 log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
             }
         } catch (error) {
-            isConnected = false
             reconnectAttempts++
+            mongoConnectionState = MongoConnectionState.FAILED
+            connectionStateEmitter.emit('failed', error)
+            healthMonitor.updateConnectionState('failed')
+            healthMonitor.recordFailure()
             logError(`Failed to reconnect to MongoDB for instance ${validatedInstanceId}:`, error)
             throw new Error(`Failed to connect to MongoDB: ${(error as Error).message}`)
         } finally {
-            isConnecting = false
+            // Connection state is managed by enum now
         }
     }
     
-    // Wrapper for operations that need connection
-    const withConnection = async <T>(operation: () => Promise<T>): Promise<T> => {
+    // Enhanced wrapper for operations with retry logic
+    const withConnection = async <T>(
+        operation: () => Promise<T>,
+        retryOptions?: Partial<RetryOptions>
+    ): Promise<T> => {
         const startTime = Date.now()
-        try {
-            await ensureConnection()
-            
-            const result = await operation()
-            
-            // Track success metrics
-            const responseTime = Date.now() - startTime
-            trackActivity(responseTime)
-            
-            return result
-        } catch (error: any) {
-            // If it's a connection error, reset and try once more
-            if (error.message?.includes('Client must be connected') || 
-                error.message?.includes('Topology is closed') ||
-                error.message?.includes('Connection pool closed') ||
-                error.code === 'ECONNREFUSED') {
-                log(`Connection error detected for instance ${validatedInstanceId}, attempting reconnection...`)
-                isConnected = false
+        
+        // Define retry options with defaults
+        const options: RetryOptions = {
+            maxAttempts: retryOptions?.maxAttempts ?? 3,
+            initialDelay: retryOptions?.initialDelay ?? 100,
+            maxDelay: retryOptions?.maxDelay ?? 5000,
+            factor: retryOptions?.factor ?? 2,
+            jitter: retryOptions?.jitter ?? true,
+            shouldRetry: (error: any) => {
+                // Use the default retry logic from connectionRetry
+                return isRetryableError(error)
+            }
+        }
+        
+        const result = await retryWithBackoff(
+            async () => {
                 await ensureConnection()
                 return await operation()
+            },
+            options,
+            (attempt, error, delay) => {
+                logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
             }
-            
-            // Track error metrics
-            const responseTime = Date.now() - startTime
-            trackActivity(responseTime)
-            
-            throw error
+        )
+        
+        if (!result.success) {
+            logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
+            healthMonitor.recordFailure()
+            throw result.error
         }
+        
+        // Track success metrics
+        const responseTime = Date.now() - startTime
+        trackActivity(responseTime)
+        healthMonitor.recordSuccess(responseTime)
+        
+        return result.result as T
     }
     
     // Queue configuration
@@ -869,7 +975,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 queues.set(queueType, queue)
                 
                 // Set concurrency based on queue type
-                const concurrency = queueType === QueueType.LABEL_ASSOCIATIONS ? 1 : (redis.concurrency || 50)
+                let concurrency: number
+                if (queueType === QueueType.LABEL_ASSOCIATIONS) {
+                    concurrency = 1
+                } else if (queueType === QueueType.PROFILE_PICTURES) {
+                    concurrency = profilePictureConfig?.maxConcurrent || 5
+                } else {
+                    concurrency = redis.concurrency || 50
+                }
                 
                 // Create worker
                 const worker = new Worker<T>(
@@ -1292,6 +1405,61 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     await withConnection(async () =>
                         collections.contacts.bulkWrite(bulkOps, { ordered: false })
                     )
+                    
+                    // Queue profile picture retrieval for contacts if enabled
+                    if (sock && profilePictureConfig?.enabled && queues.has(QueueType.PROFILE_PICTURES)) {
+                        const profilePicQueue = queues.get(QueueType.PROFILE_PICTURES)!
+                        const refreshIntervalDays = profilePictureConfig.refreshIntervalDays || 7
+                        const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
+                        
+                        for (const contact of contacts) {
+                            try {
+                                // Check if we need to fetch/refresh the profile picture
+                                const existingContact = await withConnection(async () =>
+                                    collections.contacts.findOne({ instanceId, id: contact.id })
+                                ) as any
+                                
+                                let shouldFetchProfilePic = false
+                                
+                                if (!existingContact?.profilePic) {
+                                    // No profile picture, fetch it
+                                    shouldFetchProfilePic = true
+                                    log(`📸 [Contacts Queue] Queuing profile picture fetch for ${contact.id} (no existing picture)`)
+                                } else if (existingContact.profilePicUpdatedAt) {
+                                    // Check if profile picture is stale
+                                    const lastUpdated = new Date(existingContact.profilePicUpdatedAt).getTime()
+                                    const now = Date.now()
+                                    if (now - lastUpdated > refreshIntervalMs) {
+                                        shouldFetchProfilePic = true
+                                        log(`📸 [Contacts Queue] Queuing profile picture refresh for ${contact.id} (last updated ${refreshIntervalDays}+ days ago)`)
+                                    }
+                                } else {
+                                    // Has profile pic but no update timestamp, refresh it
+                                    shouldFetchProfilePic = true
+                                    log(`📸 [Contacts Queue] Queuing profile picture refresh for ${contact.id} (no update timestamp)`)
+                                }
+                                
+                                if (shouldFetchProfilePic) {
+                                    // Queue the profile picture fetch job
+                                    await profilePicQueue.add(
+                                        `profile-pic-${contact.id}`,
+                                        {
+                                            contactId: contact.id,
+                                            instanceId,
+                                            timestamp: Date.now()
+                                        } as ProfilePictureJob,
+                                        {
+                                            ...defaultJobOptions,
+                                            delay: Math.random() * 1000 // Random delay up to 1 second to spread out requests
+                                        }
+                                    )
+                                }
+                            } catch (error) {
+                                logWarn(`⚠️ [Contacts Queue] Failed to queue profile picture fetch for ${contact.id}:`, error)
+                            }
+                        }
+                    }
+                    
                     trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
                     await withConnection(async () =>
@@ -1301,6 +1469,48 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             { upsert: true }
                         )
                     )
+                    
+                    // Queue profile picture retrieval for single contact update if enabled
+                    if (sock && profilePictureConfig?.enabled && queues.has(QueueType.PROFILE_PICTURES)) {
+                        const profilePicQueue = queues.get(QueueType.PROFILE_PICTURES)!
+                        const refreshIntervalDays = profilePictureConfig.refreshIntervalDays || 7
+                        const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
+                        
+                        try {
+                            const existingContact = await withConnection(async () =>
+                                collections.contacts.findOne({ instanceId, id: contact.id })
+                            ) as any
+                            
+                            let shouldFetchProfilePic = false
+                            
+                            if (!existingContact?.profilePic) {
+                                shouldFetchProfilePic = true
+                            } else if (existingContact.profilePicUpdatedAt) {
+                                const lastUpdated = new Date(existingContact.profilePicUpdatedAt).getTime()
+                                const now = Date.now()
+                                if (now - lastUpdated > refreshIntervalMs) {
+                                    shouldFetchProfilePic = true
+                                }
+                            } else {
+                                shouldFetchProfilePic = true
+                            }
+                            
+                            if (shouldFetchProfilePic) {
+                                await profilePicQueue.add(
+                                    `profile-pic-${contact.id}`,
+                                    {
+                                        contactId: contact.id,
+                                        instanceId,
+                                        timestamp: Date.now()
+                                    } as ProfilePictureJob,
+                                    defaultJobOptions
+                                )
+                                log(`📸 [Contacts Queue] Queued profile picture fetch for ${contact.id}`)
+                            }
+                        } catch (error) {
+                            logWarn(`⚠️ [Contacts Queue] Failed to queue profile picture fetch for ${contact.id}:`, error)
+                        }
+                    }
                 }
                 
                 return { success: true }
@@ -1515,6 +1725,87 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     throw error
                 }
             })
+            
+            // Profile picture queue (only if sock and config are provided)
+            if (sock && profilePictureConfig?.enabled) {
+                createQueueAndWorker<ProfilePictureJob>(QueueType.PROFILE_PICTURES, async (job) => {
+                    const { contactId, retryCount = 0 } = job.data
+                    const maxRetries = profilePictureConfig.retryAttempts || 3
+                    const requestDelay = profilePictureConfig.requestDelay || 500
+                    
+                    // Add delay between requests to avoid rate limiting
+                    if (requestDelay > 0) {
+                        await new Promise(resolve => setTimeout(resolve, requestDelay))
+                    }
+                    
+                    try {
+                        log(`📸 [Profile Picture Queue] Fetching profile picture for ${contactId}`)
+                        
+                        // Fetch profile picture URL using Baileys sock
+                        const profilePictureUrl = await sock.profilePictureUrl(contactId)
+                        
+                        if (profilePictureUrl) {
+                            // Update contact with profile picture
+                            await withConnection(async () =>
+                                collections.contacts.updateOne(
+                                    { instanceId, id: contactId },
+                                    { 
+                                        $set: { 
+                                            profilePic: profilePictureUrl,
+                                            profilePicUpdatedAt: new Date(),
+                                            updatedAt: new Date()
+                                        } 
+                                    }
+                                )
+                            )
+                            
+                            log(`✅ [Profile Picture Queue] Updated profile picture for ${contactId}`)
+                            return { success: true, profilePictureUrl }
+                        } else {
+                            log(`⚠️ [Profile Picture Queue] No profile picture available for ${contactId}`)
+                            return { success: true, profilePictureUrl: null }
+                        }
+                    } catch (error: any) {
+                        // Handle privacy errors silently unless configured to log them
+                        const isPrivacyError = error.message?.includes('privacy') || 
+                                              error.message?.includes('401') ||
+                                              error.message?.includes('not authorized') ||
+                                              error.message?.includes('ProfilePictureUrl')
+                        
+                        if (isPrivacyError) {
+                            if (profilePictureConfig.logPrivacyErrors) {
+                                log(`🔒 [Profile Picture Queue] Privacy restricted for ${contactId}`)
+                            }
+                            // Mark as successful to avoid retries for privacy errors
+                            return { success: true, privacyRestricted: true }
+                        }
+                        
+                        // For other errors, retry if attempts remaining
+                        if (retryCount < maxRetries - 1) {
+                            logWarn(`⚠️ [Profile Picture Queue] Failed to fetch profile picture for ${contactId}, retry ${retryCount + 1}/${maxRetries}: ${error.message}`)
+                            // Re-queue with incremented retry count
+                            await queues.get(QueueType.PROFILE_PICTURES)?.add(
+                                `profile-pic-${contactId}`,
+                                {
+                                    ...job.data,
+                                    retryCount: retryCount + 1,
+                                    lastError: error.message
+                                },
+                                {
+                                    delay: (retryCount + 1) * 2000, // Exponential backoff
+                                    ...defaultJobOptions
+                                }
+                            )
+                        } else {
+                            logError(`❌ [Profile Picture Queue] Failed to fetch profile picture for ${contactId} after ${maxRetries} attempts:`, error.message)
+                        }
+                        
+                        throw error
+                    }
+                })
+                
+                log(`📸 Profile picture queue initialized with concurrency: ${profilePictureConfig.maxConcurrent || 5}`)
+            }
             
             bullInitialized = true
             log(`✅ Bull queues initialized successfully for instance ${instanceId}`)
@@ -4448,8 +4739,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Reset connection state
-            isConnected = false
-            isConnecting = false
+            mongoConnectionState = MongoConnectionState.DISCONNECTED
             reconnectAttempts = 0
         }
     }

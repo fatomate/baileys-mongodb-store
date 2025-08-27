@@ -37,7 +37,8 @@
       "mcp__ide__getDiagnostics",
       "Bash(chmod:*)",
       "Read(//Users/firdausazizi/Library/CloudStorage/GoogleDrive-firdaus@fames.my/My Drive/Fatomate/Wabot/Fatomate/Wabot/Baileys MongoDB Store Project/baileys-mongodb-store/src/**)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(cd:*)"
     ],
     "deny": []
   }

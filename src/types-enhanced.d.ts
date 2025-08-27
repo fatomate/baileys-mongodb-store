@@ -1,6 +1,6 @@
 import type { Comparable } from '@adiwajshing/keyed-db/lib/Types'
 import type { Logger } from 'pino'
-import type { proto } from 'baileys'
+import type { proto, WASocket } from 'baileys'
 import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata, PresenceData, WAMessageCursor } from 'baileys'
 import type { Label } from 'baileys/lib/Types/Label'
 import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
@@ -149,6 +149,47 @@ export interface RedisConfig {
      * Remove failed jobs after this many seconds (default: 86400)
      */
     removeOnFail?: number
+}
+
+/**
+ * Configuration for profile picture auto-retrieval
+ */
+export interface ProfilePictureConfig {
+    /**
+     * Enable automatic profile picture retrieval
+     * Default: false
+     */
+    enabled?: boolean
+    
+    /**
+     * Days before refreshing profile pictures
+     * Default: 7 days
+     */
+    refreshIntervalDays?: number
+    
+    /**
+     * Delay between profile picture requests in milliseconds
+     * Default: 500ms
+     */
+    requestDelay?: number
+    
+    /**
+     * Maximum concurrent profile picture fetches
+     * Default: 5
+     */
+    maxConcurrent?: number
+    
+    /**
+     * Number of retry attempts for failed fetches
+     * Default: 3
+     */
+    retryAttempts?: number
+    
+    /**
+     * Whether to log privacy errors (when user has restricted profile picture)
+     * Default: false
+     */
+    logPrivacyErrors?: boolean
 }
 
 export interface EnhancedMongoDBStoreConfig {
@@ -309,6 +350,18 @@ export interface EnhancedMongoDBStoreConfig {
      * Default: true (recommended for multiple instances)
      */
     useSharedConnections?: boolean
+    
+    /**
+     * WhatsApp socket instance for profile picture retrieval
+     * Required if profilePictureConfig is enabled
+     */
+    sock?: WASocket
+    
+    /**
+     * Profile picture auto-retrieval configuration
+     * Enables automatic download of contact profile pictures
+     */
+    profilePictureConfig?: ProfilePictureConfig
 }
 
 /**
