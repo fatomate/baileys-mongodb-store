@@ -41,6 +41,7 @@ import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
+import { safeDropIndex, safeCreateIndex } from './utils/indexHelper'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
 import { EventEmitter } from 'events'
@@ -2109,12 +2110,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // No TTL for groupMetadata - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            withConnection(async () => collections.groupMetadata.dropIndex('updatedAt_1')).catch(() => {
-                // Index might not exist, ignore error
-            }).then(async () => {
-                // Create unique index without TTL
-                return withConnection(async () => collections.groupMetadata.createIndex({ instanceId: 1, id: 1 }, { unique: true }))
-            }).then(() => {})
+            withConnection(async () => safeDropIndex(collections.groupMetadata, 'updatedAt_1'))
+                .then(async () => {
+                    // Create unique index without TTL
+                    return withConnection(async () => safeCreateIndex(collections.groupMetadata, { instanceId: 1, id: 1 }, { unique: true }))
+                })
+                .then(() => {})
             // TTL index removed - groupMetadata will persist until explicitly deleted
         )
         
@@ -2133,24 +2134,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // No TTL for labels - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            withConnection(async () => collections.labels.dropIndex('updatedAt_1')).catch(() => {
-                // Index might not exist, ignore error
-            }).then(async () => {
-                // Create unique index without TTL
-                return withConnection(async () => collections.labels.createIndex({ instanceId: 1, id: 1 }, { unique: true }))
-            }).then(() => {})
+            withConnection(async () => safeDropIndex(collections.labels, 'updatedAt_1'))
+                .then(async () => {
+                    // Create unique index without TTL
+                    return withConnection(async () => safeCreateIndex(collections.labels, { instanceId: 1, id: 1 }, { unique: true }))
+                })
+                .then(() => {})
             // TTL index removed - labels will persist until explicitly deleted
         )
         
         // No TTL for labelAssociations - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            withConnection(async () => collections.labelAssociations.dropIndex('updatedAt_1')).catch(() => {
-                // Index might not exist, ignore error
-            }).then(async () => {
-                // Create unique index without TTL
-                return withConnection(async () => collections.labelAssociations.createIndex({ instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true }))
-            }).then(() => {})
+            withConnection(async () => safeDropIndex(collections.labelAssociations, 'updatedAt_1'))
+                .then(async () => {
+                    // Create unique index without TTL
+                    return withConnection(async () => safeCreateIndex(collections.labelAssociations, { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true }))
+                })
+                .then(() => {})
             // TTL index removed - labelAssociations will persist until explicitly deleted
         )
         

@@ -30,6 +30,7 @@ import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController, MemoryAwareBatchProcessor, calculateOptimalBatchSize } from './utils/memory'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
 import { retryWithBackoff, isRetryableError } from './utils/connectionRetry'
+import { safeDropIndex } from './utils/indexHelper'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
@@ -1446,19 +1447,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         const dropObsoleteTTLIndexes = async () => {
             try {
                 // Drop TTL indexes for groupMetadata if they exist
-                await collections.groupMetadata.dropIndex('updatedAt_1').catch(() => {
-                    // Index might not exist, ignore error
-                })
+                await withConnection(() => safeDropIndex(collections.groupMetadata, 'updatedAt_1'))
                 
                 // Drop TTL indexes for labelAssociations if they exist
-                await collections.labelAssociations.dropIndex('updatedAt_1').catch(() => {
-                    // Index might not exist, ignore error
-                })
+                await withConnection(() => safeDropIndex(collections.labelAssociations, 'updatedAt_1'))
                 
                 // Drop TTL indexes for labels if they exist
-                await collections.labels.dropIndex('updatedAt_1').catch(() => {
-                    // Index might not exist, ignore error
-                })
+                await withConnection(() => safeDropIndex(collections.labels, 'updatedAt_1'))
                 
                 log('🔄 Migrated: Removed TTL indexes from groupMetadata, labelAssociations, and labels')
             } catch (error) {

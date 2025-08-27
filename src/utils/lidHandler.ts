@@ -9,6 +9,7 @@ import {
     extractLidPhonePair
 } from './jidUtils'
 import { retryWithBackoff } from './connectionRetry'
+import { safeDropIndex } from './indexHelper'
 
 export interface LidMapping {
     instanceId: string
@@ -95,9 +96,7 @@ export class LidHandler {
         if (this.lidMappingsCollection) {
             // Drop existing TTL index if it exists (migration from older versions)
             promises.push(
-                this.lidMappingsCollection.dropIndex('lastSeen_1').catch(() => {
-                    // Index might not exist, ignore error
-                })
+                safeDropIndex(this.lidMappingsCollection, 'lastSeen_1')
             )
             
             promises.push(
