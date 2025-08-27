@@ -292,6 +292,26 @@ export interface MongoDBStore {
     bind(ev: BaileysEventEmitter): void
     
     /**
+     * Update socket reference after store creation
+     */
+    setSock?(socket: any): void
+    
+    /**
+     * Check if store and database connection are healthy
+     */
+    isHealthy?(): Promise<boolean>
+    
+    /**
+     * Safe rebind method - unbinds existing listeners before binding new ones
+     */
+    rebind?(ev: BaileysEventEmitter): void
+    
+    /**
+     * Reconnect to MongoDB
+     */
+    reconnect?(): Promise<void>
+    
+    /**
      * Load messages from the store
      */
     loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]>

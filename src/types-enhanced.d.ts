@@ -450,6 +450,10 @@ export interface EnhancedMongoDBStore {
     upsertLabelAssociation(association: LabelAssociation): Promise<void>
     deleteLabelAssociation(association: LabelAssociation): Promise<void>
     bind(ev: BaileysEventEmitter): void
+    setSock(socket: any): void
+    isHealthy(): Promise<boolean>
+    rebind(ev: BaileysEventEmitter): void
+    reconnect(): Promise<void>
     loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]>
     loadMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | undefined>
     mostRecentMessage(jid: string): Promise<proto.IWebMessageInfo | undefined>

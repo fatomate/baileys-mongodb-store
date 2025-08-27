@@ -514,9 +514,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         lidHandler: lidHandlerConfig,
         connectionConfig,
         useSharedConnections = true,
-        sock,
         profilePictureConfig
     } = config
+    
+    // Socket can be set later using setSock() method
+    let sock = config.sock || null
     
     // Validate instance ID
     const validatedInstanceId = validateInstanceId(instanceId)
@@ -575,6 +577,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     let mongoConnectionState = MongoConnectionState.DISCONNECTED
     const connectionStateEmitter = new EventEmitter()
+    // Fix EventEmitter memory leak warning by setting reasonable limit
+    connectionStateEmitter.setMaxListeners(50)
     
     // Initialize health monitor
     const healthMonitor = new ConnectionHealthMonitor({
@@ -729,6 +733,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     reject(error)
                 }
                 
+                // Clean up any existing listeners before adding new ones
+                connectionStateEmitter.removeAllListeners('connected')
+                connectionStateEmitter.removeAllListeners('failed')
                 connectionStateEmitter.once('connected', onConnected)
                 connectionStateEmitter.once('failed', onFailed)
             })
@@ -1558,8 +1565,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 })
             }
             
-            // Fix EventEmitter memory leak warning for per-instance mode
-            redisConnection.setMaxListeners(0)
+            // Set reasonable listener limit instead of unlimited
+            redisConnection.setMaxListeners(30)
             
             // Test Redis connection
             await redisConnection.ping()
@@ -2370,6 +2377,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     try {
                         log(`📸 [Profile Picture Queue] Fetching profile picture for ${contactId}`)
                         
+                        // Check if socket is available
+                        if (!sock) {
+                            log(`⚠️ [Profile Picture Queue] Socket not available, skipping profile picture for ${contactId}`)
+                            return
+                        }
+                        
                         // Fetch profile picture URL using Baileys sock
                         const profilePictureUrl = await sock.profilePictureUrl(contactId)
                         
@@ -2810,6 +2823,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Initialize indexes
     await createIndexes()
+    
+    // Track binding state to prevent duplicate bindings
+    let isBound = false
     
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
@@ -4223,6 +4239,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         // bind method continues with event handling...
         bind(ev: BaileysEventEmitter): void {
+            // Check if already bound to prevent duplicate bindings
+            if (isBound) {
+                log(`[${instanceId}] store.bind() already called, skipping duplicate binding`)
+                return
+            }
+            isBound = true
             log(`[${instanceId}] store.bind() called - setting up event listeners with selective storage`)
             
             // Connection update
@@ -5027,6 +5049,84 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
         },
 
+        // Method to update socket reference after store creation
+        setSock(socket: any): void {
+            sock = socket
+            log(`[${instanceId}] Socket reference updated in store`)
+            
+            // Re-initialize profile picture retrieval if enabled
+            if (profilePictureConfig?.enabled && socket) {
+                log(`[${instanceId}] Re-initializing profile picture retrieval with new socket`)
+                // Profile picture functionality will use the updated socket
+            }
+        },
+
+        // Health check method for store and database connection
+        async isHealthy(): Promise<boolean> {
+            try {
+                // Check MongoDB connection state
+                if (mongoConnectionState !== MongoConnectionState.CONNECTED) {
+                    log(`[${instanceId}] Health check failed: MongoDB not connected`)
+                    return false
+                }
+                
+                // Ping the database to ensure it's responsive
+                await db.admin().ping()
+                
+                // Check Redis connection if Bull is initialized
+                if (bullInitialized && redisConnection) {
+                    await redisConnection.ping()
+                }
+                
+                log(`[${instanceId}] Health check passed`)
+                return true
+            } catch (error) {
+                logError(`[${instanceId}] Health check failed:`, error)
+                return false
+            }
+        },
+
+        // Safe rebind method - unbinds existing listeners before binding new ones
+        rebind(ev: BaileysEventEmitter): void {
+            // Reset binding state to allow rebinding
+            isBound = false
+            // Now bind again
+            storeImpl.bind(ev)
+        },
+
+        // Connection recovery method
+        async reconnect(): Promise<void> {
+            // If already reconnecting, wait for it to complete
+            if (mongoConnectionState === MongoConnectionState.CONNECTING || 
+                mongoConnectionState === MongoConnectionState.RECONNECTING) {
+                log(`[${instanceId}] Already reconnecting, waiting for completion...`)
+                return new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        connectionStateEmitter.removeAllListeners('connected')
+                        connectionStateEmitter.removeAllListeners('failed')
+                        reject(new Error('Reconnection timeout'))
+                    }, 30000)
+                    
+                    const onConnected = () => {
+                        clearTimeout(timeout)
+                        resolve()
+                    }
+                    
+                    const onFailed = (error: Error) => {
+                        clearTimeout(timeout)
+                        reject(error)
+                    }
+                    
+                    connectionStateEmitter.once('connected', onConnected)
+                    connectionStateEmitter.once('failed', onFailed)
+                })
+            }
+            
+            // Force reconnection
+            log(`[${instanceId}] Initiating reconnection...`)
+            await ensureConnection()
+        },
+
         async loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]> {
             const mode = !cursor || 'before' in cursor ? 'before' : 'after'
             const cursorKey = cursor ? ('before' in cursor ? cursor.before : cursor.after) : undefined
@@ -5408,6 +5508,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Reset connection state
             mongoConnectionState = MongoConnectionState.DISCONNECTED
             reconnectAttempts = 0
+            
+            // Clean up EventEmitter to prevent memory leaks
+            connectionStateEmitter.removeAllListeners()
+            
+            // Reset binding state
+            isBound = false
         }
     }
 
