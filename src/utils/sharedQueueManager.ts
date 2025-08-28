@@ -80,7 +80,8 @@ export class SharedQueueManager extends EventEmitter {
     private workers: Map<SharedQueueName, Worker<SharedJobData>>
     private queueEvents: Map<SharedQueueName, QueueEvents>
     private metrics: Map<SharedQueueName, QueueMetrics>
-    private processors: Map<JobType, (job: Job<SharedJobData>) => Promise<any>>
+    // Changed to support per-instance processors to fix the singleton overwrite issue
+    private instanceProcessors: Map<JobType, Map<string, (job: Job<SharedJobData>) => Promise<any>>>
     private config: SharedQueueManagerConfig
     private isShuttingDown: boolean = false
     private readonly queueConfigs: Map<SharedQueueName, QueueConfig>
@@ -92,7 +93,7 @@ export class SharedQueueManager extends EventEmitter {
         this.workers = new Map()
         this.queueEvents = new Map()
         this.metrics = new Map()
-        this.processors = new Map()
+        this.instanceProcessors = new Map() // Initialize instance processors map
         this.redis = null as any // Will be initialized in initializeRedis()
         
         // Define queue configurations
@@ -306,12 +307,14 @@ export class SharedQueueManager extends EventEmitter {
             throw new Error('Queue manager is shutting down')
         }
         
-        // Get processor for this job type
-        const processor = this.processors.get(type)
-        if (!processor) {
-            this.log('warn', `⚠️ No processor registered for job type ${type}`)
-            return { success: false, error: 'No processor registered' }
+        // Get processor for this specific instance and job type
+        const processors = this.instanceProcessors.get(type)
+        if (!processors || !processors.has(instanceId)) {
+            this.log('warn', `⚠️ No processor registered for instance ${instanceId} and job type ${type}`)
+            return { success: false, error: `No processor for instance ${instanceId}` }
         }
+        
+        const processor = processors.get(instanceId)!
         
         try {
             // Add processing metadata
@@ -335,11 +338,42 @@ export class SharedQueueManager extends EventEmitter {
     }
     
     /**
-     * Register a processor for a specific job type
+     * Register a processor for a specific job type and instance
+     * This fixes the singleton overwrite issue by maintaining per-instance processors
+     */
+    registerInstanceProcessor(instanceId: string, type: JobType, processor: (job: Job<SharedJobData>) => Promise<any>): void {
+        if (!this.instanceProcessors.has(type)) {
+            this.instanceProcessors.set(type, new Map())
+        }
+        this.instanceProcessors.get(type)!.set(instanceId, processor)
+        this.log('info', `📝 Registered processor for instance ${instanceId} and job type ${type}`)
+    }
+    
+    /**
+     * Legacy method - kept for backward compatibility but now registers for a default instance
+     * @deprecated Use registerInstanceProcessor instead
      */
     registerProcessor(type: JobType, processor: (job: Job<SharedJobData>) => Promise<any>): void {
-        this.processors.set(type, processor)
-        this.log('info', `📝 Registered processor for job type ${type}`)
+        this.log('warn', `⚠️ Using deprecated registerProcessor for job type ${type}. Use registerInstanceProcessor instead.`)
+        // Register as a default processor - this will be overwritten if called multiple times!
+        this.registerInstanceProcessor('default', type, processor)
+    }
+    
+    /**
+     * Unregister all processors for a specific instance
+     * Call this when an instance shuts down to clean up
+     */
+    unregisterInstanceProcessors(instanceId: string): void {
+        let removedCount = 0
+        for (const [jobType, processors] of this.instanceProcessors) {
+            if (processors.has(instanceId)) {
+                processors.delete(instanceId)
+                removedCount++
+            }
+        }
+        if (removedCount > 0) {
+            this.log('info', `🗑️ Unregistered ${removedCount} processors for instance ${instanceId}`)
+        }
     }
     
     /**

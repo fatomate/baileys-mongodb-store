@@ -47,6 +47,14 @@ import type { ConnectionConfig } from './types/connection'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
 
+// Declare Node.js globals if not available in tsconfig
+declare global {
+    function setImmediate(callback: (...args: any[]) => void): NodeJS.Immediate
+    function clearImmediate(handle: NodeJS.Immediate): void
+    function setTimeout(callback: (...args: any[]) => void, ms: number, ...args: any[]): NodeJS.Timeout
+    function clearTimeout(handle: NodeJS.Timeout): void
+}
+
 const DEFAULT_TTL_DAYS = 30
 const DEFAULT_EVENT_CONFIG: EventStorageConfig = {
     enabled: true,
@@ -919,6 +927,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let sharedQueueManager: SharedQueueManager | null = null
     const useSharedQueues = redis?.useSharedQueues !== false // Default to true if Redis is provided
     
+    // Track background tasks for cleanup
+    let profilePictureFetchHandle: NodeJS.Immediate | null = null
+    let isClosing = false
+    
     // Default job options for automatic cleanup
     const defaultJobOptions = {
         removeOnComplete: {
@@ -970,8 +982,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const registerSharedQueueProcessors = async () => {
         if (!sharedQueueManager) return
         
-        // Messages processor
-        sharedQueueManager.registerProcessor(JobType.MESSAGES, async (job) => {
+        // Messages processor - use instance-specific registration to fix singleton issue
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.MESSAGES, async (job) => {
             const { data, instanceId: jobInstanceId } = job.data
             
             // Only process jobs for this instance
@@ -1074,13 +1086,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: false, error: 'Unknown message job type' }
         })
         
-        // Contacts processor
-        sharedQueueManager.registerProcessor(JobType.CONTACTS, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Contacts processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.CONTACTS, async (job) => {
+            const { data } = job.data
             
             const { type, contacts, contact } = data as ContactJob
             
@@ -1125,13 +1133,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: false, error: 'Unknown contact job type' }
         })
         
-        // Chats processor
-        sharedQueueManager.registerProcessor(JobType.CHATS, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Chats processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.CHATS, async (job) => {
+            const { data } = job.data
             
             const { type, chats, chatId, update, deleteIds } = data as ChatJob
             
@@ -1178,13 +1182,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: false, error: 'Unknown chat job type' }
         })
         
-        // Group metadata processor
-        sharedQueueManager.registerProcessor(JobType.GROUP_METADATA, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Group metadata processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.GROUP_METADATA, async (job) => {
+            const { data } = job.data
             
             const { type, jid, metadata, update } = data as GroupMetadataJob
             
@@ -1218,13 +1218,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: false, error: 'Unknown group metadata job type' }
         })
         
-        // Profile pictures processor
-        sharedQueueManager.registerProcessor(JobType.PROFILE_PICTURES, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Profile pictures processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.PROFILE_PICTURES, async (job) => {
+            const { data } = job.data
             
             const { contactId, retryCount = 0 } = data as ProfilePictureJob
             
@@ -1292,13 +1288,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         })
         
-        // Media download processor (NEW)
-        sharedQueueManager.registerProcessor(JobType.MEDIA_DOWNLOAD, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Media download processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.MEDIA_DOWNLOAD, async (job) => {
+            const { data } = job.data
             
             const { message } = data
             
@@ -1367,13 +1359,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         })
         
-        // State processor
-        sharedQueueManager.registerProcessor(JobType.STATE, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // State processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.STATE, async (job) => {
+            const { data } = job.data
             
             const { update } = data as StateJob
             
@@ -1394,13 +1382,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: true }
         })
         
-        // Presences processor
-        sharedQueueManager.registerProcessor(JobType.PRESENCES, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Presences processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.PRESENCES, async (job) => {
+            const { data } = job.data
             
             const { id, presences } = data as PresenceJob
             
@@ -1422,13 +1406,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: true }
         })
         
-        // Labels processor
-        sharedQueueManager.registerProcessor(JobType.LABELS, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Labels processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.LABELS, async (job) => {
+            const { data } = job.data
             
             const { type, id, label } = data as LabelJob
             
@@ -1462,13 +1442,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return { success: false, error: 'Unknown label job type' }
         })
         
-        // Label associations processor
-        sharedQueueManager.registerProcessor(JobType.LABEL_ASSOCIATIONS, async (job) => {
-            const { data, instanceId: jobInstanceId } = job.data
-            
-            if (jobInstanceId !== validatedInstanceId) {
-                return { skipped: true, reason: 'Different instance' }
-            }
+        // Label associations processor - use instance-specific registration
+        sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.LABEL_ASSOCIATIONS, async (job) => {
+            const { data } = job.data
             
             const { type, association } = data as LabelAssociationJob
             
@@ -2582,7 +2558,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Get existing data from Redis
             const existingData = await redisConnection.hget(hashKey, normalizedChatId)
-            let metadata = existingData ? JSON.parse(existingData) : {
+            const metadata = existingData ? JSON.parse(existingData) : {
                 chatId: association.chatId,
                 addLabelIds: [],
                 removeLabelIds: []
@@ -3067,34 +3043,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (contacts.length === 0) return
             
             const startTime = Date.now()
-            trackActivity() // Track request
             
-            // Use Bull queue if available
-            if (bullInitialized && queues.has(QueueType.CONTACTS)) {
-                try {
-                    const queue = queues.get(QueueType.CONTACTS)!
-                    // Split large contact lists into batches
-                    for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-                        const batch = contacts.slice(i, i + BATCH_SIZE)
-                        await queue.add(
-                            'upsert',
-                            {
-                                type: 'upsert',
-                                contacts: batch,
-                                instanceId,
-                                timestamp: Date.now()
-                            },
-                            defaultJobOptions
-                        )
-                    }
-                    trackActivity(Date.now() - startTime) // Track response time for queued operation
-                    return
-                } catch (error) {
-                    logError('[Bull Contacts] Failed to queue, falling back:', error)
-                }
-            }
+            log(`📝 [Contacts] Saving ${contacts.length} contacts to database`)
             
-            // Fallback to direct write
+            // IMPORTANT: Save contacts directly to ensure data persistence
+            // This bypasses the broken SharedQueueManager that causes processor conflicts
             const bulkOps = contacts.map(contact => ({
                 replaceOne: {
                     filter: { instanceId, id: contact.id },
@@ -3109,6 +3062,126 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 await withConnection(async () =>
                     collections.contacts.bulkWrite(chunk, { ordered: false })
                 )
+            }
+            
+            log(`✅ [Contacts] Saved ${contacts.length} contacts to database`)
+            trackActivity(Date.now() - startTime) // Track response time
+            
+            // Fetch profile pictures asynchronously in the background
+            // This ensures contacts are saved immediately while profile pictures are fetched later
+            if (sock && profilePictureConfig?.enabled) {
+                // Clear any existing fetch operation
+                if (profilePictureFetchHandle) {
+                    clearImmediate(profilePictureFetchHandle)
+                    profilePictureFetchHandle = null
+                }
+                
+                // Use setImmediate to run in background without blocking the event loop
+                profilePictureFetchHandle = setImmediate(async () => {
+                    // Check if we're closing
+                    if (isClosing) {
+                        log(`⚠️ [Contacts] Skipping profile picture fetch - store is closing`)
+                        return
+                    }
+                    log(`📸 [Contacts] Starting profile picture fetch for ${contacts.length} contacts`)
+                    
+                    const requestDelay = profilePictureConfig.requestDelay || 500
+                    const maxRetries = profilePictureConfig.retryAttempts || 3
+                    const refreshIntervalDays = profilePictureConfig.refreshIntervalDays || 7
+                    const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
+                    
+                    for (const contact of contacts) {
+                        try {
+                            // Check if we need to fetch profile picture for this contact
+                            const existingContact = await withConnection(async () =>
+                                collections.contacts.findOne({ instanceId, id: contact.id })
+                            ) as any
+                            
+                            const shouldFetch = !existingContact?.profilePic || 
+                                                !existingContact?.profilePicUpdatedAt ||
+                                                (Date.now() - new Date(existingContact.profilePicUpdatedAt).getTime() > refreshIntervalMs)
+                            
+                            if (!shouldFetch) {
+                                log(`⏭️ [Contacts] Skipping profile picture for ${contact.id} (recently updated)`)
+                                continue
+                            }
+                            
+                            // Rate limiting: add delay between requests
+                            if (requestDelay > 0) {
+                                await new Promise(resolve => setTimeout(resolve, requestDelay))
+                            }
+                            
+                            log(`📸 [Contacts] Fetching profile picture for ${contact.id} (${existingContact?.profilePic ? 'outdated' : 'no existing picture'})`)
+                            
+                            let attempts = 0
+                            let profilePictureUrl: string | null = null
+                            
+                            while (attempts < maxRetries && !profilePictureUrl) {
+                                try {
+                                    // Check if store is closing or sock is null
+                                    if (isClosing || !sock) {
+                                        log(`⚠️ [Contacts] Stopping profile fetch - ${isClosing ? 'closing' : 'no socket'}`)
+                                        break
+                                    }
+                                    
+                                    profilePictureUrl = await sock.profilePictureUrl(contact.id).catch(() => null) as string | null
+                                    
+                                    if (profilePictureUrl) {
+                                        // Update contact with profile picture URL
+                                        await withConnection(async () =>
+                                            collections.contacts.updateOne(
+                                                { instanceId, id: contact.id },
+                                                { 
+                                                    $set: { 
+                                                        profilePic: profilePictureUrl,
+                                                        profilePicUpdatedAt: new Date(),
+                                                        updatedAt: new Date()
+                                                    } 
+                                                }
+                                            )
+                                        )
+                                        log(`✅ [Contacts] Updated profile picture for ${contact.id}`)
+                                        break
+                                    }
+                                } catch (error: any) {
+                                    // Handle privacy errors silently
+                                    if (error?.message?.includes('privacy') || 
+                                        error?.message?.includes('401') ||
+                                        error?.message?.includes('not authorized')) {
+                                        log(`🔒 [Contacts] Profile picture private for ${contact.id}`)
+                                        // Mark as checked to avoid repeated attempts
+                                        await withConnection(async () =>
+                                            collections.contacts.updateOne(
+                                                { instanceId, id: contact.id },
+                                                { 
+                                                    $set: { 
+                                                        profilePicUpdatedAt: new Date(),
+                                                        updatedAt: new Date()
+                                                    } 
+                                                }
+                                            )
+                                        )
+                                        break
+                                    }
+                                    
+                                    attempts++
+                                    if (attempts < maxRetries) {
+                                        log(`⚠️ [Contacts] Retry ${attempts}/${maxRetries} for ${contact.id}: ${error?.message}`)
+                                        await new Promise(resolve => setTimeout(resolve, requestDelay * 2))
+                                    }
+                                }
+                            }
+                            
+                            if (!profilePictureUrl && attempts >= maxRetries) {
+                                log(`❌ [Contacts] Failed to fetch profile picture for ${contact.id} after ${maxRetries} attempts`)
+                            }
+                        } catch (error) {
+                            logError(`❌ [Contacts] Error processing profile picture for ${contact.id}:`, error)
+                        }
+                    }
+                    
+                    log(`✅ [Contacts] Profile picture fetch completed for ${contacts.length} contacts`)
+                })
             }
         },
 
@@ -3533,7 +3606,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Helper function for inline media download (fallback)
                     async function performInlineMediaDownload() {
-                        // Function to check for existing media by hash
+                        // Check for existing media by hash
                         const checkExistingMedia = async (hash: string): Promise<string | null> => {
                             const existing = await withConnection(async () =>
                                 collections.messages.findOne({
@@ -5436,6 +5509,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         
         async close(): Promise<void> {
+            // Set closing flag to stop background operations
+            isClosing = true
+            
+            // Clear profile picture fetch handle if it exists
+            if (profilePictureFetchHandle) {
+                clearImmediate(profilePictureFetchHandle)
+                profilePictureFetchHandle = null
+            }
+            
+            // Unregister instance processors from SharedQueueManager to prevent memory leaks
+            if (sharedQueueManager && useSharedQueues) {
+                log(`🗑️ Unregistering processors for instance ${instanceId} from SharedQueueManager`)
+                sharedQueueManager.unregisterInstanceProcessors(validatedInstanceId)
+            }
+            
             // Remove repeatable job for cleanup if it exists
             if (queues.has(QueueType.LABEL_ASSOCIATIONS)) {
                 const labelQueue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
@@ -5448,7 +5536,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             // Close Bull queues if initialized
-            if (bullInitialized) {
+            if (bullInitialized && !useSharedQueues) {
                 log(`🛑 Closing Bull queues for instance ${instanceId}...`)
                 try {
                     // Close all workers and remove event listeners
@@ -5456,9 +5544,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Remove event listeners if they exist
                         if ((worker as any).__eventHandlers) {
                             const handlers = (worker as any).__eventHandlers
-                            worker.removeListener('completed', handlers.completed)
-                            worker.removeListener('failed', handlers.failed)
-                            worker.removeListener('stalled', handlers.stalled)
+                            worker.off('completed', handlers.completed)
+                            worker.off('failed', handlers.failed)
+                            worker.off('stalled', handlers.stalled)
                             delete (worker as any).__eventHandlers
                         }
                         await worker.close()
