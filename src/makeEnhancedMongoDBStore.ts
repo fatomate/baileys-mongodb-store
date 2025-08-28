@@ -3046,15 +3046,43 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             log(`📝 [Contacts] Saving ${contacts.length} contacts to database`)
             
+            // Fetch existing contacts to preserve profile picture data
+            const existingContacts = await withConnection(async () =>
+                collections.contacts.find({
+                    instanceId,
+                    id: { $in: contacts.map(c => c.id) }
+                }).toArray()
+            ) as any[]
+            
+            // Create a map of existing profile picture data
+            const existingDataMap = new Map(
+                existingContacts.map(c => [c.id, {
+                    profilePic: c.profilePic,
+                    profilePicUpdatedAt: c.profilePicUpdatedAt
+                }])
+            )
+            
             // IMPORTANT: Save contacts directly to ensure data persistence
             // This bypasses the broken SharedQueueManager that causes processor conflicts
-            const bulkOps = contacts.map(contact => ({
-                replaceOne: {
-                    filter: { instanceId, id: contact.id },
-                    replacement: { ...contact, instanceId, updatedAt: new Date() },
-                    upsert: true
+            const bulkOps = contacts.map(contact => {
+                const existing = existingDataMap.get(contact.id)
+                return {
+                    replaceOne: {
+                        filter: { instanceId, id: contact.id },
+                        replacement: {
+                            ...contact,
+                            instanceId,
+                            updatedAt: new Date(),
+                            // Preserve existing profile picture data if it exists
+                            ...(existing?.profilePic && {
+                                profilePic: existing.profilePic,
+                                profilePicUpdatedAt: existing.profilePicUpdatedAt
+                            })
+                        },
+                        upsert: true
+                    }
                 }
-            }))
+            })
             
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
@@ -3093,13 +3121,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     for (const contact of contacts) {
                         try {
                             // Check if we need to fetch profile picture for this contact
-                            const existingContact = await withConnection(async () =>
-                                collections.contacts.findOne({ instanceId, id: contact.id })
-                            ) as any
+                            // Use the existingDataMap we already fetched to avoid redundant queries
+                            const existingData = existingDataMap.get(contact.id)
                             
-                            const shouldFetch = !existingContact?.profilePic || 
-                                                !existingContact?.profilePicUpdatedAt ||
-                                                (Date.now() - new Date(existingContact.profilePicUpdatedAt).getTime() > refreshIntervalMs)
+                            const shouldFetch = !existingData?.profilePic || 
+                                                !existingData?.profilePicUpdatedAt ||
+                                                (Date.now() - new Date(existingData.profilePicUpdatedAt).getTime() > refreshIntervalMs)
                             
                             if (!shouldFetch) {
                                 log(`⏭️ [Contacts] Skipping profile picture for ${contact.id} (recently updated)`)
@@ -3111,7 +3138,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 await new Promise(resolve => setTimeout(resolve, requestDelay))
                             }
                             
-                            log(`📸 [Contacts] Fetching profile picture for ${contact.id} (${existingContact?.profilePic ? 'outdated' : 'no existing picture'})`)
+                            log(`📸 [Contacts] Fetching profile picture for ${contact.id} (${existingData?.profilePic ? 'outdated' : 'no existing picture'})`)
                             
                             let attempts = 0
                             let profilePictureUrl: string | null = null
