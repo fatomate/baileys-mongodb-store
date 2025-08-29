@@ -3294,8 +3294,11 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
  * Cleanup MongoDB store data for a specific instance
  * @param instanceId - The instance ID to cleanup. If not provided, closes all connections.
  * @param deleteData - Whether to delete all data for the instance (default: false)
+ * @param mongoUri - MongoDB connection URI (required if no active connections)
+ * @param database - Database name (required if no active connections)
+ * @param collectionPrefix - Collection prefix to use (default: 'baileys_')
  */
-export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boolean = false, mongoUri?: string, database?: string): Promise<void> => {
+export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boolean = false, mongoUri?: string, database?: string, collectionPrefix: string = 'baileys_'): Promise<void> => {
     if (!instanceId) {
         // Just close all connections
         const connections = [...activeConnections]
@@ -3325,8 +3328,11 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
         return
     }
 
+    // Validate and normalize the instance ID
+    const validatedInstanceId = validateInstanceId(instanceId)
+    
     // Find connections for the specific instance
-    let instanceConnections = activeConnections.filter(c => c.instanceId === instanceId)
+    let instanceConnections = activeConnections.filter(c => c.instanceId === validatedInstanceId)
     
     // If no active connections and deleteData is requested, create a temporary connection
     if (instanceConnections.length === 0 && deleteData && mongoUri && database) {
@@ -3336,10 +3342,10 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
             await tempClient.connect()
             
             instanceConnections = [{
-                instanceId,
+                instanceId: validatedInstanceId,
                 client: tempClient,
                 database,
-                collectionPrefix: 'baileys_',
+                collectionPrefix,
                 uri: mongoUri
             }]
             
@@ -3370,14 +3376,19 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
                     `${conn.collectionPrefix}lidMappings`
                 ]
 
+                let totalDeleted = 0
                 for (const collName of collections) {
                     try {
-                        await db.collection(collName).deleteMany({ instanceId })
+                        const result = await db.collection(collName).deleteMany({ instanceId: validatedInstanceId })
+                        if (result.deletedCount > 0) {
+                            console.log(`Deleted ${result.deletedCount} documents from ${collName}`)
+                            totalDeleted += result.deletedCount
+                        }
                     } catch (error) {
                         console.error(`Error deleting data from ${collName}:`, error)
                     }
                 }
-                console.log(`Deleted all data for instance: ${instanceId}`)
+                console.log(`Deleted all data for instance: ${instanceId} (${totalDeleted} total documents)`)
             }
 
             // Close the connection
@@ -3389,5 +3400,5 @@ export const cleanupMongoDBStore = async (instanceId?: string, deleteData: boole
     }
 
     // Remove from active connections
-    activeConnections = activeConnections.filter(c => c.instanceId !== instanceId)
+    activeConnections = activeConnections.filter(c => c.instanceId !== validatedInstanceId)
 }

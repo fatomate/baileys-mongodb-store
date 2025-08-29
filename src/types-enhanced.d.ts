@@ -581,6 +581,11 @@ export interface EnhancedMongoDBStore {
         error?: string
     }>
     
+    /**
+     * Clean up MongoDB data and optionally close connections for this instance
+     * @param deleteData Whether to delete all data for the instance (default: false)
+     */
+    cleanup(deleteData?: boolean): Promise<void>
     
     close(): Promise<void>
 }

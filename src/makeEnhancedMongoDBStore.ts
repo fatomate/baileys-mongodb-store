@@ -5817,6 +5817,63 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         },
         
+        async cleanup(deleteData: boolean = false): Promise<void> {
+            log(`[${instanceId}] Starting cleanup - deleteData: ${deleteData}`)
+            
+            try {
+                if (deleteData) {
+                    log(`[${instanceId}] Deleting all data for instance with prefix: ${collectionPrefix}`)
+                    
+                    // Define all collections with the correct prefix
+                    const collections = [
+                        `${collectionPrefix}chats`,
+                        `${collectionPrefix}contacts`,
+                        `${collectionPrefix}messages`,
+                        `${collectionPrefix}groupMetadata`,
+                        `${collectionPrefix}state`,
+                        `${collectionPrefix}presences`,
+                        `${collectionPrefix}labels`,
+                        `${collectionPrefix}labelAssociations`,
+                        `${collectionPrefix}lidMappings`
+                    ]
+                    
+                    let totalDeleted = 0
+                    
+                    for (const collName of collections) {
+                        try {
+                            const result = await withConnection(async () =>
+                                db.collection(collName).deleteMany({ instanceId: validatedInstanceId })
+                            )
+                            
+                            if (result.deletedCount > 0) {
+                                log(`[${instanceId}] Deleted ${result.deletedCount} documents from ${collName}`)
+                                totalDeleted += result.deletedCount
+                            }
+                        } catch (error) {
+                            logError(`[${instanceId}] Error deleting data from ${collName}:`, error)
+                        }
+                    }
+                    
+                    log(`[${instanceId}] Cleanup completed: ${totalDeleted} total documents deleted`)
+                    
+                    // Clear any cached data
+                    const cacheKeys = binaryConversionCache.keys()
+                    cacheKeys.forEach(key => {
+                        if (key.startsWith(`msg_${validatedInstanceId}_`)) {
+                            binaryConversionCache.del(key)
+                        }
+                    })
+                }
+                
+                // Always close connections after data cleanup
+                await storeImpl.close()
+                
+            } catch (error) {
+                logError(`[${instanceId}] Cleanup failed:`, error)
+                throw error
+            }
+        },
+        
         async close(): Promise<void> {
             // Set closing flag to stop background operations
             isClosing = true
