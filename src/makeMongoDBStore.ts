@@ -2684,11 +2684,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 await store.updateState(update)
             })
 
-            ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
-                if (isLatest) {
-                    await store.clearAll()
-                }
-                
+            ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages }) => {
                 // Process in parallel with proper queue management
                 const promises: Promise<void>[] = []
                 
@@ -2976,14 +2972,15 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 }
             })
             
+            // Note: Group metadata is excluded from clearAll() as it's persistent data
             await Promise.all([
                 collections.chats.deleteMany({ instanceId }),
                 collections.contacts.deleteMany({ instanceId }),
                 collections.messages.deleteMany({ instanceId }),
-                collections.groupMetadata.deleteMany({ instanceId }),
                 collections.presences.deleteMany({ instanceId }),
                 collections.labels.deleteMany({ instanceId }),
                 collections.labelAssociations.deleteMany({ instanceId })
+                // Removed: collections.groupMetadata.deleteMany({ instanceId })
             ])
         },
 

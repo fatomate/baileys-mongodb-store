@@ -4968,12 +4968,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
                 if (await shouldStoreEvent('messaging-history.set', historyData)) {
                     try {
-                        if (isLatest) {
-                            // Clear existing data when syncing latest history
-                            await storeImpl.clearAll()
-                            log(`[${instanceId}] Cleared all data for latest history sync`)
-                        }
-                        
                         // Process in parallel
                         const promises: Promise<void>[] = []
                         
@@ -5324,14 +5318,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             })
             
-            // Note: Labels and label associations are excluded from clearAll()
-            // They should persist across history syncs to maintain label integrity
+            // Note: Labels, label associations, and group metadata are excluded from clearAll()
+            // They should persist across history syncs to maintain data integrity
             await Promise.all([
                 collections.chats.deleteMany({ instanceId }),
                 collections.contacts.deleteMany({ instanceId }),
                 collections.messages.deleteMany({ instanceId }),
-                collections.groupMetadata.deleteMany({ instanceId }),
                 collections.presences.deleteMany({ instanceId })
+                // Removed: collections.groupMetadata.deleteMany({ instanceId })
                 // Removed: collections.labels.deleteMany({ instanceId })
                 // Removed: collections.labelAssociations.deleteMany({ instanceId })
             ])
