@@ -931,6 +931,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let profilePictureFetchHandle: NodeJS.Immediate | null = null
     let isClosing = false
     
+    // Operation locking for clearAll to prevent race conditions
+    let clearAllInProgress = false
+    const pendingOperations = new Set<Promise<any>>()
+    let historyDebounceTimer: NodeJS.Timeout | null = null
+    const pendingHistoryData: any[] = []
+    
     // Default job options for automatic cleanup
     const defaultJobOptions = {
         removeOnComplete: {
@@ -3131,12 +3137,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Use setImmediate to run in background without blocking the event loop
                 profilePictureFetchHandle = setImmediate(async () => {
-                    // Check if we're closing
-                    if (isClosing) {
-                        log(`⚠️ [Contacts] Skipping profile picture fetch - store is closing`)
-                        return
-                    }
-                    log(`📸 [Contacts] Starting profile picture fetch for ${contacts.length} contacts`)
+                    // Track this operation
+                    const profileFetchPromise = (async () => {
+                        // Check if we're closing or clearAll is in progress
+                        if (isClosing || clearAllInProgress) {
+                            log(`⚠️ [Contacts] Skipping profile picture fetch - store is ${isClosing ? 'closing' : 'clearing'}`)
+                            return
+                        }
+                        log(`📸 [Contacts] Starting profile picture fetch for ${contacts.length} contacts`)
                     
                     const requestDelay = profilePictureConfig.requestDelay || 500
                     const maxRetries = profilePictureConfig.retryAttempts || 3
@@ -3239,6 +3247,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     log(`✅ [Contacts] Profile picture fetch completed for ${contacts.length} contacts`)
+                    })() // Close and execute the async function
+                    
+                    // Add to pending operations for tracking
+                    pendingOperations.add(profileFetchPromise)
+                    profileFetchPromise.finally(() => {
+                        pendingOperations.delete(profileFetchPromise)
+                    })
                 })
             }
         },
@@ -4988,73 +5003,114 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             })
 
-            // Messaging history sync
+            // Messaging history sync with debouncing
             ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
                 if (enableMetrics) updateEventMetrics('messaging-history.set', 'received')
                 
                 const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
                 if (await shouldStoreEvent('messaging-history.set', historyData)) {
                     try {
-                        // Clear all data if isLatest is true and clearAllOnHistorySync is enabled
-                        if (isLatest && config.clearAllOnHistorySync) {
-                            log(`[${instanceId}] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)`)
-                            await storeImpl.clearAll()
+                        // Add to pending data
+                        pendingHistoryData.push(historyData)
+                        
+                        // Clear existing timer if any
+                        if (historyDebounceTimer) {
+                            clearTimeout(historyDebounceTimer)
                         }
                         
-                        // Process in parallel
-                        const promises: Promise<void>[] = []
-                        
-                        if (newChats?.length) {
-                            promises.push((async () => {
-                                await storeImpl.upsertChats(...newChats)
-                                log(`[${instanceId}] Synced ${newChats.length} chats from history`)
-                            })())
-                        }
-                        
-                        if (newContacts?.length) {
-                            promises.push((async () => {
-                                await storeImpl.upsertContacts(newContacts)
-                                log(`[${instanceId}] Synced ${newContacts.length} contacts from history`)
-                            })())
-                        }
-                        
-                        if (newMessages?.length) {
-                            // Process messages in batches
-                            for (const msg of newMessages) {
-                                let jid = msg.key.remoteJid
-                                if (!jid) continue
+                        // Set new timer to process accumulated data
+                        historyDebounceTimer = setTimeout(async () => {
+                            historyDebounceTimer = null
+                            
+                            try {
+                                if (pendingHistoryData.length === 0) return
                                 
-                                // Process LID if handler is available
-                                if (lidHandler) {
-                                    const { normalizedJid, lidInfo } = await lidHandler.processMessage(msg)
-                                    
-                                    // Update the message's remoteJid to use normalized (phone number) format
-                                    if (normalizedJid && normalizedJid !== msg.key.remoteJid) {
-                                        log(`[History LID Handler] Normalizing JID: ${msg.key.remoteJid} -> ${normalizedJid}`)
-                                        msg.key.remoteJid = normalizedJid
-                                        jid = normalizedJid
+                                const dataToProcess = [...pendingHistoryData]
+                                pendingHistoryData.length = 0 // Clear array
+                                
+                                log(`[${instanceId}] Processing ${dataToProcess.length} accumulated history events`)
+                                
+                                // Check if any event has isLatest=true
+                                const hasLatest = dataToProcess.some(data => data.isLatest)
+                                
+                                // Clear all data if any event has isLatest=true and clearAllOnHistorySync is enabled
+                                if (hasLatest && config.clearAllOnHistorySync) {
+                                    log(`[${instanceId}] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)`)
+                                    await storeImpl.clearAll()
+                                }
+                                
+                                // Merge all history data
+                                const mergedChats = new Map<string, Chat>()
+                                const mergedContacts = new Map<string, Contact>()
+                                const mergedMessages = new Map<string, proto.IWebMessageInfo[]>()
+                                
+                                for (const data of dataToProcess) {
+                                    // Merge chats
+                                    if (data.chats?.length) {
+                                        for (const chat of data.chats) {
+                                            mergedChats.set(chat.id, chat)
+                                        }
                                     }
                                     
-                                    // Store LID info in the message for reference
-                                    if (lidInfo.lid || lidInfo.phoneNumber) {
-                                        (msg as any).lidMapping = {
-                                            lid: lidInfo.lid,
-                                            phoneNumber: lidInfo.phoneNumber,
-                                            originalJid: msg.key.remoteJid,
-                                            mappingStored: lidInfo.mappingStored
+                                    // Merge contacts
+                                    if (data.contacts?.length) {
+                                        for (const contact of data.contacts) {
+                                            mergedContacts.set(contact.id, contact)
+                                        }
+                                    }
+                                    
+                                    // Merge messages by chat
+                                    if (data.messages?.length) {
+                                        for (const msg of data.messages) {
+                                            const chatId = msg.key.remoteJid!
+                                            if (!mergedMessages.has(chatId)) {
+                                                mergedMessages.set(chatId, [])
+                                            }
+                                            mergedMessages.get(chatId)!.push(msg)
                                         }
                                     }
                                 }
                                 
-                                await storeImpl.upsertMessage(jid, msg)
+                                // Process the merged data
+                                const promises: Promise<void>[] = []
+                                
+                                const allChats = Array.from(mergedChats.values())
+                                const allContacts = Array.from(mergedContacts.values())
+                                const allMessages = Array.from(mergedMessages.values()).flat()
+                                
+                                if (allChats.length) {
+                                    promises.push(storeImpl.upsertChats(...allChats))
+                                }
+                                
+                                if (allContacts.length) {
+                                    promises.push(storeImpl.upsertContacts(allContacts))
+                                }
+                                
+                                if (allMessages.length) {
+                                    // Group messages by chat for batch processing
+                                    const messagesByChat = new Map<string, proto.IWebMessageInfo[]>()
+                                    for (const msg of allMessages) {
+                                        const chatId = msg.key.remoteJid!
+                                        if (!messagesByChat.has(chatId)) {
+                                            messagesByChat.set(chatId, [])
+                                        }
+                                        messagesByChat.get(chatId)!.push(msg)
+                                    }
+                                    
+                                    // Process messages for each chat
+                                    for (const [chatId, messages] of messagesByChat) {
+                                        for (const msg of messages) {
+                                            promises.push(storeImpl.upsertMessage(chatId, msg, true))
+                                        }
+                                    }
+                                }
+                                
+                                await Promise.all(promises)
+                                log(`[${instanceId}] Successfully processed ${dataToProcess.length} accumulated history events`)
+                            } catch (error) {
+                                logError(`[${instanceId}] Error processing accumulated history:`, error)
                             }
-                            log(`[${instanceId}] Synced ${newMessages.length} messages from history`)
-                        }
-                        
-                        await Promise.all(promises)
-                        
-                        if (enableMetrics) updateEventMetrics('messaging-history.set', 'stored')
-                        if (hooks.afterStore) await hooks.afterStore('messaging-history.set', historyData)
+                        }, 500) // Wait 500ms for more events
                     } catch (error) {
                         logError('Failed to process messaging history:', error)
                         if (enableMetrics) updateEventMetrics('messaging-history.set', 'error')
@@ -5237,6 +5293,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             log(`[${instanceId}] Unbinding event listeners from current emitter`)
+            
+            // Clear history debounce timer if active
+            if (historyDebounceTimer) {
+                clearTimeout(historyDebounceTimer)
+                historyDebounceTimer = null
+                pendingHistoryData.length = 0 // Clear pending data
+                log(`[${instanceId}] Cleared pending history sync data`)
+            }
 
             // Remove all registered event listeners
             for (const [eventName, handler] of Object.entries(eventHandlers)) {
@@ -5344,24 +5408,99 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async clearAll(): Promise<void> {
-            const keys = binaryConversionCache.keys()
-            keys.forEach(key => {
-                if (key.startsWith(`msg_${instanceId}_`)) {
-                    binaryConversionCache.del(key)
-                }
-            })
+            // Check if clearAll is already in progress
+            if (clearAllInProgress) {
+                log(`[${instanceId}] clearAll already in progress, skipping duplicate call`)
+                return
+            }
             
-            // Note: Labels, label associations, and group metadata are excluded from clearAll()
-            // They should persist across history syncs to maintain data integrity
-            await Promise.all([
-                collections.chats.deleteMany({ instanceId }),
-                collections.contacts.deleteMany({ instanceId }),
-                collections.messages.deleteMany({ instanceId }),
-                collections.presences.deleteMany({ instanceId })
-                // Removed: collections.groupMetadata.deleteMany({ instanceId })
-                // Removed: collections.labels.deleteMany({ instanceId })
-                // Removed: collections.labelAssociations.deleteMany({ instanceId })
-            ])
+            // Check if store is closing
+            if (isClosing) {
+                log(`[${instanceId}] Store is closing, skipping clearAll`)
+                return
+            }
+            
+            clearAllInProgress = true
+            const startTime = Date.now()
+            
+            try {
+                log(`[CLEAR_ALL_START] Instance: ${instanceId}, Pending ops: ${pendingOperations.size}`)
+                
+                // Cancel any pending profile picture fetching
+                if (profilePictureFetchHandle) {
+                    clearImmediate(profilePictureFetchHandle)
+                    profilePictureFetchHandle = null
+                    log(`[${instanceId}] Cancelled profile picture background fetch`)
+                }
+                
+                // Wait for pending operations with timeout
+                if (pendingOperations.size > 0) {
+                    log(`[${instanceId}] Waiting for ${pendingOperations.size} pending operations...`)
+                    await Promise.race([
+                        Promise.all(Array.from(pendingOperations)),
+                        new Promise(resolve => setTimeout(resolve, config.clearAllTimeout || 10000))
+                    ])
+                    pendingOperations.clear()
+                }
+                
+                // Pause all queues if using Bull
+                if (bullInitialized) {
+                    log(`[${instanceId}] Pausing queues before clearAll...`)
+                    for (const [queueType, queue] of queues) {
+                        try {
+                            await queue.pause()
+                            // Drain any pending jobs
+                            await queue.drain()
+                            log(`[${instanceId}] Paused and drained queue: ${queueType}`)
+                        } catch (error) {
+                            logWarn(`[${instanceId}] Failed to pause queue ${queueType}:`, error)
+                        }
+                    }
+                }
+                
+                // Clear cache entries
+                const keys = binaryConversionCache.keys()
+                keys.forEach(key => {
+                    if (key.startsWith(`msg_${instanceId}_`)) {
+                        binaryConversionCache.del(key)
+                    }
+                })
+                
+                // Perform the actual deletion
+                log(`[${instanceId}] Deleting collections...`)
+                // Note: Labels, label associations, and group metadata are excluded from clearAll()
+                // They should persist across history syncs to maintain data integrity
+                await Promise.all([
+                    collections.chats.deleteMany({ instanceId }),
+                    collections.contacts.deleteMany({ instanceId }),
+                    collections.messages.deleteMany({ instanceId }),
+                    collections.presences.deleteMany({ instanceId })
+                    // Removed: collections.groupMetadata.deleteMany({ instanceId })
+                    // Removed: collections.labels.deleteMany({ instanceId })
+                    // Removed: collections.labelAssociations.deleteMany({ instanceId })
+                ])
+                
+                const duration = Date.now() - startTime
+                log(`[CLEAR_ALL_END] Instance: ${instanceId}, Duration: ${duration}ms`)
+                
+            } catch (error) {
+                logError(`[CLEAR_ALL_ERROR] Instance: ${instanceId}, Error:`, error)
+                throw error
+            } finally {
+                // Resume queues
+                if (bullInitialized) {
+                    for (const [queueType, queue] of queues) {
+                        try {
+                            await queue.resume()
+                            log(`[${instanceId}] Resumed queue: ${queueType}`)
+                        } catch (error) {
+                            logWarn(`[${instanceId}] Failed to resume queue ${queueType}:`, error)
+                        }
+                    }
+                }
+                
+                clearAllInProgress = false
+            }
         },
 
         getPerformanceStats() {

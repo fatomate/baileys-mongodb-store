@@ -386,6 +386,13 @@ export interface EnhancedMongoDBStoreConfig {
      * Set to true if you want to clear all existing data when receiving the latest history
      */
     clearAllOnHistorySync?: boolean
+    
+    /**
+     * Timeout for clearAll operation (in milliseconds)
+     * Default: 10000 (10 seconds)
+     * Maximum time to wait for pending operations before proceeding with clearAll
+     */
+    clearAllTimeout?: number
 }
 
 /**

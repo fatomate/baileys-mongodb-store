@@ -1,0 +1,430 @@
+Fetching account data from DB for instance_id: 67A565520694F
+Account data cached for 67A565520694F (token: 67A565520694F)
+Current version: 2.3000.1026474633
+Initializing MongoDB store for instance 67A565520694F
+permissions for module whatsapp_poll_template is defined for 67A565520694F (from cache)
+permissions for module whatsapp_live_chat is defined for 67A565520694F (from cache)
+Returning full permissions for 67A565520694F (from cache)
+User retention preference: 7 days for instance 67A565520694F
+Cached retention preference: 7 days for instance 67A565520694F
+Enabling poll template features for instance 67A565520694F
+Enabling live chat features for instance 67A565520694F
+Using shared connection for instance 67A565520694F
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection chats
+[LidHandler] All indexes created successfully
+[LID Handler] Initialized for instance 67A565520694F
+🚀 Initializing shared queue manager for instance 67A565520694F...
+✅ Registered all shared queue processors for instance 67A565520694F
+✅ Shared queue manager initialized successfully for instance 67A565520694F
+ℹ️ Index lastSeen_1 does not exist in collection wabot_lidMappings, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection contacts
+[LidHandler] All indexes created successfully
+Reconnected to MongoDB (shared) for instance 67A565520694F
+ℹ️ Index updatedAt_1 does not exist in collection wabot_groupMetadata, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labels, skipping drop
+ℹ️ Index updatedAt_1 does not exist in collection wabot_labelAssociations, skipping drop
+[TTL Monitor] Warning: TTL index missing for collection messages
+[TTL Monitor] Warning: TTL index missing for collection groupMetadata
+✅ Created index on collection wabot_labelAssociations
+✅ Created index on collection wabot_groupMetadata
+✅ Created index on collection wabot_labels
+[TTL Monitor] Warning: TTL index missing for collection state
+[TTL Monitor] Warning: TTL index missing for collection presences
+[TTL Monitor] Warning: TTL index missing for collection labels
+[TTL Monitor] Warning: TTL index missing for collection labelAssociations
+✅ Indexes created with custom TTL settings for instance 67A565520694F
+[TTL Monitor] Verifying TTL indexes...
+[TTL Monitor] All TTL indexes verified successfully
+Store created for 67A565520694F: Index TTL=30d, User retention=7d, Media=true
+✅ SharedQueueManager is active and handling queues
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+[67A565520694F] Socket reference updated in store
+[67A565520694F] Auto-rebinding to new socket's event emitter for safety
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+[67A565520694F] Re-initializing profile picture retrieval with new socket
+Store bound to socket events for instance 67A565520694F (initial binding)
+sessions[instance_id] could not be created for instance  67A565520694F
+new session created for instance id 67A565520694F
+Recreating socket for 67A565520694F (store persists)
+[67A565520694F] Socket reference updated in store
+[67A565520694F] Auto-rebinding to new socket's event emitter for safety
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+[67A565520694F] Re-initializing profile picture retrieval with new socket
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+Socket recreated and store rebound for 67A565520694F
+{"level":50,"time":"2025-08-29T04:04:11.009Z","pid":17511,"hostname":"wabotv3-sql","node":{"tag":"stream:error","attrs":{"code":"515"}},"msg":"stream errored out"}
+Socket disconnection for  67A565520694F  reason:  515
+Recreating socket for 67A565520694F (store persists)
+[67A565520694F] Socket reference updated in store
+[67A565520694F] Auto-rebinding to new socket's event emitter for safety
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+[67A565520694F] Re-initializing profile picture retrieval with new socket
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+Socket recreated and store rebound for 67A565520694F
+connection closed for instance 67A565520694F due to 515 , reconnecting true
+userAppVersion is app and appVersion is app
+userAppversion is the same as appVersion
+Reconnection process initiated for instance 67A565520694F
+2025-08-29T04:04:11.014Z - Attempting to reconnect for instance 67A565520694F
+2025-08-29T04:04:11.014Z - Deleted session for instance 67A565520694F
+2025-08-29T04:04:11.014Z - Waiting for 5 seconds before reconnecting
+{"level":50,"time":"2025-08-29T04:04:11.955Z","pid":17511,"hostname":"wabotv3-sql","node":{"tag":"stream:error","attrs":{},"content":[{"tag":"conflict","attrs":{"type":"replaced"}}]},"msg":"stream errored out"}
+{"level":50,"time":"2025-08-29T04:04:12.274Z","pid":17511,"hostname":"wabotv3-sql","node":{"tag":"stream:error","attrs":{},"content":[{"tag":"conflict","attrs":{"type":"replaced"}}]},"msg":"stream errored out"}
+2025-08-29T04:04:16.014Z - 5 seconds have passed, now creating new session
+Current version: 2.3000.1026474633
+MongoDB store already exists for instance 67A565520694F
+[67A565520694F] store.bind() already called, skipping duplicate binding
+[67A565520694F] Socket reference updated in store
+[67A565520694F] Auto-rebinding to new socket's event emitter for safety
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+[67A565520694F] Re-initializing profile picture retrieval with new socket
+Store bound to socket events for instance 67A565520694F (initial binding)
+sessions[instance_id] could not be created for instance  67A565520694F
+new session created for instance id 67A565520694F
+2025-08-29T04:04:16.267Z - New session was created for 67A565520694F
+Loading Chat [null%]
+Labels Edited: {
+  "id": "1",
+  "name": "Unread",
+  "color": 0,
+  "deleted": false
+} for instance id 67A565520694F
+Labels Edited: {
+  "id": "2",
+  "name": "Favourites",
+  "color": 0,
+  "deleted": false
+} for instance id 67A565520694F
+Labels Edited: {
+  "id": "3",
+  "name": "Groups",
+  "color": 0,
+  "deleted": false
+} for instance id 67A565520694F
+⏭️ [Protocol] Skipping protocol message of type 9 for instance 67A565520694F
+⏭️ [Protocol] Skipping protocol message of type 6 for instance 67A565520694F
+⏭️ [Protocol] Skipping protocol message of type 5 for instance 67A565520694F
+messages.upsert received for instance 67A565520694F : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "C97E783A077095C095FA925CDFBCB0CE",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440252,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC",
+          "initialSecurityNotificationSettingSync": {
+            "securityNotificationEnabled": false
+          }
+        }
+      }
+    },
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "01406BB00772EA0D19CC6AEF52C34A82",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440252,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "APP_STATE_SYNC_KEY_SHARE",
+          "appStateSyncKeyShare": {
+            "keys": [
+              {
+                "keyId": {
+                  "keyId": "AAAAAD99"
+                },
+                "keyData": {
+                  "keyData": "u57Zhh7ki/48NdpKvKbZog+cqaF/5r5FQdnu0UI6bCM=",
+                  "fingerprint": {
+                    "rawId": 2060979798,
+                    "currentIndex": 1,
+                    "deviceIndexes": [
+                      0,
+                      1
+                    ]
+                  },
+                  "timestamp": "1756440252306"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "4F27520631F517F058140A0E0F166E29",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440252,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "HISTORY_SYNC_NOTIFICATION",
+          "historySyncNotification": {
+            "fileSha256": "Dkz0UDP7mcehngS0gGsvG5+AMt/EXgSRgfazdoKo/ME=",
+            "fileLength": "10",
+            "mediaKey": "GW6DEgHJsZN8EqXRzRT1ivvh0PR7jbycOPs7JCvgnhU=",
+            "fileEncSha256": "NDwV0B+BqLBqVrKTzbkxyxog3g1nL1EeqGYIvEk9Dws=",
+            "directPath": "/v/t62.31111-24/540189139_694080250356259_6400039642065812039_n.enc?ccb=11-4&oh=01_Q5Aa2QETfGXh0HSdf0PUnHs0-45AUsVrZn47Z9HXSnS-kVlDtQ&oe=68D89F4A&_nc_sid=5e03e0",
+            "syncType": "INITIAL_STATUS_V3",
+            "encHandle": "AQIohbTp5AayNIdT7lMeHBIhPzn60sLN12SrNMpac79L4ym3sXU90HKTTOVYodRj77quaw4b9X3xOO8vabF-K4as3HDD2etxCDebTs_Vg4yMxPpasIoQghM3piuyBrt1YPM"
+          }
+        }
+      }
+    }
+  ],
+  "type": "append"
+}
+📝 [Contacts] Saving 4 contacts to database
+Skipping protocolMessage for instance 67A565520694F: 9
+Skipping protocolMessage for instance 67A565520694F: 6
+Skipping protocolMessage for instance 67A565520694F: 5
+Contacts upsert received for instance id 67A565520694F
+permissions for module whatsapp_crm is defined for 67A565520694F (from cache)
+CRM permission check for 67A565520694F is true
+directoryPath is sessions/67A565520694F
+Loading Chat [null%]
+directoryPath created
+filePath is sessions/67A565520694F/message-contact.json
+label list contact group created for instance id 67A565520694F
+label list contact group created for instance id 67A565520694F
+label list contact group created for instance id 67A565520694F
+Message contact appended successfully.
+file appended successfully
+Contact upsert saved to MongoDB: 60196953307 - Firdaus
+Contact upsert saved to MongoDB: 60196794989 - Fames Automate
+Contact upsert saved to MongoDB: 60196195886 - Wabot
+Contact upsert saved to MongoDB: 601157671940 - Wabot Backup
+Successfully processed 4 contacts for MongoDB
+✅ [Contacts] Saved 4 contacts to database
+📸 [Contacts] Starting profile picture fetch for 4 contacts
+⏭️ [Contacts] Skipping profile picture for 60196953307@s.whatsapp.net (recently updated)
+⏭️ [Contacts] Skipping profile picture for 60196794989@s.whatsapp.net (recently updated)
+⏭️ [Contacts] Skipping profile picture for 60196195886@s.whatsapp.net (recently updated)
+⏭️ [Contacts] Skipping profile picture for 601157671940@s.whatsapp.net (recently updated)
+✅ [Contacts] Profile picture fetch completed for 4 contacts
+connection opened for instance 67A565520694F
+user name is undefined, waiting for 3 seconds
+⏭️ [Protocol] Skipping protocol message of type 5 for instance 67A565520694F
+messages.upsert received for instance 67A565520694F : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "F3887A3E78BFDF3C795332B8403B38E4",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440252,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "HISTORY_SYNC_NOTIFICATION",
+          "historySyncNotification": {
+            "fileSha256": "UuBNARtSJWgt0vEILsdzq/4cOMFNnZAYcH6PGjNu4hc=",
+            "fileLength": "1315",
+            "mediaKey": "iRUHn4QyOHCfYF40VWKtwPzJsV0oi0j5ZhDgX6AkdpI=",
+            "fileEncSha256": "9lyD7LiT2ZBP82YZO1q+GKWEcMway5qzBmZ+frHN+HE=",
+            "directPath": "/v/t62.31111-24/540180301_1329141212147989_1508370527415271284_n.enc?ccb=11-4&oh=01_Q5Aa2QGmb5AyFtjmC2KRxfLkeX5nnuz5YB6GZyWbG_UX1ADxLA&oe=68D8926E&_nc_sid=5e03e0",
+            "syncType": "PUSH_NAME",
+            "chunkOrder": 1
+          }
+        }
+      }
+    }
+  ],
+  "type": "append"
+}
+[67A565520694F] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)
+Skipping protocolMessage for instance 67A565520694F: 5
+Messaging history received for instance id 67A565520694F
+permissions for module whatsapp_crm is defined for 67A565520694F (from cache)
+CRM permission check for 67A565520694F is true
+permission is true
+directoryPath is sessions/67A565520694F
+Loading Chat [null%]
+⏭️ [Protocol] Skipping protocol message of type 5 for instance 67A565520694F
+messages.upsert received for instance 67A565520694F : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "83C11315BD2FFAA20BC15E8B64EA4548",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440253,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "HISTORY_SYNC_NOTIFICATION",
+          "historySyncNotification": {
+            "fileSha256": "B9U2t55AEVXpJNywBRfxPQfJ41vyV0cxVvDZ2abFlKM=",
+            "fileLength": "22574",
+            "mediaKey": "cjJm+8aghKkj9JH99AygO7g2PojebaOOitLXh5vqpks=",
+            "fileEncSha256": "a86uA0bxLL4QO93ODcED0nKCwrSxiUcKoksu2DB7RHU=",
+            "directPath": "/v/t62.31111-24/540219939_1495395624963133_7321635915106332795_n.enc?ccb=11-4&oh=01_Q5Aa2QHS9iQiMYYnR431XDXsS6hnp4gNcAbu8dArP_0MjISODQ&oe=68D89E90&_nc_sid=5e03e0",
+            "syncType": "INITIAL_BOOTSTRAP",
+            "encHandle": "AQJxxyS1XeRguk-qhQtc3yYYmLpRVtWzoT_6Ybo8m9etPGjZ-6J32sO_nBBAaSI9mDvU95_d00OqjgFnEXRUJ_Xk4PvwBHi8OVHHX3gUj3jitKoqBwtHs5PkXPfZLgIm9NI"
+          }
+        }
+      }
+    }
+  ],
+  "type": "append"
+}
+directoryPath created
+filePath is sessions/67A565520694F/message-history.json
+Skipping protocolMessage for instance 67A565520694F: 5
+Loading Chat [null%]
+⏭️ [Protocol] Skipping protocol message of type 5 for instance 67A565520694F
+messages.upsert received for instance 67A565520694F : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "ABE9005220E38D523984A3E8498C6D51",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440253,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "HISTORY_SYNC_NOTIFICATION",
+          "historySyncNotification": {
+            "fileSha256": "bf/4BHtakNEs0yJdpsJa6++J9AVq/ilOzWSIPc3/wpQ=",
+            "fileLength": "532",
+            "mediaKey": "0Dgd1X7N6Vaqzn4ccjWeEipPAmAkvUXW/Xnb1OtxfF8=",
+            "fileEncSha256": "d7fZdxsMhZr19Ez8iFQR9cpEfEBz1fOPEvP/eP8GMg0=",
+            "directPath": "/v/t62.31111-24/535042977_2535926333453393_2214151273125508925_n.enc?ccb=11-4&oh=01_Q5Aa2QHU5ZxksRF0NFGbdWA7te5QUSNJ8u1eEMs8GsqV_c417g&oe=68D8AA08&_nc_sid=5e03e0",
+            "syncType": "NON_BLOCKING_DATA",
+            "encHandle": "AQLSzJvy-VB_sUNiEBIFdqJz67mxXfMhX4inQLZJ99lI3oIiOJVb6oz3G84Wi9Aal7IRma5AwPCW4RTZ73l-pyisxuvWFt6GNB96NM0-7F0oHY0q5LDzje8hNavyudRDvX0"
+          }
+        }
+      }
+    }
+  ],
+  "type": "append"
+}
+Message history appended successfully.
+file appended successfully
+Length of chatData is 0
+No individual chats found for instance id 67A565520694F
+No individual messages history found for instance id 67A565520694F
+Skipping protocolMessage for instance 67A565520694F: 5
+📝 [Contacts] Saving 35 contacts to database
+✅ [Contacts] Saved 35 contacts to database
+[67A565520694F] Synced 35 contacts from history
+📸 [Contacts] Starting profile picture fetch for 35 contacts
+📸 [Contacts] Fetching profile picture for 60196953307@s.whatsapp.net (no existing picture)
+✅ [Contacts] Updated profile picture for 60196953307@s.whatsapp.net
+📸 [Contacts] Fetching profile picture for 60176031924@s.whatsapp.net (no existing picture)
+✅ [Contacts] Updated profile picture for 60176031924@s.whatsapp.net
+📸 [Contacts] Fetching profile picture for 60163390817@s.whatsapp.net (no existing picture)
+Loading Chat [100%]
+Current version: 2.3000.1026474633
+MongoDB store already exists for instance 67A565520694F
+[67A565520694F] store.bind() already called, skipping duplicate binding
+[67A565520694F] Socket reference updated in store
+[67A565520694F] Auto-rebinding to new socket's event emitter for safety
+[67A565520694F] Unbinding event listeners from current emitter
+[67A565520694F] Removed listener for: connection.update
+[67A565520694F] Removed listener for: messages.upsert
+[67A565520694F] Successfully unbound all event listeners
+[67A565520694F] store.bind() called - setting up event listeners with selective storage
+[67A565520694F] Re-initializing profile picture retrieval with new socket
+Store bound to socket events for instance 67A565520694F (initial binding)
+messages.upsert received for instance 67A565520694F : {
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "601157671940@s.whatsapp.net",
+        "fromMe": true,
+        "id": "2F70D0A51978C90346C771A546B6332C",
+        "senderLid": "601157671940@s.whatsapp.net",
+        "senderPn": "601157671940@s.whatsapp.net"
+      },
+      "messageTimestamp": 1756440261,
+      "broadcast": false,
+      "status": 2,
+      "message": {
+        "protocolMessage": {
+          "type": "HISTORY_SYNC_NOTIFICATION",
+          "historySyncNotification": {
+            "fileSha256": "WtQlcDxoCdyixBNRNuHvpni93THJ/BFC+4fsqTzbVTk=",
+            "fileLength": "167682",
+            "mediaKey": "uyxOVwoLk8S9MOktqEDDnvUV2J8GbPTiCAH2yLDnCNM=",
+            "fileEncSha256": "0/mXMfhcHI/MgJkwleQP3f4bKQRr3g957fSKNcbJzZo=",
+            "directPath": "/v/t62.31111-24/539003534_1829365514632939_7180689073794079842_n.enc?ccb=11-4&oh=01_Q5Aa2QEgMRngGRVq6bCV-l7cnexnW-twYEKm2Sf-UX775XnOkg&oe=68D89897&_nc_sid=5e03e0",
+            "syncType": "RECENT",
+            "chunkOrder": 1,
+            "progress": 100,
+            "oldestMsgInChunkTimestampSec": "1749011028",
+            "encHandle": "AQIlyKpOyKddbh5ucmITsIoHY15Q6xmAZpwBIVfUyLfL57PXRTUP2xv1ZtiN2wwcSEUwpRs5zcGt86eL-6F0qg1pWjMa9No9zmHRLTvKQOKyl6zYMvDyySflzr3XYoibvc0"
+          }
+        }
+      }
+    }
+  ],
+  "type": "notify"
+}
+📝 [Contacts] Saving 58 contacts to database
+[LidHandler] Processing message 3EB017AF939935BF16CA2D: {"phoneNumber":"60196953307@s.whatsapp.net","debug":["Found phone in remoteJid: 60196953307@s.whatsapp.net"]}
+[LidHandler] No LID found in message, using original JID: 60196953307@s.whatsapp.net
+Skipping protocolMessage for instance 67A565520694F: 5
+Messaging history received for instance id 67A565520694F
+permissions for module whatsapp_crm is defined for 67A565520694F (from cache)
+CRM permission check for 67A565520694F is true
+permission is true
+directoryPath is sessions/67A565520694F
+Starting Wabot with appVersion: app on port: 9181
