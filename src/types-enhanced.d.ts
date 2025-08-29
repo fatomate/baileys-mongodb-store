@@ -393,6 +393,48 @@ export interface EnhancedMongoDBStoreConfig {
      * Maximum time to wait for pending operations before proceeding with clearAll
      */
     clearAllTimeout?: number
+    
+    /**
+     * Whether to debounce messaging-history.set events
+     * Default: true
+     * Helps prevent crashes from rapid successive events
+     */
+    debounceHistoryEvents?: boolean
+    
+    /**
+     * Delay in milliseconds for debouncing history events
+     * Default: 500
+     * Time to wait for additional events before processing
+     */
+    debounceDelay?: number
+    
+    /**
+     * Whether to wait for pending operations before clearAll
+     * Default: true
+     * Ensures all operations complete before clearing data
+     */
+    waitForPendingOps?: boolean
+    
+    /**
+     * Maximum time to wait for pending operations (in milliseconds)
+     * Default: 10000 (10 seconds)
+     * Timeout for waiting on pending operations
+     */
+    maxPendingOpsWait?: number
+    
+    /**
+     * Interval for cleaning up stale pending operations (in milliseconds)
+     * Default: 120000 (2 minutes)
+     * How often to check for and clean up stale operations
+     */
+    staleOperationCleanupInterval?: number
+    
+    /**
+     * Threshold for considering an operation stale (in milliseconds)
+     * Default: 300000 (5 minutes)
+     * Operations older than this are considered stale
+     */
+    staleOperationThreshold?: number
 }
 
 /**

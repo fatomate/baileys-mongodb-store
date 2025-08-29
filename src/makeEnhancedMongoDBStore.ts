@@ -934,8 +934,52 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Operation locking for clearAll to prevent race conditions
     let clearAllInProgress = false
     const pendingOperations = new Set<Promise<any>>()
+    const pendingOperationsMetadata = new Map<Promise<any>, { startTime: number, description?: string }>()
     let historyDebounceTimer: NodeJS.Timeout | null = null
     const pendingHistoryData: any[] = []
+    let staleOperationCleanupTimer: NodeJS.Timeout | null = null
+    
+    // Helper function to track operations with metadata
+    const trackOperation = (promise: Promise<any>, description?: string) => {
+        pendingOperations.add(promise)
+        pendingOperationsMetadata.set(promise, {
+            startTime: Date.now(),
+            description
+        })
+        
+        // Clean up when promise completes
+        promise.finally(() => {
+            pendingOperations.delete(promise)
+            pendingOperationsMetadata.delete(promise)
+        })
+        
+        return promise
+    }
+    
+    // Periodic cleanup of stale operations
+    const cleanupStaleOperations = () => {
+        const now = Date.now()
+        const staleThreshold = config.staleOperationThreshold || 5 * 60 * 1000 // Default 5 minutes
+        let cleaned = 0
+        
+        for (const [promise, metadata] of pendingOperationsMetadata.entries()) {
+            if (now - metadata.startTime > staleThreshold) {
+                pendingOperations.delete(promise)
+                pendingOperationsMetadata.delete(promise)
+                cleaned++
+                logWarn(`[${instanceId}] Cleaned stale operation: ${metadata.description || 'unknown'} (age: ${Math.round((now - metadata.startTime) / 1000)}s)`)
+            }
+        }
+        
+        if (cleaned > 0) {
+            log(`[${instanceId}] Cleaned ${cleaned} stale operations`)
+        }
+    }
+    
+    // Start periodic cleanup
+    staleOperationCleanupTimer = setInterval(() => {
+        cleanupStaleOperations()
+    }, config.staleOperationCleanupInterval || 2 * 60 * 1000) // Default 2 minutes
     
     // Default job options for automatic cleanup
     const defaultJobOptions = {
@@ -2830,7 +2874,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Track current event emitter and handlers for proper cleanup
     let currentEventEmitter: BaileysEventEmitter | null = null
-    let eventHandlers: { [eventName: string]: (...args: any[]) => Promise<void> } = {}
+    const eventHandlers = new Map<string, (...args: any[]) => Promise<void>>()
     
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
@@ -3249,11 +3293,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`✅ [Contacts] Profile picture fetch completed for ${contacts.length} contacts`)
                     })() // Close and execute the async function
                     
-                    // Add to pending operations for tracking
-                    pendingOperations.add(profileFetchPromise)
-                    profileFetchPromise.finally(() => {
-                        pendingOperations.delete(profileFetchPromise)
-                    })
+                    // Track this operation with metadata
+                    trackOperation(profileFetchPromise, `Profile picture fetch for ${contacts.length} contacts`)
                 })
             }
         },
@@ -4404,7 +4445,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (hooks.afterStore) await hooks.afterStore('connection.update', update)
                 }
             }
-            eventHandlers['connection.update'] = connectionUpdateHandler
+            eventHandlers.set('connection.update', connectionUpdateHandler)
             ev.on('connection.update', connectionUpdateHandler)
 
             // Messages upsert - CRITICAL for storing messages including polls
@@ -4678,7 +4719,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
             }
-            eventHandlers['messages.upsert'] = messagesUpsertHandler
+            eventHandlers.set('messages.upsert', messagesUpsertHandler)
             ev.on('messages.upsert', messagesUpsertHandler)
 
             // Messages update
@@ -5018,7 +5059,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             clearTimeout(historyDebounceTimer)
                         }
                         
-                        // Set new timer to process accumulated data
+                        // Set new timer to process accumulated data (respect config)
+                        const debounceDelay = config.debounceHistoryEvents === false ? 0 : (config.debounceDelay || 500)
                         historyDebounceTimer = setTimeout(async () => {
                             historyDebounceTimer = null
                             
@@ -5110,7 +5152,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             } catch (error) {
                                 logError(`[${instanceId}] Error processing accumulated history:`, error)
                             }
-                        }, 500) // Wait 500ms for more events
+                        }, debounceDelay)
                     } catch (error) {
                         logError('Failed to process messaging history:', error)
                         if (enableMetrics) updateEventMetrics('messaging-history.set', 'error')
@@ -5303,7 +5345,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             // Remove all registered event listeners
-            for (const [eventName, handler] of Object.entries(eventHandlers)) {
+            for (const [eventName, handler] of eventHandlers.entries()) {
                 try {
                     (currentEventEmitter as any).off(eventName, handler)
                     log(`[${instanceId}] Removed listener for: ${eventName}`)
@@ -5313,7 +5355,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             // Clear the handlers registry
-            eventHandlers = {}
+            eventHandlers.clear()
             
             // Reset state
             currentEventEmitter = null
@@ -5433,12 +5475,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`[${instanceId}] Cancelled profile picture background fetch`)
                 }
                 
-                // Wait for pending operations with timeout
-                if (pendingOperations.size > 0) {
+                // Wait for pending operations with timeout (if configured)
+                if (pendingOperations.size > 0 && config.waitForPendingOps !== false) {
                     log(`[${instanceId}] Waiting for ${pendingOperations.size} pending operations...`)
+                    const maxWait = config.maxPendingOpsWait || config.clearAllTimeout || 10000
                     await Promise.race([
                         Promise.all(Array.from(pendingOperations)),
-                        new Promise(resolve => setTimeout(resolve, config.clearAllTimeout || 10000))
+                        new Promise(resolve => setTimeout(resolve, maxWait))
                     ])
                     pendingOperations.clear()
                 }
@@ -5455,6 +5498,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         } catch (error) {
                             logWarn(`[${instanceId}] Failed to pause queue ${queueType}:`, error)
                         }
+                    }
+                }
+                
+                // Pause SharedQueueManager processing for this instance
+                if (sharedQueueManager && useSharedQueues) {
+                    log(`[${instanceId}] Pausing SharedQueueManager processing...`)
+                    try {
+                        // Temporarily unregister processors to stop processing
+                        sharedQueueManager.unregisterInstanceProcessors(validatedInstanceId)
+                        log(`[${instanceId}] SharedQueueManager processors paused`)
+                    } catch (error) {
+                        logWarn(`[${instanceId}] Failed to pause SharedQueueManager:`, error)
                     }
                 }
                 
@@ -5496,6 +5551,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         } catch (error) {
                             logWarn(`[${instanceId}] Failed to resume queue ${queueType}:`, error)
                         }
+                    }
+                }
+                
+                // Re-register SharedQueueManager processors
+                if (sharedQueueManager && useSharedQueues) {
+                    log(`[${instanceId}] Re-registering SharedQueueManager processors...`)
+                    try {
+                        await registerSharedQueueProcessors()
+                        log(`[${instanceId}] SharedQueueManager processors re-registered`)
+                    } catch (error) {
+                        logWarn(`[${instanceId}] Failed to re-register SharedQueueManager processors:`, error)
                     }
                 }
                 
@@ -5765,6 +5831,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (profilePictureFetchHandle) {
                 clearImmediate(profilePictureFetchHandle)
                 profilePictureFetchHandle = null
+            }
+            
+            // Clear stale operation cleanup timer
+            if (staleOperationCleanupTimer) {
+                clearInterval(staleOperationCleanupTimer)
+                staleOperationCleanupTimer = null
+                log(`[${instanceId}] Stopped stale operation cleanup timer`)
             }
             
             // Unregister instance processors from SharedQueueManager to prevent memory leaks
