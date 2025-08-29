@@ -450,6 +450,7 @@ export interface EnhancedMongoDBStore {
     upsertLabelAssociation(association: LabelAssociation): Promise<void>
     deleteLabelAssociation(association: LabelAssociation): Promise<void>
     bind(ev: BaileysEventEmitter): void
+    unbind(): void
     setSock(socket: any): void
     isHealthy(): Promise<boolean>
     rebind(ev: BaileysEventEmitter): void

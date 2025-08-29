@@ -365,7 +365,7 @@ export class SharedQueueManager extends EventEmitter {
      */
     unregisterInstanceProcessors(instanceId: string): void {
         let removedCount = 0
-        for (const [_jobType, processors] of this.instanceProcessors) {
+        for (const [, processors] of this.instanceProcessors) {
             if (processors.has(instanceId)) {
                 processors.delete(instanceId)
                 removedCount++

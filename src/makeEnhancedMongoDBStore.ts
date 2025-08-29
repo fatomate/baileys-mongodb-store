@@ -2801,6 +2801,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Track binding state to prevent duplicate bindings
     let isBound = false
     
+    // Track current event emitter and handlers for proper cleanup
+    let currentEventEmitter: BaileysEventEmitter | null = null
+    let eventHandlers: { [eventName: string]: (...args: any[]) => Promise<void> } = {}
+    
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
         instanceId,
@@ -4343,20 +4347,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 return
             }
             isBound = true
+            
+            // Store the event emitter reference for cleanup
+            currentEventEmitter = ev
+            
             log(`[${instanceId}] store.bind() called - setting up event listeners with selective storage`)
             
             // Connection update
-            ev.on('connection.update', async update => {
+            const connectionUpdateHandler = async (update: any) => {
                 if (enableMetrics) updateEventMetrics('connection.update', 'received')
                 if (await shouldStoreEvent('connection.update', update)) {
                     await storeImpl.updateState(update)
                     if (enableMetrics) updateEventMetrics('connection.update', 'stored')
                     if (hooks.afterStore) await hooks.afterStore('connection.update', update)
                 }
-            })
+            }
+            eventHandlers['connection.update'] = connectionUpdateHandler
+            ev.on('connection.update', connectionUpdateHandler)
 
             // Messages upsert - CRITICAL for storing messages including polls
-            ev.on('messages.upsert', async ({ messages }) => {
+            const messagesUpsertHandler = async ({ messages }: any) => {
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
                 
                 for (const msg of messages) {
@@ -4625,7 +4635,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
                 }
-            })
+            }
+            eventHandlers['messages.upsert'] = messagesUpsertHandler
+            ev.on('messages.upsert', messagesUpsertHandler)
 
             // Messages update
             ev.on('messages.update', async (updates) => {
@@ -5152,6 +5164,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             sock = socket
             log(`[${instanceId}] Socket reference updated in store`)
             
+            // SAFETY: Auto-rebind if we have an event emitter and were previously bound
+            if (socket?.ev && isBound) {
+                log(`[${instanceId}] Auto-rebinding to new socket's event emitter for safety`)
+                storeImpl.rebind(socket.ev)
+            }
+            
             // Re-initialize profile picture retrieval if enabled
             if (profilePictureConfig?.enabled && socket) {
                 log(`[${instanceId}] Re-initializing profile picture retrieval with new socket`)
@@ -5184,11 +5202,43 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         },
 
+        // Unbind method to properly remove all event listeners
+        unbind(): void {
+            if (!isBound || !currentEventEmitter) {
+                log(`[${instanceId}] unbind() called but not currently bound`)
+                return
+            }
+
+            log(`[${instanceId}] Unbinding event listeners from current emitter`)
+
+            // Remove all registered event listeners
+            for (const [eventName, handler] of Object.entries(eventHandlers)) {
+                try {
+                    (currentEventEmitter as any).off(eventName, handler)
+                    log(`[${instanceId}] Removed listener for: ${eventName}`)
+                } catch (error) {
+                    logWarn(`[${instanceId}] Failed to remove listener for ${eventName}:`, error)
+                }
+            }
+
+            // Clear the handlers registry
+            eventHandlers = {}
+            
+            // Reset state
+            currentEventEmitter = null
+            isBound = false
+
+            log(`[${instanceId}] Successfully unbound all event listeners`)
+        },
+
         // Safe rebind method - unbinds existing listeners before binding new ones
         rebind(ev: BaileysEventEmitter): void {
-            // Reset binding state to allow rebinding
-            isBound = false
-            // Now bind again
+            // First unbind from previous emitter if bound
+            if (isBound && currentEventEmitter) {
+                storeImpl.unbind()
+            }
+            
+            // Now bind to new emitter
             storeImpl.bind(ev)
         },
 
@@ -5538,6 +5588,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         async close(): Promise<void> {
             // Set closing flag to stop background operations
             isClosing = true
+            
+            // Unbind all event listeners to prevent memory leaks
+            if (isBound && currentEventEmitter) {
+                log(`[${instanceId}] Unbinding all event listeners during close`)
+                storeImpl.unbind()
+            }
             
             // Clear profile picture fetch handle if it exists
             if (profilePictureFetchHandle) {
