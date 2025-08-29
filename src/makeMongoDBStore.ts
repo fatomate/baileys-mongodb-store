@@ -2684,7 +2684,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 await store.updateState(update)
             })
 
-            ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages }) => {
+            ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
+                // Clear all data if isLatest is true and clearAllOnHistorySync is enabled
+                if (isLatest && config.clearAllOnHistorySync) {
+                    console.log(`[${instanceId}] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)`)
+                    await store.clearAll()
+                }
+                
                 // Process in parallel with proper queue management
                 const promises: Promise<void>[] = []
                 

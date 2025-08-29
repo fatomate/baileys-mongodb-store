@@ -2022,6 +2022,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
                         
                         for (const contact of contacts) {
+                            // Only fetch profile pictures for user JIDs (@s.whatsapp.net)
+                            // Skip groups (@g.us) and LIDs (@lid)
+                            if (!contact.id.endsWith('@s.whatsapp.net')) {
+                                log(`📸 [Contacts Queue] Skipping profile picture for ${contact.id} (not a user JID)`)
+                                continue
+                            }
+                            
                             try {
                                 // Check if we need to fetch/refresh the profile picture
                                 const existingContact = await withConnection(async () =>
@@ -2082,6 +2089,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Queue profile picture retrieval for single contact update if enabled
                     if (sock && profilePictureConfig?.enabled && queues.has(QueueType.PROFILE_PICTURES)) {
+                        // Only fetch profile pictures for user JIDs (@s.whatsapp.net)
+                        // Skip groups (@g.us) and LIDs (@lid)
+                        if (!contact.id.endsWith('@s.whatsapp.net')) {
+                            log(`📸 [Contacts Queue] Skipping profile picture for ${contact.id} (not a user JID)`)
+                            return { success: true }
+                        }
+                        
                         const profilePicQueue = queues.get(QueueType.PROFILE_PICTURES)!
                         const refreshIntervalDays = profilePictureConfig.refreshIntervalDays || 7
                         const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
@@ -2342,6 +2356,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const { contactId, retryCount = 0 } = job.data
                     const maxRetries = profilePictureConfig.retryAttempts || 3
                     const requestDelay = profilePictureConfig.requestDelay || 500
+                    
+                    // Only fetch profile pictures for user JIDs (@s.whatsapp.net)
+                    // Skip groups (@g.us) and LIDs (@lid)
+                    if (!contactId.endsWith('@s.whatsapp.net')) {
+                        log(`📸 [Profile Picture Queue] Skipping profile picture for ${contactId} (not a user JID)`)
+                        return { success: true }
+                    }
                     
                     // Add delay between requests to avoid rate limiting
                     if (requestDelay > 0) {
@@ -3123,6 +3144,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const refreshIntervalMs = refreshIntervalDays * 24 * 60 * 60 * 1000
                     
                     for (const contact of contacts) {
+                        // Only fetch profile pictures for user JIDs (@s.whatsapp.net)
+                        // Skip groups (@g.us) and LIDs (@lid)
+                        if (!contact.id.endsWith('@s.whatsapp.net')) {
+                            continue
+                        }
+                        
                         try {
                             // Check if we need to fetch profile picture for this contact
                             // Use the existingDataMap we already fetched to avoid redundant queries
@@ -4968,6 +4995,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
                 if (await shouldStoreEvent('messaging-history.set', historyData)) {
                     try {
+                        // Clear all data if isLatest is true and clearAllOnHistorySync is enabled
+                        if (isLatest && config.clearAllOnHistorySync) {
+                            log(`[${instanceId}] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)`)
+                            await storeImpl.clearAll()
+                        }
+                        
                         // Process in parallel
                         const promises: Promise<void>[] = []
                         

@@ -379,6 +379,13 @@ export interface EnhancedMongoDBStoreConfig {
      * Enables automatic download of contact profile pictures
      */
     profilePictureConfig?: ProfilePictureConfig
+    
+    /**
+     * Whether to clear all data when receiving isLatest=true in messaging-history.set
+     * Default: false (for backward compatibility)
+     * Set to true if you want to clear all existing data when receiving the latest history
+     */
+    clearAllOnHistorySync?: boolean
 }
 
 /**
