@@ -574,6 +574,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let isUsingSharedConnection = false
     let reconnectAttempts = 0
     
+    // Session management state
+    let currentSession: any = null
+    let sessionExpiry: number | null = null
+    
     // Connection state management
     enum MongoConnectionState {
         DISCONNECTED = 'disconnected',
@@ -600,6 +604,48 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         if (isUsingSharedConnection && connectionManager) {
             connectionManager.recordActivity(validatedInstanceId, responseTime)
         }
+    }
+    
+    // Session management functions (moved here to be available before use)
+    const refreshSession = async (): Promise<void> => {
+        // End existing session if it exists
+        if (currentSession) {
+            try {
+                await currentSession.endSession()
+            } catch (error) {
+                // Ignore errors when ending stale sessions
+                log(`[Session] Error ending stale session: ${error}`)
+            }
+        }
+        
+        // Create new session if client is connected
+        if (client) {
+            try {
+                // Check if client is connected by attempting to ping
+                await db.admin().ping()
+                currentSession = client.startSession()
+                sessionExpiry = Date.now() + (30 * 60 * 1000) // 30 minutes
+                log(`[${validatedInstanceId}] Created new MongoDB session`)
+            } catch (error) {
+                logWarn(`[${validatedInstanceId}] Failed to create session: ${error}`)
+                currentSession = null
+                sessionExpiry = null
+            }
+        } else {
+            currentSession = null
+            sessionExpiry = null
+        }
+    }
+    
+    const ensureValidSession = async (): Promise<any> => {
+        const now = Date.now()
+        
+        // Check if session is expired or doesn't exist
+        if (!currentSession || (sessionExpiry && now >= sessionExpiry)) {
+            await refreshSession()
+        }
+        
+        return currentSession
     }
     
     // Check if we should use shared connections
@@ -652,6 +698,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         // Start health monitoring
         healthMonitor.startMonitoring(db)
+        
+        // Proactively create session for dedicated connections
+        await refreshSession()
     }
     
     // Initialize TTL monitor after DB connection
@@ -714,6 +763,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             try {
                 // Quick ping to verify connection is alive
                 await db.admin().ping()
+                
+                // Additional session health check
+                if (currentSession) {
+                    try {
+                        // Test session validity with a lightweight operation
+                        await currentSession.withTransaction(async () => {
+                            // Empty transaction to test session
+                            return Promise.resolve()
+                        })
+                    } catch (sessionError: any) {
+                        if (sessionError.name === 'MongoExpiredSessionError' ||
+                            sessionError.message?.includes('session has ended') ||
+                            sessionError.message?.includes('Cannot use a session')) {
+                            logWarn(`[${validatedInstanceId}] Detected expired session during connection check`)
+                            await refreshSession()
+                        }
+                    }
+                }
+                
                 return
             } catch (error) {
                 log(`Connection check failed for instance ${validatedInstanceId}: ${error}`)
@@ -886,14 +954,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             factor: retryOptions?.factor ?? 2,
             jitter: retryOptions?.jitter ?? true,
             shouldRetry: (error: any) => {
-                // Use the default retry logic from connectionRetry
-                return isRetryableError(error)
+                // Enhanced error detection for session issues
+                const isSessionError = error.name === 'MongoExpiredSessionError' ||
+                                     error.message?.includes('session has ended') ||
+                                     error.message?.includes('Cannot use a session');
+                
+                if (isSessionError) {
+                    logWarn(`[${validatedInstanceId}] Session expired, will refresh on retry`)
+                    currentSession = null // Force session refresh on retry
+                    sessionExpiry = null
+                }
+                
+                // Use the default retry logic from connectionRetry (includes session errors)
+                return isRetryableError(error) || isSessionError
             }
         }
         
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
+                await ensureValidSession() // Ensure we have a valid session
                 return await operation()
             },
             options,
@@ -5311,8 +5391,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     return false
                 }
                 
-                // Ping the database to ensure it's responsive
-                await db.admin().ping()
+                // Use withConnection for proper session handling
+                await withConnection(async () => {
+                    // Ping the database to ensure it's responsive
+                    await db.admin().ping()
+                    return true
+                })
                 
                 // Check Redis connection if Bull is initialized
                 if (bullInitialized && redisConnection) {
@@ -5958,6 +6042,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (ttlMonitor) {
                 ttlMonitor.stopMonitoring()
                 ttlMonitor = null
+            }
+            
+            // Clean up MongoDB session
+            if (currentSession) {
+                try {
+                    await currentSession.endSession()
+                    log(`[${validatedInstanceId}] Ended MongoDB session on close`)
+                } catch (error) {
+                    logWarn(`[${validatedInstanceId}] Error ending session on close:`, error)
+                }
+                currentSession = null
+                sessionExpiry = null
             }
             
             // Handle connection cleanup based on connection type

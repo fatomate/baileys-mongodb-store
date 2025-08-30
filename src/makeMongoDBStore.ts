@@ -33,6 +33,7 @@ import { ConnectionManager, getConnectionManager } from './utils/connectionManag
 import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
 import { LidHandler } from './utils/lidHandler'
+import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
 
 const DEFAULT_TTL_DAYS = 30
 
@@ -1222,41 +1223,57 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         )
     }
     
-    // Wrapper for MongoDB operations with automatic reconnection
-    const withConnection = async <T>(operation: () => Promise<T>): Promise<T> => {
+    // Enhanced wrapper for MongoDB operations with retry logic
+    const withConnection = async <T>(
+        operation: () => Promise<T>,
+        retryOptions?: Partial<RetryOptions>
+    ): Promise<T> => {
         const startTime = Date.now()
-        try {
-            await ensureConnection()
-            // Refresh collections after reconnection
-            collections = getCollections()
-            
-            // Track activity for connection manager
-            if (isUsingSharedConnection && connectionManager) {
-                connectionManager.recordActivity(validatedInstanceId)
+        
+        // Define retry options with defaults
+        const options: RetryOptions = {
+            maxAttempts: retryOptions?.maxAttempts ?? 3,
+            initialDelay: retryOptions?.initialDelay ?? 100,
+            maxDelay: retryOptions?.maxDelay ?? 5000,
+            factor: retryOptions?.factor ?? 2,
+            jitter: retryOptions?.jitter ?? true,
+            shouldRetry: (error: any) => {
+                // Use the default retry logic from connectionRetry which includes session errors
+                return isRetryableError(error)
             }
-            
-            const result = await operation()
-            
-            // Record response time
-            if (isUsingSharedConnection && connectionManager) {
-                const responseTime = Date.now() - startTime
-                connectionManager.recordActivity(validatedInstanceId, responseTime)
-            }
-            
-            return result
-        } catch (error: any) {
-            // If it's a connection error, reset and try once more
-            if (error.message?.includes('Client must be connected') || 
-                error.message?.includes('Topology is closed') ||
-                error.code === 'ECONNREFUSED') {
-                log(`Connection error detected for instance ${instanceId}, attempting reconnection...`)
-                isConnected = false
-                await ensureConnection()
-                collections = getCollections()
-                return await operation()
-            }
-            throw error
         }
+        
+        const result = await retryWithBackoff(
+            async () => {
+                await ensureConnection()
+                // Refresh collections after reconnection
+                collections = getCollections()
+                
+                // Track activity for connection manager
+                if (isUsingSharedConnection && connectionManager) {
+                    connectionManager.recordActivity(validatedInstanceId)
+                }
+                
+                return await operation()
+            },
+            options,
+            (attempt, error, delay) => {
+                logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+            }
+        )
+        
+        if (!result.success) {
+            logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
+            throw result.error
+        }
+        
+        // Record response time for successful operations
+        if (isUsingSharedConnection && connectionManager) {
+            const responseTime = Date.now() - startTime
+            connectionManager.recordActivity(validatedInstanceId, responseTime)
+        }
+        
+        return result.result as T
     }
 
     // Batch processing functions

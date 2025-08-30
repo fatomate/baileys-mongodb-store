@@ -33,6 +33,9 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
             'ENETUNREACH',
             'MongoNetworkError',
             'MongoNotConnectedError',
+            'MongoExpiredSessionError',
+            'Cannot use a session that has ended',
+            'session has ended',
             'connection timed out',
             'socket hang up'
         ]
@@ -42,7 +45,8 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
                error.code === 'ETIMEDOUT' ||
                error.code === 'ENETUNREACH' ||
                error.name === 'MongoNetworkError' ||
-               error.name === 'MongoNotConnectedError'
+               error.name === 'MongoNotConnectedError' ||
+               error.name === 'MongoExpiredSessionError'
     }
 }
 
