@@ -1511,7 +1511,9 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         const optimizationIndexes = [
             // Performance optimization indexes - improve speed but not essential
             { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1 }, options: {}, name: 'label_assoc_chat' },
-            { collection: 'labelAssociations', spec: { instanceId: 1, messageId: 1 }, options: {}, name: 'label_assoc_message' }
+            { collection: 'labelAssociations', spec: { instanceId: 1, messageId: 1 }, options: {}, name: 'label_assoc_message' },
+            // Dedicated index for direct key.id lookups (prevents inefficient index selection)
+            { collection: 'messages', spec: { instanceId: 1, 'key.id': 1 }, options: {}, name: 'messages_keyid' }
         ]
         
         const ttlIndexes = [
@@ -1920,6 +1922,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
 
         async getMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | null> {
+            const startTime = Date.now()
             try {
                 // Normalize JID if it's a LID
                 let normalizedJid = jid
@@ -1933,7 +1936,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 // Check cache first
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
                 const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
-                if (cached) return cached
+                if (cached) {
+                    const elapsed = Date.now() - startTime
+                    if (elapsed > 10) {
+                        log(`getMessage cache hit in ${elapsed}ms`)
+                    }
+                    return cached
+                }
                 
                 // Primary query using jid
                 let message = await collections.messages.findOne({
@@ -1944,19 +1953,29 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 
                 // Fallback query using key.remoteJid (for poll messages and edge cases)
                 if (!message) {
-                    console.log(`[getMessage] Primary query failed for jid: ${validJid}, id: ${validId}. Trying fallback with key.remoteJid`)
+                    const fallbackStart = Date.now()
+                    log(`[getMessage] Primary query failed for jid: ${validJid}, id: ${validId}. Trying fallback with key.remoteJid`)
                     message = await collections.messages.findOne({
                         instanceId: validatedInstanceId,
                         'key.remoteJid': validJid,
                         'key.id': validId
                     })
                     
+                    const fallbackTime = Date.now() - fallbackStart
                     if (message) {
-                        console.log(`[getMessage] ✅ Found message using fallback query with key.remoteJid`)
+                        log(`[getMessage] ✅ Found message using fallback query with key.remoteJid in ${fallbackTime}ms`)
+                    } else if (fallbackTime > 100) {
+                        logWarn(`[getMessage] Slow fallback query: ${fallbackTime}ms`)
                     }
                 }
                 
-                if (!message) return null
+                if (!message) {
+                    const totalTime = Date.now() - startTime
+                    if (totalTime > 100) {
+                        logWarn(`[getMessage] Message not found after ${totalTime}ms - ID: ${validId}, JID: ${validJid}`)
+                    }
+                    return null
+                }
                 
                 // Check access permissions
                 accessContext.validateAccess(message.instanceId, 'read')

@@ -574,10 +574,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let isUsingSharedConnection = false
     let reconnectAttempts = 0
     
-    // Session management state
-    let currentSession: any = null
-    let sessionExpiry: number | null = null
-    
     // Connection state management
     enum MongoConnectionState {
         DISCONNECTED = 'disconnected',
@@ -604,48 +600,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         if (isUsingSharedConnection && connectionManager) {
             connectionManager.recordActivity(validatedInstanceId, responseTime)
         }
-    }
-    
-    // Session management functions (moved here to be available before use)
-    const refreshSession = async (): Promise<void> => {
-        // End existing session if it exists
-        if (currentSession) {
-            try {
-                await currentSession.endSession()
-            } catch (error) {
-                // Ignore errors when ending stale sessions
-                log(`[Session] Error ending stale session: ${error}`)
-            }
-        }
-        
-        // Create new session if client is connected
-        if (client) {
-            try {
-                // Check if client is connected by attempting to ping
-                await db.admin().ping()
-                currentSession = client.startSession()
-                sessionExpiry = Date.now() + (30 * 60 * 1000) // 30 minutes
-                log(`[${validatedInstanceId}] Created new MongoDB session`)
-            } catch (error) {
-                logWarn(`[${validatedInstanceId}] Failed to create session: ${error}`)
-                currentSession = null
-                sessionExpiry = null
-            }
-        } else {
-            currentSession = null
-            sessionExpiry = null
-        }
-    }
-    
-    const ensureValidSession = async (): Promise<any> => {
-        const now = Date.now()
-        
-        // Check if session is expired or doesn't exist
-        if (!currentSession || (sessionExpiry && now >= sessionExpiry)) {
-            await refreshSession()
-        }
-        
-        return currentSession
     }
     
     // Check if we should use shared connections
@@ -698,9 +652,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         // Start health monitoring
         healthMonitor.startMonitoring(db)
-        
-        // Proactively create session for dedicated connections
-        await refreshSession()
     }
     
     // Initialize TTL monitor after DB connection
@@ -763,25 +714,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             try {
                 // Quick ping to verify connection is alive
                 await db.admin().ping()
-                
-                // Additional session health check
-                if (currentSession) {
-                    try {
-                        // Test session validity with a lightweight operation
-                        await currentSession.withTransaction(async () => {
-                            // Empty transaction to test session
-                            return Promise.resolve()
-                        })
-                    } catch (sessionError: any) {
-                        if (sessionError.name === 'MongoExpiredSessionError' ||
-                            sessionError.message?.includes('session has ended') ||
-                            sessionError.message?.includes('Cannot use a session')) {
-                            logWarn(`[${validatedInstanceId}] Detected expired session during connection check`)
-                            await refreshSession()
-                        }
-                    }
-                }
-                
                 return
             } catch (error) {
                 log(`Connection check failed for instance ${validatedInstanceId}: ${error}`)
@@ -954,26 +886,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             factor: retryOptions?.factor ?? 2,
             jitter: retryOptions?.jitter ?? true,
             shouldRetry: (error: any) => {
-                // Enhanced error detection for session issues
-                const isSessionError = error.name === 'MongoExpiredSessionError' ||
-                                     error.message?.includes('session has ended') ||
-                                     error.message?.includes('Cannot use a session');
-                
-                if (isSessionError) {
-                    logWarn(`[${validatedInstanceId}] Session expired, will refresh on retry`)
-                    currentSession = null // Force session refresh on retry
-                    sessionExpiry = null
-                }
-                
-                // Use the default retry logic from connectionRetry (includes session errors)
-                return isRetryableError(error) || isSessionError
+                // Use the default retry logic from connectionRetry
+                return isRetryableError(error)
             }
         }
         
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
-                await ensureValidSession() // Ensure we have a valid session
                 return await operation()
             },
             options,
@@ -2870,7 +2790,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Index for media deduplication
             withConnection(async () => collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true })).then(() => {}),
             // Compound index for fallback queries using key.remoteJid (optimized for poll messages and edge cases)
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 })).then(() => {})
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 })).then(() => {}),
+            // Dedicated index for direct key.id lookups (prevents inefficient index selection)
+            withConnection(async () => collections.messages.createIndex({ instanceId: 1, 'key.id': 1 })).then(() => {})
         )
         
         // No TTL for groupMetadata - data persists indefinitely
@@ -3437,12 +3359,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // If still not found, try without the jid constraint at all (just instanceId and key.id)
                 // This handles edge cases like LID/phone number mismatches
                 if (!message) {
-                    message = await withConnection(async () =>
-                        collections.messages.findOne({
+                    const queryStart = Date.now()
+                    message = await withConnection(async () => {
+                        // Use the dedicated key.id index to avoid inefficient index selection
+                        // This prevents MongoDB from choosing the mediaHash index incorrectly
+                        const cursor = collections.messages.find({
                             instanceId: validatedInstanceId,
                             'key.id': validId
-                        })
-                    )
+                        }).limit(1)
+                        
+                        // Try to use hint if available (MongoDB 4.4+)
+                        try {
+                            cursor.hint({ instanceId: 1, 'key.id': 1 })
+                        } catch (e) {
+                            // Hint not supported, continue without it
+                        }
+                        
+                        const results = await cursor.toArray()
+                        return results[0] || null
+                    })
+                    const queryTime = Date.now() - queryStart
+                    if (queryTime > 100) {
+                        logWarn(`[getMessage] Slow query detected: ${queryTime}ms for key.id lookup (${validId})`)
+                    }
                     
                     // Check if the JID mismatch is acceptable
                     if (message && message.key?.remoteJid !== validJid) {
@@ -3504,31 +3443,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
 
-                    // After all attempts, if still not found, log debug and return null
+                    // After all attempts, if still not found, return null
                     if (!message) {
-                        // Log more details to help debug
-                        const count = await withConnection(async () =>
-                            collections.messages.countDocuments({
-                                instanceId: validatedInstanceId
-                            })
-                        )
-                        log(`Total messages for instance: ${count}`)
-                        
-                        // Try to find similar message IDs
-                        const similarMessages = await withConnection(async () =>
-                            collections.messages.find({
-                                instanceId: validatedInstanceId,
-                                'key.id': { $regex: validId.substring(0, 10) }
-                            }).limit(5).toArray()
-                        )
-                        
-                        if (similarMessages.length > 0) {
-                            log(`Found ${similarMessages.length} messages with similar IDs:`)
-                            similarMessages.forEach(msg => {
-                                log(`  - ID: ${msg.key?.id}, JID: ${msg.key?.remoteJid || msg.jid}`)
-                            })
-                        }
-                        
+                        // Only log basic info, avoid expensive debug queries
+                        log(`Message not found - ID: ${validId}, JID: ${validJid}`)
                         return null
                     }
                 
@@ -5391,12 +5309,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     return false
                 }
                 
-                // Use withConnection for proper session handling
-                await withConnection(async () => {
-                    // Ping the database to ensure it's responsive
-                    await db.admin().ping()
-                    return true
-                })
+                // Ping the database to ensure it's responsive
+                await db.admin().ping()
                 
                 // Check Redis connection if Bull is initialized
                 if (bullInitialized && redisConnection) {
@@ -6042,18 +5956,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (ttlMonitor) {
                 ttlMonitor.stopMonitoring()
                 ttlMonitor = null
-            }
-            
-            // Clean up MongoDB session
-            if (currentSession) {
-                try {
-                    await currentSession.endSession()
-                    log(`[${validatedInstanceId}] Ended MongoDB session on close`)
-                } catch (error) {
-                    logWarn(`[${validatedInstanceId}] Error ending session on close:`, error)
-                }
-                currentSession = null
-                sessionExpiry = null
             }
             
             // Handle connection cleanup based on connection type

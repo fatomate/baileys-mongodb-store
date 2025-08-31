@@ -509,21 +509,30 @@ export class LidHandler {
         
         try {
             // Look for messages where this LID appears with a phone number
+            // Add projection to only fetch needed fields for performance
             const message = await this.messagesCollection.findOne({
                 instanceId: this.instanceId,
                 $or: [
                     // Case 1: LID in senderLid with phone in senderPn
                     { 
                         'key.senderLid': normalizedLid,
-                        'key.senderPn': { $exists: true, $not: { $regex: '@lid$' } }
+                        'key.senderPn': { 
+                            $exists: true, 
+                            $nin: [null, '']
+                        }
                     },
                     // Case 2: LID in remoteJid with phone in senderPn (fromMe=false)
                     {
                         'key.remoteJid': normalizedLid,
                         'key.fromMe': false,
-                        'key.senderPn': { $exists: true, $not: { $regex: '@lid$' } }
+                        'key.senderPn': { 
+                            $exists: true,
+                            $nin: [null, '']
+                        }
                     }
                 ]
+            }, {
+                projection: { 'key.senderPn': 1 } // Only fetch the field we need
             })
             
             if (message?.key?.senderPn && !this.isLidFormat(message.key.senderPn)) {
