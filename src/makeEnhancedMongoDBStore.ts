@@ -580,13 +580,51 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         CONNECTING = 'connecting',
         CONNECTED = 'connected',
         RECONNECTING = 'reconnecting',
+        DISCONNECTING = 'disconnecting',
         FAILED = 'failed'
     }
     
     let mongoConnectionState = MongoConnectionState.DISCONNECTED
     const connectionStateEmitter = new EventEmitter()
     // Fix EventEmitter memory leak warning by setting reasonable limit
-    connectionStateEmitter.setMaxListeners(50)
+    connectionStateEmitter.setMaxListeners(100)
+    
+    // Track listeners for cleanup
+    const activeListeners = new Map<string, { event: string, handler: (...args: any[]) => void }>()
+    
+    // Enhanced listener management - commented out for future use when needed
+    // const addManagedListener = (event: string, handler: (...args: any[]) => void): string => {
+    //     const wrappedHandler = (...args: any[]) => {
+    //         try {
+    //             return handler(...args)
+    //         } catch (error) {
+    //             logError(`Error in event handler for ${event}:`, error)
+    //         }
+    //     }
+    //     
+    //     const listenerId = `${event}_${Date.now()}_${Math.random()}`
+    //     activeListeners.set(listenerId, { event, handler: wrappedHandler })
+    //     
+    //     connectionStateEmitter.on(event, wrappedHandler)
+    //     
+    //     return listenerId
+    // }
+    // 
+    // const removeManagedListener = (listenerId: string): void => {
+    //     const listener = activeListeners.get(listenerId)
+    //     if (listener) {
+    //         connectionStateEmitter.off(listener.event, listener.handler)
+    //         activeListeners.delete(listenerId)
+    //     }
+    // }
+    
+    const cleanupAllListeners = (): void => {
+        for (const [_listenerId, listener] of activeListeners) {
+            connectionStateEmitter.off(listener.event, listener.handler)
+        }
+        activeListeners.clear()
+        connectionStateEmitter.removeAllListeners()
+    }
     
     // Initialize health monitor
     const healthMonitor = new ConnectionHealthMonitor({
@@ -876,6 +914,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         operation: () => Promise<T>,
         retryOptions?: Partial<RetryOptions>
     ): Promise<T> => {
+        // Check if store is closing or closed
+        if (isClosing) {
+            throw new Error('Store is closing, operation cancelled')
+        }
+        
+        if (mongoConnectionState === MongoConnectionState.DISCONNECTING ||
+            mongoConnectionState === MongoConnectionState.DISCONNECTED) {
+            throw new Error('Store is disconnected, operation cancelled')
+        }
+        
         const startTime = Date.now()
         
         // Define retry options with defaults
@@ -886,34 +934,62 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             factor: retryOptions?.factor ?? 2,
             jitter: retryOptions?.jitter ?? true,
             shouldRetry: (error: any) => {
+                // Don't retry if store is closing
+                if (isClosing || mongoConnectionState === MongoConnectionState.DISCONNECTING) {
+                    return false
+                }
+                
+                // Don't retry certain errors during shutdown
+                if (error.message?.includes('Store is closing') ||
+                    error.message?.includes('Store is disconnected') ||
+                    error.name === 'MongoPoolClosedError' ||
+                    error.message?.includes('Cannot use a session that has ended')) {
+                    return false
+                }
+                
                 // Use the default retry logic from connectionRetry
                 return isRetryableError(error)
             }
         }
         
-        const result = await retryWithBackoff(
-            async () => {
-                await ensureConnection()
-                return await operation()
-            },
-            options,
-            (attempt, error, delay) => {
-                logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+        try {
+            const result = await retryWithBackoff(
+                async () => {
+                    // Check again before operation
+                    if (isClosing) {
+                        throw new Error('Store is closing, operation cancelled')
+                    }
+                    
+                    await ensureConnection()
+                    return await operation()
+                },
+                options,
+                (attempt, error, delay) => {
+                    if (!isClosing) {
+                        logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+                    }
+                }
+            )
+            
+            if (!result.success) {
+                logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
+                healthMonitor.recordFailure()
+                throw result.error
             }
-        )
-        
-        if (!result.success) {
-            logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
-            healthMonitor.recordFailure()
-            throw result.error
+            
+            // Track success metrics
+            const responseTime = Date.now() - startTime
+            trackActivity(responseTime)
+            healthMonitor.recordSuccess(responseTime)
+            
+            return result.result as T
+        } catch (error) {
+            // Don't log if we're closing
+            if (!isClosing) {
+                logError(`[withConnection] Operation failed:`, error)
+            }
+            throw error
         }
-        
-        // Track success metrics
-        const responseTime = Date.now() - startTime
-        trackActivity(responseTime)
-        healthMonitor.recordSuccess(responseTime)
-        
-        return result.result as T
     }
     
     // Queue configuration
@@ -5302,25 +5378,35 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         // Health check method for store and database connection
         async isHealthy(): Promise<boolean> {
+            // Check closing state first
+            if (isClosing || mongoConnectionState === MongoConnectionState.DISCONNECTING) {
+                return false // Not healthy if closing
+            }
+            
+            if (mongoConnectionState !== MongoConnectionState.CONNECTED) {
+                return false
+            }
+            
             try {
-                // Check MongoDB connection state
-                if (mongoConnectionState !== MongoConnectionState.CONNECTED) {
-                    log(`[${instanceId}] Health check failed: MongoDB not connected`)
-                    return false
-                }
+                // Perform actual health check with timeout
+                const healthCheckPromise = db.admin().ping()
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Health check timeout')), 5000)
+                )
                 
-                // Ping the database to ensure it's responsive
-                await db.admin().ping()
+                await Promise.race([healthCheckPromise, timeoutPromise])
                 
                 // Check Redis connection if Bull is initialized
                 if (bullInitialized && redisConnection) {
                     await redisConnection.ping()
                 }
                 
-                log(`[${instanceId}] Health check passed`)
                 return true
             } catch (error) {
-                logError(`[${instanceId}] Health check failed:`, error)
+                // Don't log if we're closing
+                if (!isClosing) {
+                    logError(`[${instanceId}] Health check failed:`, error)
+                }
                 return false
             }
         },
@@ -5873,8 +5959,44 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         
         async close(): Promise<void> {
+            // Check if already closing to prevent duplicate close calls
+            if (isClosing) {
+                log(`[${instanceId}] Already closing, skipping duplicate close call`)
+                return
+            }
+            
             // Set closing flag to stop background operations
             isClosing = true
+            mongoConnectionState = MongoConnectionState.DISCONNECTING
+            
+            // Emit closing event to stop all pending operations
+            connectionStateEmitter.emit('closing')
+            
+            // Stop all background tasks FIRST
+            const cleanupTasks: Promise<any>[] = []
+            
+            // Clear history debounce timer and pending data
+            if (historyDebounceTimer) {
+                clearTimeout(historyDebounceTimer)
+                historyDebounceTimer = null
+                pendingHistoryData.length = 0
+            }
+            
+            // Cancel all pending operations
+            if (pendingOperations && pendingOperations.size > 0) {
+                log(`[${instanceId}] Cancelling ${pendingOperations.size} pending operations`)
+                for (const operation of pendingOperations) {
+                    // Operations are Promises, we can't cancel them directly but we track them
+                    cleanupTasks.push(
+                        operation.catch(() => {
+                            // Ignore errors during shutdown
+                            return null
+                        })
+                    )
+                }
+                pendingOperations.clear()
+                pendingOperationsMetadata.clear()
+            }
             
             // Unbind all event listeners to prevent memory leaks
             if (isBound && currentEventEmitter) {
@@ -5958,25 +6080,43 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 ttlMonitor = null
             }
             
+            // Wait for all cleanup tasks to complete
+            await Promise.allSettled(cleanupTasks)
+            
             // Handle connection cleanup based on connection type
             if (isUsingSharedConnection && connectionManager) {
-                // Unregister from connection manager
-                await connectionManager.unregisterInstance(validatedInstanceId)
+                try {
+                    // Unregister from connection manager
+                    await connectionManager.unregisterInstance(validatedInstanceId)
+                    // Wait for connection pool to actually close
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                } catch (error) {
+                    logWarn(`Error unregistering from connection manager: ${(error as Error).message}`)
+                }
                 connectionManager = null
             } else if (client && !isUsingSharedConnection) {
-                // Close dedicated connection
-                await client.close()
+                try {
+                    // Close dedicated connection with force flag
+                    await client.close(true)
+                    // Wait for connection to fully close
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                } catch (error) {
+                    logWarn(`Error closing MongoDB client: ${(error as Error).message}`)
+                }
             }
             
             // Reset connection state
             mongoConnectionState = MongoConnectionState.DISCONNECTED
             reconnectAttempts = 0
             
-            // Clean up EventEmitter to prevent memory leaks
-            connectionStateEmitter.removeAllListeners()
+            // Clean up all managed listeners and EventEmitter to prevent memory leaks
+            cleanupAllListeners()
             
-            // Reset binding state
+            // Reset all flags
             isBound = false
+            isClosing = false
+            
+            log(`[${instanceId}] Store closed successfully`)
         }
     }
 
