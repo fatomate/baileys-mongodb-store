@@ -659,6 +659,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
+            mongoConnectionState = MongoConnectionState.CONNECTED
+            
+            // Start health monitoring for shared connection
+            healthMonitor.startMonitoring(db)
             
             log(`Using shared connection for instance ${instanceId}`)
         } catch (error) {
@@ -673,8 +677,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
             await client.connect()
             db = client.db(dbName)
+            mongoConnectionState = MongoConnectionState.CONNECTED
             isUsingSharedConnection = false
             connectionManager = null
+            
+            // Start health monitoring for fallback connection
+            healthMonitor.startMonitoring(db)
         }
     } else {
         // Use dedicated connection (original behavior)
