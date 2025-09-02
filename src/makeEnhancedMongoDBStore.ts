@@ -42,6 +42,7 @@ import { ConnectionManager, getConnectionManager } from './utils/connectionManag
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
 import { safeDropIndex, safeCreateIndex } from './utils/indexHelper'
+import { IndexLockManager } from './utils/indexLock'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
 import { EventEmitter } from 'events'
@@ -733,6 +734,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Don't throw - LID handler is optional
         }
     }
+    
+    // Initialize index lock manager for distributed index operations
+    const indexLockManager = new IndexLockManager(db, validatedInstanceId, collectionPrefix)
     
     // Get collections
     const getCollections = (): MongoCollections => {
@@ -2899,75 +2903,106 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Create indexes with custom TTL
     const createIndexes = async () => {
-        const indexPromises: Promise<void>[] = []
+        // Sequential execution to prevent race conditions
+        log(`🔧 Starting sequential index creation for instance ${instanceId}...`)
         
+        // Chats indexes with distributed lock
         const chatsTTL = getTTLForCollection('chats') * 24 * 60 * 60
-        indexPromises.push(
-            withConnection(async () => collections.chats.createIndex({ instanceId: 1, id: 1 }, { unique: true })).then(() => {}),
-            withConnection(async () => collections.chats.createIndex({ updatedAt: 1 }, { expireAfterSeconds: chatsTTL })).then(() => {})
+        await indexLockManager.withLock(
+            `${collectionPrefix}chats`,
+            async () => withConnection(async () => {
+                await safeCreateIndex(collections.chats, { instanceId: 1, id: 1 }, { unique: true })
+                await safeCreateIndex(collections.chats, { updatedAt: 1 }, { expireAfterSeconds: chatsTTL })
+            }),
+            15000 // 15 second timeout for lock acquisition
         )
         
+        // Contacts indexes with distributed lock
         const contactsTTL = getTTLForCollection('contacts') * 24 * 60 * 60
-        indexPromises.push(
-            withConnection(async () => collections.contacts.createIndex({ instanceId: 1, id: 1 }, { unique: true })).then(() => {}),
-            withConnection(async () => collections.contacts.createIndex({ updatedAt: 1 }, { expireAfterSeconds: contactsTTL })).then(() => {})
+        await indexLockManager.withLock(
+            `${collectionPrefix}contacts`,
+            async () => withConnection(async () => {
+                await safeCreateIndex(collections.contacts, { instanceId: 1, id: 1 }, { unique: true })
+                await safeCreateIndex(collections.contacts, { updatedAt: 1 }, { expireAfterSeconds: contactsTTL })
+            }),
+            15000
         )
         
+        // Messages indexes with distributed lock
         const messagesTTL = getTTLForCollection('messages') * 24 * 60 * 60
-        indexPromises.push(
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true })).then(() => {}),
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, jid: 1, messageTimestamp: -1 })).then(() => {}),
-            withConnection(async () => collections.messages.createIndex({ updatedAt: 1 }, { expireAfterSeconds: messagesTTL })).then(() => {}),
-            // Index for media deduplication
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, mediaHash: 1 }, { sparse: true })).then(() => {}),
-            // Compound index for fallback queries using key.remoteJid (optimized for poll messages and edge cases)
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 })).then(() => {}),
-            // Dedicated index for direct key.id lookups (prevents inefficient index selection)
-            withConnection(async () => collections.messages.createIndex({ instanceId: 1, 'key.id': 1 })).then(() => {})
+        await indexLockManager.withLock(
+            `${collectionPrefix}messages`,
+            async () => withConnection(async () => {
+                await safeCreateIndex(collections.messages, { instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true })
+                await safeCreateIndex(collections.messages, { instanceId: 1, jid: 1, messageTimestamp: -1 })
+                await safeCreateIndex(collections.messages, { updatedAt: 1 }, { expireAfterSeconds: messagesTTL })
+                // Index for media deduplication
+                await safeCreateIndex(collections.messages, { instanceId: 1, mediaHash: 1 }, { sparse: true })
+                // Compound index for fallback queries using key.remoteJid (optimized for poll messages and edge cases)
+                await safeCreateIndex(collections.messages, { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 })
+                // Dedicated index for direct key.id lookups (prevents inefficient index selection)
+                await safeCreateIndex(collections.messages, { instanceId: 1, 'key.id': 1 })
+            }),
+            15000
         )
         
         // No TTL for groupMetadata - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
-        indexPromises.push(
-            withConnection(async () => {
+        await indexLockManager.withLock(
+            `${collectionPrefix}groupMetadata`,
+            async () => withConnection(async () => {
                 // Execute all index operations sequentially within a single connection context
                 await safeDropIndex(collections.groupMetadata, 'updatedAt_1')
                 
                 // Create unique index without TTL
                 await safeCreateIndex(collections.groupMetadata, { instanceId: 1, id: 1 }, { unique: true })
-            })
-            // TTL index removed - groupMetadata will persist until explicitly deleted
+            }),
+            15000 // 15 second timeout for lock acquisition
         )
+        // TTL index removed - groupMetadata will persist until explicitly deleted
         
+        // State indexes
         const stateTTL = getTTLForCollection('state') * 24 * 60 * 60
-        indexPromises.push(
-            withConnection(async () => collections.state.createIndex({ instanceId: 1 }, { unique: true })).then(() => {}),
-            withConnection(async () => collections.state.createIndex({ updatedAt: 1 }, { expireAfterSeconds: stateTTL })).then(() => {})
+        await indexLockManager.withLock(
+            `${collectionPrefix}state`,
+            async () => withConnection(async () => {
+                await safeCreateIndex(collections.state, { instanceId: 1 }, { unique: true })
+                await safeCreateIndex(collections.state, { updatedAt: 1 }, { expireAfterSeconds: stateTTL })
+            }),
+            15000 // 15 second timeout for lock acquisition
         )
         
+        // Presences indexes
         const presencesTTL = getTTLForCollection('presences') * 24 * 60 * 60
-        indexPromises.push(
-            withConnection(async () => collections.presences.createIndex({ instanceId: 1, id: 1 }, { unique: true })).then(() => {}),
-            withConnection(async () => collections.presences.createIndex({ updatedAt: 1 }, { expireAfterSeconds: presencesTTL })).then(() => {})
+        await indexLockManager.withLock(
+            `${collectionPrefix}presences`,
+            async () => withConnection(async () => {
+                await safeCreateIndex(collections.presences, { instanceId: 1, id: 1 }, { unique: true })
+                await safeCreateIndex(collections.presences, { updatedAt: 1 }, { expireAfterSeconds: presencesTTL })
+            }),
+            15000 // 15 second timeout for lock acquisition
         )
         
         // No TTL for labels - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
-        indexPromises.push(
-            withConnection(async () => {
+        await indexLockManager.withLock(
+            `${collectionPrefix}labels`,
+            async () => withConnection(async () => {
                 // Execute all index operations sequentially within a single connection context
                 await safeDropIndex(collections.labels, 'updatedAt_1')
                 
                 // Create unique index without TTL
                 await safeCreateIndex(collections.labels, { instanceId: 1, id: 1 }, { unique: true })
-            })
-            // TTL index removed - labels will persist until explicitly deleted
+            }),
+            15000 // 15 second timeout for lock acquisition
         )
+        // TTL index removed - labels will persist until explicitly deleted
         
         // No TTL for labelAssociations - data persists indefinitely
         // Drop legacy indexes and create partial unique indexes for proper uniqueness semantics
-        indexPromises.push(
-            withConnection(async () => {
+        await indexLockManager.withLock(
+            `${collectionPrefix}labelAssociations`,
+            async () => withConnection(async () => {
                 // Execute all index operations sequentially within a single connection context
                 // Drop legacy indexes first
                 await safeDropIndex(collections.labelAssociations, 'updatedAt_1')
@@ -2982,21 +3017,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 await safeCreateIndex(
                     collections.labelAssociations,
                     { instanceId: 1, type: 1, chatId: 1, labelId: 1 },
-                    { unique: true, partialFilterExpression: { type: 'label_jid' } }
+                    { 
+                        unique: true, 
+                        name: 'label_jid_unique_partial',
+                        partialFilterExpression: { type: 'label_jid' } 
+                    }
                 )
                 
                 // Create partial unique index for message-level labels (label_message)
                 await safeCreateIndex(
                     collections.labelAssociations,
                     { instanceId: 1, type: 1, chatId: 1, labelId: 1, messageId: 1 },
-                    { unique: true, partialFilterExpression: { type: 'label_message' } }
+                    { 
+                        unique: true, 
+                        name: 'label_message_unique_partial',
+                        partialFilterExpression: { type: 'label_message' } 
+                    }
                 )
-            })
-            // Indexes updated - labelAssociations will persist until explicitly deleted
+            }),
+            15000 // 15 second timeout for lock acquisition
         )
+        // Indexes updated - labelAssociations will persist until explicitly deleted
         
-        await Promise.all(indexPromises)
-        log(`✅ Indexes created with custom TTL settings for instance ${instanceId}`)
+        log(`✅ All indexes created successfully with custom TTL settings for instance ${instanceId}`)
         
         // Verify TTL indexes if monitoring is enabled
         if (ttlMonitor) {
