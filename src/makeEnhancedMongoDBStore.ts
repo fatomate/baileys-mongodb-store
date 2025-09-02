@@ -3066,6 +3066,47 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize indexes
     await createIndexes()
     
+    // Verify critical indexes were created successfully
+    try {
+        const allIndexes = await withConnection(async () => {
+            const labelAssocIndexes = await collections.labelAssociations.listIndexes().toArray()
+            return labelAssocIndexes
+        })
+        
+        // Check for the critical partial unique indexes
+        const hasLabelJidIndex = allIndexes.some(idx => 
+            idx.name === 'label_jid_unique_partial'
+        )
+        const hasLabelMessageIndex = allIndexes.some(idx => 
+            idx.name === 'label_message_unique_partial'
+        )
+        
+        if (!hasLabelJidIndex || !hasLabelMessageIndex) {
+            const existingIndexNames = allIndexes.map(idx => idx.name).filter(name => name !== '_id_')
+            logWarn(`⚠️ Missing expected partial unique indexes on labelAssociations collection.`)
+            logWarn(`  Expected: label_jid_unique_partial, label_message_unique_partial`)
+            logWarn(`  Found: ${existingIndexNames.join(', ') || 'none'}`)
+            
+            // Log details of any indexes with similar key patterns
+            const similarIndexes = allIndexes.filter(idx => {
+                const keyStr = JSON.stringify(idx.key)
+                return keyStr.includes('instanceId') && keyStr.includes('type') && 
+                       keyStr.includes('chatId') && keyStr.includes('labelId')
+            })
+            
+            if (similarIndexes.length > 0) {
+                logWarn(`  Indexes with similar key patterns:`)
+                similarIndexes.forEach(idx => {
+                    logWarn(`    - ${idx.name}: ${JSON.stringify(idx.key)}`)
+                })
+            }
+        } else {
+            log(`✅ Verified labelAssociations partial unique indexes are present`)
+        }
+    } catch (verifyError) {
+        logWarn(`⚠️ Could not verify labelAssociations indexes:`, verifyError)
+    }
+    
     // Track binding state to prevent duplicate bindings
     let isBound = false
     
@@ -5887,6 +5928,73 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             return indexStatus
+        },
+
+        async verifyExpectedIndexes(): Promise<{
+            collection: string
+            missing: string[]
+            unexpected: string[]
+            correct: string[]
+        }[]> {
+            // Define expected indexes for each collection
+            const expectedIndexes: Record<string, string[]> = {
+                chats: ['instanceId_1_id_1'],
+                contacts: ['instanceId_1_id_1'],
+                messages: [
+                    'instanceId_1_jid_1_key.id_1',
+                    'instanceId_1_key.id_1',
+                    'instanceId_1_key.remoteJid_1_key.id_1',
+                    'instanceId_1_jid_1_key.fromMe_-1_key.id_-1',
+                    'instanceId_1_messageTimestamp_-1',
+                    'instanceId_1_mediaHash_1'
+                ],
+                groupMetadata: ['instanceId_1_id_1'],
+                state: ['instanceId_1_type_1_subtype_1', 'instanceId_1_type_1_subtype_1_id_1'],
+                presences: ['instanceId_1_id_1', 'instanceId_1_id_1_participant_1'],
+                labels: ['instanceId_1_id_1'],
+                labelAssociations: [
+                    'label_jid_unique_partial',
+                    'label_message_unique_partial'
+                ]
+            }
+            
+            const status = await this.getIndexStatus()
+            const results = []
+            
+            for (const collName of Object.keys(expectedIndexes)) {
+                const fullCollName = `${collectionPrefix}${collName}`
+                const collectionStatus = status.find(s => s.collection === fullCollName)
+                
+                if (!collectionStatus) {
+                    results.push({
+                        collection: fullCollName,
+                        missing: expectedIndexes[collName],
+                        unexpected: [],
+                        correct: []
+                    })
+                    continue
+                }
+                
+                const existingIndexNames = collectionStatus.indexes
+                    .map(idx => idx.name)
+                    .filter(name => name !== '_id_') // Exclude default _id index
+                
+                const expected = expectedIndexes[collName]
+                const missing = expected.filter(name => !existingIndexNames.includes(name))
+                const unexpected = existingIndexNames.filter(name => 
+                    !expected.includes(name) && !name.endsWith('_ttl') // TTL indexes are dynamic
+                )
+                const correct = expected.filter(name => existingIndexNames.includes(name))
+                
+                results.push({
+                    collection: fullCollName,
+                    missing,
+                    unexpected,
+                    correct
+                })
+            }
+            
+            return results
         },
 
         async getTTLStatus(): Promise<any> {

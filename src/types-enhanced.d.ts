@@ -534,6 +534,12 @@ export interface EnhancedMongoDBStore {
     resetPerformanceStats(): void
     recreateIndexes(): Promise<{ created: number; failed: number; details: string[] }>
     getIndexStatus(): Promise<{ collection: string; indexes: any[] }[]>
+    verifyExpectedIndexes(): Promise<{
+        collection: string
+        missing: string[]
+        unexpected: string[]
+        correct: string[]
+    }[]>
     getTTLStatus(): Promise<{
         enabled: boolean
         ttlDays?: number

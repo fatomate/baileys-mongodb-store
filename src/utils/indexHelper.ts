@@ -1,6 +1,30 @@
 import { Collection } from 'mongodb'
 
 /**
+ * Find an index by its key pattern
+ * @param collection The MongoDB collection
+ * @param keyPattern The key pattern to match
+ * @returns The name of the matching index, or null if not found
+ */
+async function findIndexByKeyPattern(collection: Collection<any>, keyPattern: any): Promise<string | null> {
+    try {
+        const indexes = await collection.indexes()
+        for (const idx of indexes) {
+            // Skip the default _id index
+            if (idx.name === '_id_') continue
+            
+            // Compare key patterns
+            if (JSON.stringify(idx.key) === JSON.stringify(keyPattern)) {
+                return idx.name || null
+            }
+        }
+    } catch (error) {
+        console.error(`❌ Failed to find index by key pattern on collection ${collection.collectionName}:`, error)
+    }
+    return null
+}
+
+/**
  * Safely drop an index if it exists
  * @param collection The MongoDB collection
  * @param indexName The name of the index to drop
@@ -124,26 +148,53 @@ export async function safeCreateIndex(
             
             // Handle index exists with different options
             if (error.code === 85 || error.codeName === 'IndexOptionsConflict') {
-                console.log(`⚠️ Index exists with different options on collection ${collection.collectionName}, dropping and recreating`)
-                
-                // Extract index name from error or generate from spec
-                const indexName = options?.name || Object.keys(spec).map(k => `${k}_${spec[k]}`).join('_')
+                console.log(`⚠️ Index exists with different options on collection ${collection.collectionName}, finding and recreating`)
                 
                 try {
-                    await collection.dropIndex(indexName)
+                    // First, try to find the actual conflicting index by key pattern
+                    const existingIndexName = await findIndexByKeyPattern(collection, spec)
+                    
+                    if (existingIndexName) {
+                        console.log(`📋 Found conflicting index: ${existingIndexName} on collection ${collection.collectionName}`)
+                        await safeDropIndex(collection, existingIndexName)
+                    } else {
+                        // Fallback: If we can't find by pattern, try the provided name
+                        // This handles cases where indexes might be in an inconsistent state
+                        const indexName = options?.name || Object.keys(spec).map(k => `${k}_${spec[k]}`).join('_')
+                        console.log(`⚠️ Could not find index by pattern, attempting to drop by name: ${indexName}`)
+                        
+                        // Use safeDropIndex which handles IndexNotFound gracefully
+                        await safeDropIndex(collection, indexName)
+                    }
+                    
+                    // Wait a bit for MongoDB to fully process the drop
+                    await new Promise(resolve => setTimeout(resolve, 500))
+                    
+                    // Now create the new index with the desired options
                     await collection.createIndex(spec, options)
-                    console.log(`✅ Recreated index on collection ${collection.collectionName}`)
+                    console.log(`✅ Successfully recreated index on collection ${collection.collectionName}`)
+                    return
                 } catch (recreateError: any) {
                     // If recreation fails due to IndexBuildAborted, retry
                     if (recreateError.code === 276 || recreateError.codeName === 'IndexBuildAborted') {
                         console.log(`⚠️ Index build aborted during recreation, will retry...`)
-                        // Continue to retry logic below
+                        // Continue to retry logic below to trigger retry
+                    } else if (recreateError.code === 27 || recreateError.codeName === 'IndexNotFound') {
+                        // If index not found during drop, that's fine - just create it
+                        console.log(`ℹ️ Index to drop not found, proceeding with creation on collection ${collection.collectionName}`)
+                        try {
+                            await collection.createIndex(spec, options)
+                            console.log(`✅ Created index on collection ${collection.collectionName}`)
+                            return
+                        } catch (createError: any) {
+                            console.error(`❌ Failed to create index after drop attempt on collection ${collection.collectionName}:`, createError)
+                            throw createError
+                        }
                     } else {
                         console.error(`❌ Failed to recreate index on collection ${collection.collectionName}:`, recreateError)
                         throw recreateError
                     }
                 }
-                return
             }
             
             // Handle IndexKeySpecsConflict - index with same name but different spec
