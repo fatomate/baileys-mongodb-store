@@ -7,57 +7,78 @@ import { Collection } from 'mongodb'
  * @returns Promise that resolves when the operation is complete
  */
 export async function safeDropIndex(collection: Collection<any>, indexName: string): Promise<void> {
-    try {
-        // First check if the index exists
-        const indexes = await collection.indexes()
-        const indexExists = indexes.some(idx => idx.name === indexName)
-        
-        if (indexExists) {
-            await collection.dropIndex(indexName)
-            console.log(`✅ Dropped index ${indexName} from collection ${collection.collectionName}`)
+    const maxRetries = 3
+    let retryCount = 0
+    
+    while (retryCount <= maxRetries) {
+        try {
+            // First check if the index exists
+            const indexes = await collection.indexes()
+            const indexExists = indexes.some(idx => idx.name === indexName)
             
-            // Verify the index is actually dropped with retry logic
-            let retries = 0
-            const maxRetries = 5
-            const retryDelay = 100 // ms
-            
-            while (retries < maxRetries) {
-                try {
-                    const currentIndexes = await collection.indexes()
-                    const stillExists = currentIndexes.some(idx => idx.name === indexName)
-                    
-                    if (!stillExists) {
-                        // Index successfully dropped
+            if (indexExists) {
+                await collection.dropIndex(indexName)
+                console.log(`✅ Dropped index ${indexName} from collection ${collection.collectionName}`)
+                
+                // Verify the index is actually dropped with retry logic
+                let verifyRetries = 0
+                const maxVerifyRetries = 5
+                const retryDelay = 100 // ms
+                
+                while (verifyRetries < maxVerifyRetries) {
+                    try {
+                        const currentIndexes = await collection.indexes()
+                        const stillExists = currentIndexes.some(idx => idx.name === indexName)
+                        
+                        if (!stillExists) {
+                            // Index successfully dropped
+                            break
+                        }
+                        
+                        // Index still exists, wait and retry
+                        await new Promise(resolve => setTimeout(resolve, retryDelay * (verifyRetries + 1)))
+                        verifyRetries++
+                    } catch (verifyError) {
+                        // If we can't verify, assume it's dropped
+                        console.log(`⚠️ Could not verify index drop for ${indexName}, proceeding`)
                         break
                     }
-                    
-                    // Index still exists, wait and retry
-                    await new Promise(resolve => setTimeout(resolve, retryDelay * (retries + 1)))
-                    retries++
-                } catch (verifyError) {
-                    // If we can't verify, assume it's dropped
-                    console.log(`⚠️ Could not verify index drop for ${indexName}, proceeding`)
-                    break
+                }
+                
+                // Add a small delay to ensure MongoDB has fully processed the drop
+                await new Promise(resolve => setTimeout(resolve, 100))
+            } else {
+                // Index doesn't exist, no need to drop
+                console.log(`ℹ️ Index ${indexName} does not exist in collection ${collection.collectionName}, skipping drop`)
+            }
+            return // Success
+        } catch (error: any) {
+            // Handle specific MongoDB error codes
+            if (error.code === 27 || error.codeName === 'IndexNotFound') {
+                // Index not found - this is fine, we wanted to drop it anyway
+                console.log(`ℹ️ Index ${indexName} not found in collection ${collection.collectionName}, already dropped`)
+                return
+            }
+            
+            // Handle IndexBuildAborted - concurrent operations conflict
+            if (error.code === 276 || error.codeName === 'IndexBuildAborted') {
+                retryCount++
+                if (retryCount <= maxRetries) {
+                    // Exponential backoff: 1s, 2s, 4s
+                    const backoffMs = Math.pow(2, retryCount - 1) * 1000
+                    console.log(`⚠️ Index operation aborted when dropping ${indexName} from collection ${collection.collectionName}, retrying in ${backoffMs}ms (attempt ${retryCount}/${maxRetries})`)
+                    await new Promise(resolve => setTimeout(resolve, backoffMs))
+                    continue // Retry the operation
+                } else {
+                    console.error(`❌ Failed to drop index ${indexName} after ${maxRetries} retries from collection ${collection.collectionName}:`, error)
+                    throw error
                 }
             }
             
-            // Add a small delay to ensure MongoDB has fully processed the drop
-            await new Promise(resolve => setTimeout(resolve, 100))
-        } else {
-            // Index doesn't exist, no need to drop
-            console.log(`ℹ️ Index ${indexName} does not exist in collection ${collection.collectionName}, skipping drop`)
+            // For any other error, throw it
+            console.error(`❌ Failed to drop index ${indexName} from collection ${collection.collectionName}:`, error)
+            throw error
         }
-    } catch (error: any) {
-        // Handle specific MongoDB error codes
-        if (error.code === 27 || error.codeName === 'IndexNotFound') {
-            // Index not found - this is fine, we wanted to drop it anyway
-            console.log(`ℹ️ Index ${indexName} not found in collection ${collection.collectionName}, already dropped`)
-            return
-        }
-        
-        // For any other error, throw it
-        console.error(`❌ Failed to drop index ${indexName} from collection ${collection.collectionName}:`, error)
-        throw error
     }
 }
 
@@ -73,37 +94,132 @@ export async function safeCreateIndex(
     spec: any,
     options?: any
 ): Promise<void> {
-    try {
-        await collection.createIndex(spec, options)
-        console.log(`✅ Created index on collection ${collection.collectionName}`)
-    } catch (error: any) {
-        // Handle duplicate index error
-        if (error.code === 11000 || error.codeName === 'DuplicateKey') {
-            console.log(`ℹ️ Index already exists on collection ${collection.collectionName}`)
+    const maxRetries = 3
+    let retryCount = 0
+    
+    while (retryCount <= maxRetries) {
+        try {
+            await collection.createIndex(spec, options)
+            console.log(`✅ Created index on collection ${collection.collectionName}`)
             return
-        }
-        
-        // Handle index exists with different options
-        if (error.code === 85 || error.codeName === 'IndexOptionsConflict') {
-            console.log(`⚠️ Index exists with different options on collection ${collection.collectionName}, dropping and recreating`)
-            
-            // Extract index name from error or generate from spec
-            const indexName = options?.name || Object.keys(spec).map(k => `${k}_${spec[k]}`).join('_')
-            
-            try {
-                await collection.dropIndex(indexName)
-                await collection.createIndex(spec, options)
-                console.log(`✅ Recreated index on collection ${collection.collectionName}`)
-            } catch (recreateError) {
-                console.error(`❌ Failed to recreate index on collection ${collection.collectionName}:`, recreateError)
-                throw recreateError
+        } catch (error: any) {
+            // Handle duplicate index error
+            if (error.code === 11000 || error.codeName === 'DuplicateKey') {
+                console.log(`ℹ️ Index already exists on collection ${collection.collectionName}`)
+                return
             }
-            return
+            
+            // Handle index already exists error
+            if (error.code === 68 || error.codeName === 'IndexAlreadyExists') {
+                console.log(`ℹ️ Index already exists on collection ${collection.collectionName}`)
+                return
+            }
+            
+            // Handle cannot create index error
+            if (error.code === 67 || error.codeName === 'CannotCreateIndex') {
+                console.log(`⚠️ Cannot create index on collection ${collection.collectionName}: ${error.message}`)
+                // This is usually a constraint violation - don't retry
+                throw error
+            }
+            
+            // Handle index exists with different options
+            if (error.code === 85 || error.codeName === 'IndexOptionsConflict') {
+                console.log(`⚠️ Index exists with different options on collection ${collection.collectionName}, dropping and recreating`)
+                
+                // Extract index name from error or generate from spec
+                const indexName = options?.name || Object.keys(spec).map(k => `${k}_${spec[k]}`).join('_')
+                
+                try {
+                    await collection.dropIndex(indexName)
+                    await collection.createIndex(spec, options)
+                    console.log(`✅ Recreated index on collection ${collection.collectionName}`)
+                } catch (recreateError: any) {
+                    // If recreation fails due to IndexBuildAborted, retry
+                    if (recreateError.code === 276 || recreateError.codeName === 'IndexBuildAborted') {
+                        console.log(`⚠️ Index build aborted during recreation, will retry...`)
+                        // Continue to retry logic below
+                    } else {
+                        console.error(`❌ Failed to recreate index on collection ${collection.collectionName}:`, recreateError)
+                        throw recreateError
+                    }
+                }
+                return
+            }
+            
+            // Handle IndexKeySpecsConflict - index with same name but different spec
+            if (error.code === 86 || error.codeName === 'IndexKeySpecsConflict') {
+                console.log(`⚠️ Index conflict detected on collection ${collection.collectionName}, attempting to resolve...`)
+                
+                // Extract index name from error or generate from spec
+                const indexName = options?.name || Object.keys(spec).map(k => `${k}_${spec[k]}`).join('_')
+                
+                try {
+                    // First try to drop the conflicting index
+                    await safeDropIndex(collection, indexName)
+                    
+                    // Wait a bit for MongoDB to process the drop
+                    await new Promise(resolve => setTimeout(resolve, 500))
+                    
+                    // Retry creating the index
+                    await collection.createIndex(spec, options)
+                    console.log(`✅ Resolved index conflict and created index on collection ${collection.collectionName}`)
+                    return
+                } catch (resolveError: any) {
+                    if (resolveError.code === 276 || resolveError.codeName === 'IndexBuildAborted') {
+                        console.log(`⚠️ Index build aborted during conflict resolution, will retry...`)
+                        // Continue to retry logic below
+                    } else {
+                        console.error(`❌ Failed to resolve index conflict on collection ${collection.collectionName}:`, resolveError)
+                        throw resolveError
+                    }
+                }
+            }
+            
+            // Handle write conflict error
+            if (error.code === 112 || error.codeName === 'WriteConflict') {
+                retryCount++
+                if (retryCount <= maxRetries) {
+                    // Short delay with jitter for write conflicts
+                    const jitter = Math.random() * 200 // 0-200ms jitter
+                    const backoffMs = 100 + jitter
+                    console.log(`⚠️ Write conflict on collection ${collection.collectionName}, retrying in ${Math.round(backoffMs)}ms (attempt ${retryCount}/${maxRetries})`)
+                    await new Promise(resolve => setTimeout(resolve, backoffMs))
+                    continue // Retry the operation
+                }
+            }
+            
+            // Handle not primary/master error
+            if (error.code === 13436 || error.codeName === 'NotMaster' || error.codeName === 'NotPrimaryOrSecondary') {
+                retryCount++
+                if (retryCount <= maxRetries) {
+                    // Longer delay for primary election
+                    const backoffMs = 1000 * retryCount
+                    console.log(`⚠️ Not primary error on collection ${collection.collectionName}, retrying in ${backoffMs}ms (attempt ${retryCount}/${maxRetries})`)
+                    await new Promise(resolve => setTimeout(resolve, backoffMs))
+                    continue // Retry the operation
+                }
+            }
+            
+            // Handle IndexBuildAborted - concurrent operations conflict
+            if (error.code === 276 || error.codeName === 'IndexBuildAborted') {
+                retryCount++
+                if (retryCount <= maxRetries) {
+                    // Exponential backoff with jitter: 1s, 2s, 4s + random jitter
+                    const jitter = Math.random() * 500 // 0-500ms jitter
+                    const backoffMs = Math.pow(2, retryCount - 1) * 1000 + jitter
+                    console.log(`⚠️ Index build aborted on collection ${collection.collectionName}, retrying in ${Math.round(backoffMs)}ms (attempt ${retryCount}/${maxRetries})`)
+                    await new Promise(resolve => setTimeout(resolve, backoffMs))
+                    continue // Retry the operation
+                } else {
+                    console.error(`❌ Failed to create index after ${maxRetries} retries on collection ${collection.collectionName}:`, error)
+                    throw error
+                }
+            }
+            
+            // For any other error, throw it
+            console.error(`❌ Failed to create index on collection ${collection.collectionName}:`, error)
+            throw error
         }
-        
-        // For any other error, throw it
-        console.error(`❌ Failed to create index on collection ${collection.collectionName}:`, error)
-        throw error
     }
 }
 
