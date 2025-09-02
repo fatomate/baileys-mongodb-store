@@ -15,6 +15,34 @@ export async function safeDropIndex(collection: Collection<any>, indexName: stri
         if (indexExists) {
             await collection.dropIndex(indexName)
             console.log(`✅ Dropped index ${indexName} from collection ${collection.collectionName}`)
+            
+            // Verify the index is actually dropped with retry logic
+            let retries = 0
+            const maxRetries = 5
+            const retryDelay = 100 // ms
+            
+            while (retries < maxRetries) {
+                try {
+                    const currentIndexes = await collection.indexes()
+                    const stillExists = currentIndexes.some(idx => idx.name === indexName)
+                    
+                    if (!stillExists) {
+                        // Index successfully dropped
+                        break
+                    }
+                    
+                    // Index still exists, wait and retry
+                    await new Promise(resolve => setTimeout(resolve, retryDelay * (retries + 1)))
+                    retries++
+                } catch (verifyError) {
+                    // If we can't verify, assume it's dropped
+                    console.log(`⚠️ Could not verify index drop for ${indexName}, proceeding`)
+                    break
+                }
+            }
+            
+            // Add a small delay to ensure MongoDB has fully processed the drop
+            await new Promise(resolve => setTimeout(resolve, 100))
         } else {
             // Index doesn't exist, no need to drop
             console.log(`ℹ️ Index ${indexName} does not exist in collection ${collection.collectionName}, skipping drop`)

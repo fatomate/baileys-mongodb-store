@@ -2929,12 +2929,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // No TTL for groupMetadata - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            withConnection(async () => safeDropIndex(collections.groupMetadata, 'updatedAt_1'))
-                .then(async () => {
-                    // Create unique index without TTL
-                    return withConnection(async () => safeCreateIndex(collections.groupMetadata, { instanceId: 1, id: 1 }, { unique: true }))
-                })
-                .then(() => {})
+            withConnection(async () => {
+                // Execute all index operations sequentially within a single connection context
+                await safeDropIndex(collections.groupMetadata, 'updatedAt_1')
+                
+                // Create unique index without TTL
+                await safeCreateIndex(collections.groupMetadata, { instanceId: 1, id: 1 }, { unique: true })
+            })
             // TTL index removed - groupMetadata will persist until explicitly deleted
         )
         
@@ -2953,44 +2954,44 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // No TTL for labels - data persists indefinitely
         // Drop existing TTL index if it exists (migration from older versions)
         indexPromises.push(
-            withConnection(async () => safeDropIndex(collections.labels, 'updatedAt_1'))
-                .then(async () => {
-                    // Create unique index without TTL
-                    return withConnection(async () => safeCreateIndex(collections.labels, { instanceId: 1, id: 1 }, { unique: true }))
-                })
-                .then(() => {})
+            withConnection(async () => {
+                // Execute all index operations sequentially within a single connection context
+                await safeDropIndex(collections.labels, 'updatedAt_1')
+                
+                // Create unique index without TTL
+                await safeCreateIndex(collections.labels, { instanceId: 1, id: 1 }, { unique: true })
+            })
             // TTL index removed - labels will persist until explicitly deleted
         )
         
         // No TTL for labelAssociations - data persists indefinitely
         // Drop legacy indexes and create partial unique indexes for proper uniqueness semantics
         indexPromises.push(
-            withConnection(async () => safeDropIndex(collections.labelAssociations, 'updatedAt_1'))
+            withConnection(async () => {
+                // Execute all index operations sequentially within a single connection context
+                // Drop legacy indexes first
+                await safeDropIndex(collections.labelAssociations, 'updatedAt_1')
+                
                 // Legacy unique index without type field (causes E11000 when mixing types)
-                .then(async () => withConnection(async () => safeDropIndex(collections.labelAssociations, 'instanceId_1_chatId_1_labelId_1')))
+                await safeDropIndex(collections.labelAssociations, 'instanceId_1_chatId_1_labelId_1')
+                
                 // Previous unique index without messageId (blocks multiple message labels per chat)
-                .then(async () => withConnection(async () => safeDropIndex(collections.labelAssociations, 'instanceId_1_type_1_chatId_1_labelId_1')))
-                .then(async () => {
-                    // Create partial unique index for chat-level labels (label_jid)
-                    return withConnection(async () =>
-                        safeCreateIndex(
-                            collections.labelAssociations,
-                            { instanceId: 1, type: 1, chatId: 1, labelId: 1 },
-                            { unique: true, partialFilterExpression: { type: 'label_jid' } }
-                        )
-                    )
-                })
-                .then(async () => {
-                    // Create partial unique index for message-level labels (label_message)
-                    return withConnection(async () =>
-                        safeCreateIndex(
-                            collections.labelAssociations,
-                            { instanceId: 1, type: 1, chatId: 1, labelId: 1, messageId: 1 },
-                            { unique: true, partialFilterExpression: { type: 'label_message' } }
-                        )
-                    )
-                })
-                .then(() => {})
+                await safeDropIndex(collections.labelAssociations, 'instanceId_1_type_1_chatId_1_labelId_1')
+                
+                // Create partial unique index for chat-level labels (label_jid)
+                await safeCreateIndex(
+                    collections.labelAssociations,
+                    { instanceId: 1, type: 1, chatId: 1, labelId: 1 },
+                    { unique: true, partialFilterExpression: { type: 'label_jid' } }
+                )
+                
+                // Create partial unique index for message-level labels (label_message)
+                await safeCreateIndex(
+                    collections.labelAssociations,
+                    { instanceId: 1, type: 1, chatId: 1, labelId: 1, messageId: 1 },
+                    { unique: true, partialFilterExpression: { type: 'label_message' } }
+                )
+            })
             // Indexes updated - labelAssociations will persist until explicitly deleted
         )
         
