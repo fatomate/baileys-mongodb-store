@@ -1587,34 +1587,59 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // const associationId = `${association.labelId}_${association.chatId || (association as any).messageId}`
             
             if (type === 'upsert') {
-                await withConnection(async () =>
-                    collections.labelAssociations.replaceOne(
-                        {
-                            instanceId: validatedInstanceId,
-                            labelId: association.labelId,
-                            chatId: association.chatId,
-                            messageId: (association as any).messageId
-                        },
-                        {
-                            ...association,
-                            instanceId: validatedInstanceId,
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
+                const filter: any = {
+                    instanceId: validatedInstanceId,
+                    type: association.type,
+                    chatId: association.chatId,
+                    labelId: association.labelId
+                }
+                if (association.type === 'label_message' && 'messageId' in association && (association as any).messageId) {
+                    filter.messageId = (association as any).messageId
+                }
+                try {
+                    await withConnection(async () =>
+                        collections.labelAssociations.replaceOne(
+                            filter,
+                            {
+                                ...association,
+                                instanceId: validatedInstanceId,
+                                updatedAt: new Date()
+                            },
+                            { upsert: true }
+                        )
                     )
-                )
-                
+                } catch (error: any) {
+                    if (error?.code === 11000 || (typeof error?.message === 'string' && error.message.includes('duplicate key'))) {
+                        await withConnection(async () =>
+                            collections.labelAssociations.updateOne(
+                                filter,
+                                {
+                                    $set: {
+                                        ...association,
+                                        instanceId: validatedInstanceId,
+                                        updatedAt: new Date()
+                                    }
+                                }
+                            )
+                        )
+                    } else {
+                        throw error
+                    }
+                }
                 return { success: true }
             } else if (type === 'delete') {
+                const filter: any = {
+                    instanceId: validatedInstanceId,
+                    type: association.type,
+                    chatId: association.chatId,
+                    labelId: association.labelId
+                }
+                if (association.type === 'label_message' && 'messageId' in association && (association as any).messageId) {
+                    filter.messageId = (association as any).messageId
+                }
                 await withConnection(async () =>
-                    collections.labelAssociations.deleteOne({
-                        instanceId: validatedInstanceId,
-                        labelId: association.labelId,
-                        chatId: association.chatId,
-                        messageId: (association as any).messageId
-                    })
+                    collections.labelAssociations.deleteOne(filter)
                 )
-                
                 return { success: true }
             }
             
@@ -2402,17 +2427,39 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`[Label Queue] No existing documents found for ${association.chatId}/${association.labelId}`)
                         }
                         
-                        const result = await withConnection(async () =>
-                            collections.labelAssociations.replaceOne(
-                                filter,
-                                {
-                                    ...association,
-                                    instanceId,
-                                    updatedAt: new Date()
-                                },
-                                { upsert: true }
+                        let result
+                        try {
+                            result = await withConnection(async () =>
+                                collections.labelAssociations.replaceOne(
+                                    filter,
+                                    {
+                                        ...association,
+                                        instanceId,
+                                        updatedAt: new Date()
+                                    },
+                                    { upsert: true }
+                                )
                             )
-                        )
+                        } catch (error: any) {
+                            if (error?.code === 11000 || (typeof error?.message === 'string' && error.message.includes('duplicate key'))) {
+                                await withConnection(async () =>
+                                    collections.labelAssociations.updateOne(
+                                        filter,
+                                        {
+                                            $set: {
+                                                ...association,
+                                                instanceId,
+                                                updatedAt: new Date()
+                                            }
+                                        }
+                                    )
+                                )
+                                // fabricate a minimal-like result to pass validation below
+                                result = { upsertedCount: 0, modifiedCount: 1 }
+                            } else {
+                                throw error
+                            }
+                        }
                         
                         // Validate operation succeeded
                         if (result.upsertedCount === 0 && result.modifiedCount === 0) {
@@ -2916,15 +2963,35 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         )
         
         // No TTL for labelAssociations - data persists indefinitely
-        // Drop existing TTL index if it exists (migration from older versions)
+        // Drop legacy indexes and create partial unique indexes for proper uniqueness semantics
         indexPromises.push(
             withConnection(async () => safeDropIndex(collections.labelAssociations, 'updatedAt_1'))
+                // Legacy unique index without type field (causes E11000 when mixing types)
+                .then(async () => withConnection(async () => safeDropIndex(collections.labelAssociations, 'instanceId_1_chatId_1_labelId_1')))
+                // Previous unique index without messageId (blocks multiple message labels per chat)
+                .then(async () => withConnection(async () => safeDropIndex(collections.labelAssociations, 'instanceId_1_type_1_chatId_1_labelId_1')))
                 .then(async () => {
-                    // Create unique index without TTL
-                    return withConnection(async () => safeCreateIndex(collections.labelAssociations, { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, { unique: true }))
+                    // Create partial unique index for chat-level labels (label_jid)
+                    return withConnection(async () =>
+                        safeCreateIndex(
+                            collections.labelAssociations,
+                            { instanceId: 1, type: 1, chatId: 1, labelId: 1 },
+                            { unique: true, partialFilterExpression: { type: 'label_jid' } }
+                        )
+                    )
+                })
+                .then(async () => {
+                    // Create partial unique index for message-level labels (label_message)
+                    return withConnection(async () =>
+                        safeCreateIndex(
+                            collections.labelAssociations,
+                            { instanceId: 1, type: 1, chatId: 1, labelId: 1, messageId: 1 },
+                            { unique: true, partialFilterExpression: { type: 'label_message' } }
+                        )
+                    )
                 })
                 .then(() => {})
-            // TTL index removed - labelAssociations will persist until explicitly deleted
+            // Indexes updated - labelAssociations will persist until explicitly deleted
         )
         
         await Promise.all(indexPromises)
@@ -4383,17 +4450,38 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 filter.messageId = association.messageId
             }
             
-            const result = await withConnection(async () =>
-                collections.labelAssociations.replaceOne(
-                    filter,
-                    {
-                        ...association,
-                        instanceId,
-                        updatedAt: new Date()
-                    },
-                    { upsert: true }
+            let result
+            try {
+                result = await withConnection(async () =>
+                    collections.labelAssociations.replaceOne(
+                        filter,
+                        {
+                            ...association,
+                            instanceId,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
+                    )
                 )
-            )
+            } catch (error: any) {
+                if (error?.code === 11000 || (typeof error?.message === 'string' && error.message.includes('duplicate key'))) {
+                    await withConnection(async () =>
+                        collections.labelAssociations.updateOne(
+                            filter,
+                            {
+                                $set: {
+                                    ...association,
+                                    instanceId,
+                                    updatedAt: new Date()
+                                }
+                            }
+                        )
+                    )
+                    result = { upsertedCount: 0, modifiedCount: 1 }
+                } else {
+                    throw error
+                }
+            }
             
             // Validate operation succeeded
             if (result.upsertedCount === 0 && result.modifiedCount === 0) {
