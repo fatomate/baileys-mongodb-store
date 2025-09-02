@@ -820,15 +820,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Re-initialize LID handler if needed with retry
                     if (lidHandler) {
-                        const reinitResult = await retryWithBackoff(
-                            () => lidHandler!.initialize(db, collectionPrefix),
-                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
-                            (attempt, error, delay) => {
-                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+                        try {
+                            const reinitResult = await retryWithBackoff(
+                                () => lidHandler!.initialize(db, collectionPrefix),
+                                { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+                                (attempt, error, delay) => {
+                                    log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+                                }
+                            )
+                            if (!reinitResult.success) {
+                                logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+                            } else {
+                                log('[LID Handler] Successfully re-initialized after reconnection')
                             }
-                        )
-                        if (!reinitResult.success) {
-                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+                        } catch (error) {
+                            logWarn('[LID Handler] Error during re-initialization:', error)
                         }
                     }
                     
@@ -857,15 +863,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Re-initialize LID handler if needed with retry
                     if (lidHandler) {
-                        const reinitResult = await retryWithBackoff(
-                            () => lidHandler!.initialize(db, collectionPrefix),
-                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
-                            (attempt, error, delay) => {
-                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+                        try {
+                            const reinitResult = await retryWithBackoff(
+                                () => lidHandler!.initialize(db, collectionPrefix),
+                                { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+                                (attempt, error, delay) => {
+                                    log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+                                }
+                            )
+                            if (!reinitResult.success) {
+                                logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+                            } else {
+                                log('[LID Handler] Successfully re-initialized after reconnection')
                             }
-                        )
-                        if (!reinitResult.success) {
-                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+                        } catch (error) {
+                            logWarn('[LID Handler] Error during re-initialization:', error)
                         }
                     }
                     
@@ -899,7 +911,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Re-initialize LID handler if needed
                 if (lidHandler) {
-                    await lidHandler.initialize(db, collectionPrefix)
+                    try {
+                        await lidHandler.initialize(db, collectionPrefix)
+                        log('[LID Handler] Successfully re-initialized after reconnection')
+                    } catch (error) {
+                        logWarn('[LID Handler] Error during re-initialization:', error)
+                    }
                 }
                 
                 reconnectAttempts = 0
