@@ -20,7 +20,7 @@ import type {
     CollectionTTLConfig
 } from './types-enhanced'
 import NodeCache from 'node-cache'
-import * as BullMQ from 'bullmq'
+import { Queue, Worker, Job } from 'bullmq'
 import Redis from 'ioredis'
 import { 
     validateJID,
@@ -2029,7 +2029,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const { type, chats, chatId, update, deleteIds } = job.data
                 
                 if (type === 'upsert' && chats) {
-                    const bulkOps = chats.map(chat => ({
+                    const bulkOps = chats.map((chat: Chat) => ({
                         replaceOne: {
                             filter: { instanceId, id: chat.id },
                             replacement: { ...chat, instanceId, updatedAt: new Date() },
@@ -2065,7 +2065,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 trackActivity() // Track request
                 
                 if (type === 'upsert' && contacts) {
-                    const bulkOps = contacts.map(contact => ({
+                    const bulkOps = contacts.map((contact: Contact) => ({
                         replaceOne: {
                             filter: { instanceId, id: contact.id },
                             replacement: { ...contact, instanceId, updatedAt: new Date() },
@@ -4364,7 +4364,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Check for existing conflicting jobs and remove only truly conflicting ones
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
-                    const conflictingJobs = existingJobs.filter(job => {
+                    const conflictingJobs = existingJobs.filter((job: Job<LabelAssociationJob>) => {
                         const jobData = job.data as LabelAssociationJob
                         // Skip jobs without association data (like cleanup jobs)
                         if (!jobData || !jobData.association) return false
@@ -4383,7 +4383,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Remove truly conflicting jobs (only recent duplicates)
                     let removedCount = 0
-                    for (const conflictingJob of conflictingJobs) {
+                    for (const conflictingJob of conflictingJobs as Job<LabelAssociationJob>[]) {
                         // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
                         // Fix: Get timestamp from job.data.timestamp, not job.opts.timestamp
                         const jobTimestamp = (conflictingJob.data as LabelAssociationJob)?.timestamp || 
@@ -4474,7 +4474,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Check for existing conflicting jobs and remove only truly conflicting ones
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
-                    const conflictingJobs = existingJobs.filter(job => {
+                    const conflictingJobs = existingJobs.filter((job: Job<LabelAssociationJob>) => {
                         const jobData = job.data as LabelAssociationJob
                         // Skip jobs without association data (like cleanup jobs)
                         if (!jobData || !jobData.association) return false
@@ -4493,7 +4493,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Remove truly conflicting jobs (only recent duplicates)
                     let removedCount = 0
-                    for (const conflictingJob of conflictingJobs) {
+                    for (const conflictingJob of conflictingJobs as Job<LabelAssociationJob>[]) {
                         // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
                         // Fix: Get timestamp from job.data.timestamp, not job.opts.timestamp
                         const jobTimestamp = (conflictingJob.data as LabelAssociationJob)?.timestamp || 

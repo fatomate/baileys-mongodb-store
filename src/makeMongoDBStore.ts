@@ -15,7 +15,7 @@ import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 import type { MongoDBStoreConfig, MongoDBStore } from './types'
 import NodeCache from 'node-cache'
 import PQueue from 'p-queue'
-import * as BullMQ from 'bullmq'
+import { Queue, Worker, Job } from 'bullmq'
 import Redis from 'ioredis'
 import { 
     validateJID, 
@@ -2650,7 +2650,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     
                     // Check for existing conflicting jobs and remove only truly conflicting ones
                     const existingJobs = await queue.getJobs(['waiting', 'delayed'])
-                    const conflictingJobs = existingJobs.filter(job => {
+                    const conflictingJobs = existingJobs.filter((job: Job<LabelAssociationJob>) => {
                         const jobData = job.data as LabelAssociationJob
                         // Skip jobs without association data (like cleanup jobs)
                         if (!jobData || !jobData.association) return false
@@ -2669,7 +2669,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     
                     // Remove truly conflicting jobs (only recent duplicates)
                     let removedCount = 0
-                    for (const conflictingJob of conflictingJobs) {
+                    for (const conflictingJob of conflictingJobs as Job<LabelAssociationJob>[]) {
                         // Only remove if the job is very recent (within last 10 seconds) to avoid removing legitimate queued operations
                         const jobAge = Date.now() - (conflictingJob.opts?.timestamp || conflictingJob.processedOn || Date.now())
                         if (jobAge < 10000) { // 10 seconds
