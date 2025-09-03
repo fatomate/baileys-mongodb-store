@@ -366,9 +366,7 @@ export class ConnectionManager {
             instances: new Set(),
             createdAt: new Date(),
             lastUsedAt: new Date(),
-            activeOperations: 0,
-            isClosing: false,
-            acceptingOperations: true
+            activeOperations: 0
         }
         
         this.pools.set(poolId, pool)
@@ -381,50 +379,13 @@ export class ConnectionManager {
         
         this.log('info', `Closing pool ${poolId}`)
         
-        // Mark pool as closing
-        pool.isClosing = true
-        
-        // Stop accepting new operations
-        pool.acceptingOperations = false
-        
-        // Wait for active operations to complete (with timeout)
-        const waitForOperations = async () => {
-            const maxWait = 5000 // 5 seconds
-            const startTime = Date.now()
-            
-            while (pool.activeOperations > 0) {
-                if (Date.now() - startTime > maxWait) {
-                    this.log('warn', `Timeout waiting for operations to complete in pool ${poolId}, forcing close`)
-                    break
-                }
-                await new Promise(resolve => setTimeout(resolve, 100))
-            }
-        }
-        
         try {
-            await waitForOperations()
-            
-            // Close the MongoDB client with force flag
-            await pool.client.close(true)
-            
-            // Wait a bit for the close to complete
-            await new Promise(resolve => setTimeout(resolve, 200))
-            
+            await pool.client.close()
         } catch (error) {
             this.log('error', `Error closing pool ${poolId}: ${error}`)
-        } finally {
-            // Always remove from pools map
-            this.pools.delete(poolId)
-            
-            // Clean up instance associations
-            for (const [instanceId, associatedPoolId] of this.instancePools) {
-                if (associatedPoolId === poolId) {
-                    this.instancePools.delete(instanceId)
-                }
-            }
         }
         
-        this.log('info', `Pool ${poolId} closed successfully`)
+        this.pools.delete(poolId)
     }
     
     private async migrateInstancePool(instanceId: string, fromTier: ConnectionTier, toTier: ConnectionTier): Promise<void> {

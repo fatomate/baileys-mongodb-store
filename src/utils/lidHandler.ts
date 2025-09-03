@@ -31,7 +31,6 @@ export class LidHandler {
     private cache: NodeCache
     private config: Required<LidHandlerConfig>
     private instanceId: string
-    private isInitialized: boolean = false
 
     constructor(instanceId: string, config?: LidHandlerConfig) {
         this.instanceId = instanceId
@@ -59,66 +58,9 @@ export class LidHandler {
         const messagesCollectionName = collectionPrefix ? `${collectionPrefix}messages` : 'messages'
         this.messagesCollection = db.collection(messagesCollectionName)
         
-        this.isInitialized = true
         
         // Create indexes for efficient lookups with retry logic
         await this.createIndexes()
-    }
-
-    /**
-     * Check if the handler is properly initialized and connected
-     */
-    private isConnected(): boolean {
-        if (!this.isInitialized || !this.lidMappingsCollection) {
-            return false
-        }
-        
-        try {
-            // Check if the collection's client is connected
-            const client = (this.lidMappingsCollection as any).s?.client
-            if (!client) return false
-            
-            // Check MongoDB client connection state
-            const topology = client.topology || client.s?.topology
-            if (!topology) return false
-            
-            return topology.isConnected?.() || topology.s?.state === 'connected'
-        } catch (error) {
-            return false
-        }
-    }
-
-    /**
-     * Execute a database operation with connection check
-     */
-    private async withConnectionCheck<T>(
-        operation: () => Promise<T>,
-        fallback: T,
-        operationName: string
-    ): Promise<T> {
-        if (!this.isConnected()) {
-            console.warn(`[LidHandler] ${operationName}: Database not connected, returning fallback`)
-            return fallback
-        }
-        
-        try {
-            return await operation()
-        } catch (error: any) {
-            // Check if this is a connection error
-            if (error.name === 'MongoNotConnectedError' ||
-                error.name === 'MongoPoolClosedError' ||
-                error.message?.includes('Client must be connected') ||
-                error.message?.includes('server is closed') ||
-                error.message?.includes('Topology is closed')) {
-                console.warn(`[LidHandler] ${operationName}: Connection lost during operation, returning fallback`)
-                this.isInitialized = false // Mark as not initialized
-                return fallback
-            }
-            
-            // For other errors, log and re-throw
-            console.error(`[LidHandler] ${operationName} failed:`, error)
-            throw error
-        }
     }
 
     /**
@@ -293,20 +235,6 @@ export class LidHandler {
      * Store or update a LID to phone number mapping
      */
     async storeLidMapping(lid: string, phoneNumber: string): Promise<void> {
-        if (!this.isConnected()) {
-            console.debug('[LidHandler] Cannot store LID mapping - database not connected')
-            // Still update cache if enabled
-            if (this.config.enableCache) {
-                const normalizedLid = normalizeJidForStorage(lid)
-                const normalizedPhone = normalizeJidForStorage(phoneNumber)
-                if (normalizedLid && normalizedPhone && this.isLidFormat(normalizedLid) && isPhoneNumberFormat(normalizedPhone)) {
-                    this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, normalizedPhone)
-                    this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
-                }
-            }
-            return
-        }
-        
         if (!this.lidMappingsCollection) {
             console.warn('LidHandler not initialized with database')
             return
@@ -383,41 +311,37 @@ export class LidHandler {
             if (cached) return cached
         }
         
-        // Query database with connection check
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.lidMappingsCollection) {
-                    return null
+        // Query database
+        if (!this.lidMappingsCollection) {
+            console.warn('LidHandler not initialized with database')
+            return null
+        }
+        
+        try {
+            const mapping = await this.lidMappingsCollection.findOne({
+                instanceId: this.instanceId,
+                lid: normalizedLid
+            })
+            
+            if (mapping) {
+                // Update cache
+                if (this.config.enableCache) {
+                    this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, mapping.phoneNumber)
                 }
                 
-                const mapping = await this.lidMappingsCollection.findOne({
-                    instanceId: this.instanceId,
-                    lid: normalizedLid
-                })
+                // Update lastSeen
+                await this.lidMappingsCollection.updateOne(
+                    { _id: mapping._id },
+                    { $set: { lastSeen: new Date() } }
+                )
                 
-                if (mapping) {
-                    // Update cache
-                    if (this.config.enableCache) {
-                        this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, mapping.phoneNumber)
-                    }
-                    
-                    // Update lastSeen (fire and forget, don't wait)
-                    this.lidMappingsCollection.updateOne(
-                        { _id: mapping._id },
-                        { $set: { lastSeen: new Date() } }
-                    ).catch(err => {
-                        // Silently ignore update errors
-                        console.debug('[LidHandler] Failed to update lastSeen:', err.message)
-                    })
-                    
-                    return mapping.phoneNumber
-                }
-                
-                return null
-            },
-            null,
-            'getPhoneNumberFromLid'
-        )
+                return mapping.phoneNumber
+            }
+        } catch (error) {
+            console.error('[LidHandler] Failed to get phone number from LID:', error)
+        }
+        
+        return null
     }
 
     /**
@@ -433,32 +357,31 @@ export class LidHandler {
             if (cached) return cached
         }
         
-        // Query database with connection check
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.lidMappingsCollection) {
-                    return null
+        // Query database
+        if (!this.lidMappingsCollection) {
+            console.warn('LidHandler not initialized with database')
+            return null
+        }
+        
+        try {
+            const mapping = await this.lidMappingsCollection.findOne({
+                instanceId: this.instanceId,
+                phoneNumber: normalizedPhone
+            })
+            
+            if (mapping) {
+                // Update cache
+                if (this.config.enableCache) {
+                    this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, mapping.lid)
                 }
                 
-                const mapping = await this.lidMappingsCollection.findOne({
-                    instanceId: this.instanceId,
-                    phoneNumber: normalizedPhone
-                })
-                
-                if (mapping) {
-                    // Update cache
-                    if (this.config.enableCache) {
-                        this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, mapping.lid)
-                    }
-                    
-                    return mapping.lid
-                }
-                
-                return null
-            },
-            null,
-            'getLidFromPhoneNumber'
-        )
+                return mapping.lid
+            }
+        } catch (error) {
+            console.error('[LidHandler] Failed to get LID from phone number:', error)
+        }
+        
+        return null
     }
 
     /**
@@ -507,62 +430,61 @@ export class LidHandler {
      * Searches for received messages where senderLid matches the LID
      */
     async discoverPhoneFromSentMessage(lid: string): Promise<string | null> {
+        if (!this.messagesCollection) {
+            console.warn('[LidHandler] Messages collection not available for reverse lookup')
+            return null
+        }
+        
         const normalizedLid = normalizeJidForStorage(lid)
         console.log(`[LidHandler] Searching for phone number from sent message with LID: ${normalizedLid}`)
         
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.messagesCollection) {
-                    return null
+        try {
+            // Search for messages where:
+            // 1. fromMe is false (received messages)
+            // 2. senderLid matches our LID
+            const receivedMessage = await this.messagesCollection.findOne({
+                instanceId: this.instanceId,
+                'key.fromMe': false,
+                $or: [
+                    { 'key.senderLid': normalizedLid },
+                    { 'key.senderLid': lid } // Try original format too
+                ]
+            })
+            
+            if (receivedMessage) {
+                // Extract phone number from senderPn or remoteJid
+                let phoneNumber: string | null = null
+                
+                // First try senderPn
+                if (receivedMessage.key?.senderPn && !this.isLidFormat(receivedMessage.key.senderPn)) {
+                    phoneNumber = receivedMessage.key.senderPn
+                    console.log(`[LidHandler] Found phone number in senderPn: ${phoneNumber}`)
+                }
+                // Then try remoteJid if it's not a LID
+                else if (receivedMessage.key?.remoteJid && !this.isLidFormat(receivedMessage.key.remoteJid)) {
+                    phoneNumber = receivedMessage.key.remoteJid
+                    console.log(`[LidHandler] Found phone number in remoteJid: ${phoneNumber}`)
+                }
+                // Also check participant field
+                else if (receivedMessage.key?.participant && !this.isLidFormat(receivedMessage.key.participant)) {
+                    phoneNumber = receivedMessage.key.participant
+                    console.log(`[LidHandler] Found phone number in participant: ${phoneNumber}`)
                 }
                 
-                // Search for messages where:
-                // 1. fromMe is false (received messages)
-                // 2. senderLid matches our LID
-                const receivedMessage = await this.messagesCollection.findOne({
-                    instanceId: this.instanceId,
-                    'key.fromMe': false,
-                    $or: [
-                        { 'key.senderLid': normalizedLid },
-                        { 'key.senderLid': lid } // Try original format too
-                    ]
-                })
-                
-                if (receivedMessage) {
-                    // Extract phone number from senderPn or remoteJid
-                    let phoneNumber: string | null = null
-                    
-                    // First try senderPn
-                    if (receivedMessage.key?.senderPn && !this.isLidFormat(receivedMessage.key.senderPn)) {
-                        phoneNumber = receivedMessage.key.senderPn
-                        console.log(`[LidHandler] Found phone number in senderPn: ${phoneNumber}`)
-                    }
-                    // Then try remoteJid if it's not a LID
-                    else if (receivedMessage.key?.remoteJid && !this.isLidFormat(receivedMessage.key.remoteJid)) {
-                        phoneNumber = receivedMessage.key.remoteJid
-                        console.log(`[LidHandler] Found phone number in remoteJid: ${phoneNumber}`)
-                    }
-                    // Also check participant field
-                    else if (receivedMessage.key?.participant && !this.isLidFormat(receivedMessage.key.participant)) {
-                        phoneNumber = receivedMessage.key.participant
-                        console.log(`[LidHandler] Found phone number in participant: ${phoneNumber}`)
-                    }
-                    
-                    if (phoneNumber && isPhoneNumberFormat(phoneNumber)) {
-                        // Store the discovered mapping
-                        console.log(`[LidHandler] Discovered phone number ${phoneNumber} for LID ${normalizedLid} via reverse lookup`)
-                        await this.storeLidMapping(normalizedLid, phoneNumber)
-                        return phoneNumber
-                    }
-                } else {
-                    console.log(`[LidHandler] No received messages found with senderLid: ${normalizedLid}`)
+                if (phoneNumber && isPhoneNumberFormat(phoneNumber)) {
+                    // Store the discovered mapping
+                    console.log(`[LidHandler] Discovered phone number ${phoneNumber} for LID ${normalizedLid} via reverse lookup`)
+                    await this.storeLidMapping(normalizedLid, phoneNumber)
+                    return phoneNumber
                 }
-                
-                return null
-            },
-            null,
-            'discoverPhoneFromSentMessage'
-        )
+            } else {
+                console.log(`[LidHandler] No received messages found with senderLid: ${normalizedLid}`)
+            }
+        } catch (error) {
+            console.error('[LidHandler] Error during reverse lookup:', error)
+        }
+        
+        return null
     }
 
     /**
@@ -577,87 +499,85 @@ export class LidHandler {
      * Used when fromMe=true messages have LID in remoteJid
      */
     async reversePhoneLookupFromMessages(lid: string): Promise<string | null> {
+        if (!this.messagesCollection) {
+            console.warn('[LidHandler] Messages collection not available for reverse lookup')
+            return null
+        }
+        
         const normalizedLid = normalizeJidForStorage(lid)
         console.log(`[LidHandler] Attempting reverse lookup for LID: ${normalizedLid}`)
         
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.messagesCollection) {
-                    return null
-                }
-                
-                // Look for messages where this LID appears with a phone number
-                // Add projection to only fetch needed fields for performance
-                const message = await this.messagesCollection.findOne({
-                    instanceId: this.instanceId,
-                    $or: [
-                        // Case 1: LID in senderLid with phone in senderPn
-                        { 
-                            'key.senderLid': normalizedLid,
-                            'key.senderPn': { 
-                                $exists: true, 
-                                $nin: [null, '']
-                            }
-                        },
-                        // Case 2: LID in remoteJid with phone in senderPn (fromMe=false)
-                        {
-                            'key.remoteJid': normalizedLid,
-                            'key.fromMe': false,
-                            'key.senderPn': { 
-                                $exists: true,
-                                $nin: [null, '']
-                            }
+        try {
+            // Look for messages where this LID appears with a phone number
+            // Add projection to only fetch needed fields for performance
+            const message = await this.messagesCollection.findOne({
+                instanceId: this.instanceId,
+                $or: [
+                    // Case 1: LID in senderLid with phone in senderPn
+                    { 
+                        'key.senderLid': normalizedLid,
+                        'key.senderPn': { 
+                            $exists: true, 
+                            $nin: [null, '']
                         }
-                    ]
-                }, {
-                    projection: { 'key.senderPn': 1 } // Only fetch the field we need
-                })
-                
-                if (message?.key?.senderPn && !this.isLidFormat(message.key.senderPn)) {
-                    console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${message.key.senderPn}`)
-                    return message.key.senderPn
-                }
-                
-                return null
-            },
-            null,
-            'reversePhoneLookupFromMessages'
-        )
+                    },
+                    // Case 2: LID in remoteJid with phone in senderPn (fromMe=false)
+                    {
+                        'key.remoteJid': normalizedLid,
+                        'key.fromMe': false,
+                        'key.senderPn': { 
+                            $exists: true,
+                            $nin: [null, '']
+                        }
+                    }
+                ]
+            }, {
+                projection: { 'key.senderPn': 1 } // Only fetch the field we need
+            })
+            
+            if (message?.key?.senderPn && !this.isLidFormat(message.key.senderPn)) {
+                console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${message.key.senderPn}`)
+                return message.key.senderPn
+            }
+        } catch (error) {
+            console.error('[LidHandler] Error during reverse lookup:', error)
+        }
+        
+        return null
     }
 
     /**
      * Update existing messages that have a LID to use the phone number
      */
     async updateExistingMessages(lid: string, phoneNumber: string): Promise<void> {
-        await this.withConnectionCheck(
-            async () => {
-                if (!this.messagesCollection) {
-                    return
-                }
-                
-                // Update messages where remoteJid is the LID
-                const result = await this.messagesCollection.updateMany(
-                    {
-                        instanceId: this.instanceId,
-                        'key.remoteJid': lid
-                    },
-                    {
-                        $set: {
-                            'key.remoteJid': phoneNumber,
-                            jid: phoneNumber,
-                            'lidMapping.resolved': true,
-                            'lidMapping.resolvedAt': new Date()
-                        }
+        if (!this.messagesCollection) {
+            console.warn('[LidHandler] Messages collection not available for updates')
+            return
+        }
+        
+        try {
+            // Update messages where remoteJid is the LID
+            const result = await this.messagesCollection.updateMany(
+                {
+                    instanceId: this.instanceId,
+                    'key.remoteJid': lid
+                },
+                {
+                    $set: {
+                        'key.remoteJid': phoneNumber,
+                        jid: phoneNumber,
+                        'lidMapping.resolved': true,
+                        'lidMapping.resolvedAt': new Date()
                     }
-                )
-                
-                if (result.modifiedCount > 0) {
-                    console.log(`[LidHandler] Updated ${result.modifiedCount} messages from LID ${lid} to ${phoneNumber}`)
                 }
-            },
-            undefined,
-            'updateExistingMessages'
-        )
+            )
+            
+            if (result.modifiedCount > 0) {
+                console.log(`[LidHandler] Updated ${result.modifiedCount} messages from LID ${lid} to ${phoneNumber}`)
+            }
+        } catch (error) {
+            console.error('[LidHandler] Error updating existing messages:', error)
+        }
     }
 
     /**
@@ -764,44 +684,44 @@ export class LidHandler {
      * Get all mappings for this instance (for debugging/export)
      */
     async getAllMappings(): Promise<LidMapping[]> {
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.lidMappingsCollection) {
-                    return []
-                }
-                
-                return await this.lidMappingsCollection
-                    .find({ instanceId: this.instanceId })
-                    .toArray()
-            },
-            [],
-            'getAllMappings'
-        )
+        if (!this.lidMappingsCollection) {
+            console.warn('LidHandler not initialized with database')
+            return []
+        }
+        
+        try {
+            return await this.lidMappingsCollection
+                .find({ instanceId: this.instanceId })
+                .toArray()
+        } catch (error) {
+            console.error('[LidHandler] Failed to get all mappings:', error)
+            return []
+        }
     }
 
     /**
      * Delete old mappings that haven't been seen in specified days
      */
     async cleanupOldMappings(daysOld: number = 90): Promise<number> {
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.lidMappingsCollection) {
-                    return 0
-                }
-                
-                const cutoffDate = new Date()
-                cutoffDate.setDate(cutoffDate.getDate() - daysOld)
-                
-                const result = await this.lidMappingsCollection.deleteMany({
-                    instanceId: this.instanceId,
-                    lastSeen: { $lt: cutoffDate }
-                })
-                
-                console.log(`[LidHandler] Cleaned up ${result.deletedCount} old mappings`)
-                return result.deletedCount
-            },
-            0,
-            'cleanupOldMappings'
-        )
+        if (!this.lidMappingsCollection) {
+            console.warn('LidHandler not initialized with database')
+            return 0
+        }
+        
+        const cutoffDate = new Date()
+        cutoffDate.setDate(cutoffDate.getDate() - daysOld)
+        
+        try {
+            const result = await this.lidMappingsCollection.deleteMany({
+                instanceId: this.instanceId,
+                lastSeen: { $lt: cutoffDate }
+            })
+            
+            console.log(`[LidHandler] Cleaned up ${result.deletedCount} old mappings`)
+            return result.deletedCount
+        } catch (error) {
+            console.error('[LidHandler] Failed to cleanup old mappings:', error)
+            return 0
+        }
     }
 }

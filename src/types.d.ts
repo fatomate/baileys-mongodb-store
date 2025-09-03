@@ -144,6 +144,38 @@ export interface MongoDBStoreConfig {
     useSharedConnections?: boolean
     
     /**
+     * Index management configuration for smart index creation
+     * Controls how indexes are created and managed
+     */
+    indexManagement?: {
+        /**
+         * Skip index creation for collections that already exist
+         * When true, only creates indexes for new collections or missing indexes
+         * Default: true (recommended for performance)
+         */
+        skipExistingCollectionIndexes?: boolean
+        
+        /**
+         * Force recreation of all indexes, even if they exist
+         * Overrides skipExistingCollectionIndexes when true
+         * Default: false
+         */
+        forceRecreateIndexes?: boolean
+        
+        /**
+         * Enable detailed logging for index creation process
+         * Default: true
+         */
+        enableIndexHealthLogging?: boolean
+        
+        /**
+         * Timeout for index creation operations (in milliseconds)
+         * Default: 30000 (30 seconds)
+         */
+        indexCreationTimeout?: number
+    }
+    
+    /**
      * Whether to clear all data when receiving isLatest=true in messaging-history.set
      * Default: false (for backward compatibility)
      * Set to true if you want to clear all existing data when receiving the latest history

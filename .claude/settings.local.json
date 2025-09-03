@@ -42,8 +42,7 @@
       "Read(/Users/firdausazizi/Library/CloudStorage/GoogleDrive-firdaus@fames.my/My Drive/Fatomate/Wabot/**)",
       "Bash(git log:*)",
       "Bash(cd:*)",
-      "Bash(npx tsc:*)",
-      "WebSearch"
+      "Bash(npx tsc:*)"
     ],
     "deny": [],
     "additionalDirectories": [

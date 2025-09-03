@@ -32,8 +32,6 @@ export interface ConnectionPool {
     createdAt: Date
     lastUsedAt: Date
     activeOperations: number
-    isClosing?: boolean
-    acceptingOperations?: boolean
 }
 
 export interface ConnectionConfig {

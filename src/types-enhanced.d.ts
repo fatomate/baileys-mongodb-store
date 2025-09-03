@@ -435,6 +435,38 @@ export interface EnhancedMongoDBStoreConfig {
      * Operations older than this are considered stale
      */
     staleOperationThreshold?: number
+    
+    /**
+     * Index management configuration for smart index creation
+     * Controls how indexes are created and managed
+     */
+    indexManagement?: {
+        /**
+         * Skip index creation for collections that already exist
+         * When true, only creates indexes for new collections or missing indexes
+         * Default: true (recommended for performance)
+         */
+        skipExistingCollectionIndexes?: boolean
+        
+        /**
+         * Force recreation of all indexes, even if they exist
+         * Overrides skipExistingCollectionIndexes when true
+         * Default: false
+         */
+        forceRecreateIndexes?: boolean
+        
+        /**
+         * Enable detailed logging for index creation process
+         * Default: true
+         */
+        enableIndexHealthLogging?: boolean
+        
+        /**
+         * Timeout for index creation operations (in milliseconds)
+         * Default: 30000 (30 seconds)
+         */
+        indexCreationTimeout?: number
+    }
 }
 
 /**
@@ -534,12 +566,6 @@ export interface EnhancedMongoDBStore {
     resetPerformanceStats(): void
     recreateIndexes(): Promise<{ created: number; failed: number; details: string[] }>
     getIndexStatus(): Promise<{ collection: string; indexes: any[] }[]>
-    verifyExpectedIndexes(): Promise<{
-        collection: string
-        missing: string[]
-        unexpected: string[]
-        correct: string[]
-    }[]>
     getTTLStatus(): Promise<{
         enabled: boolean
         ttlDays?: number

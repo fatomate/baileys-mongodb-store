@@ -127,10 +127,10 @@ export async function safeCreateIndex(
             console.log(`✅ Created index on collection ${collection.collectionName}`)
             return
         } catch (error: any) {
-            // Handle duplicate index error
+            // Handle duplicate key error - this indicates data integrity issues, not "index exists"
             if (error.code === 11000 || error.codeName === 'DuplicateKey') {
-                console.log(`ℹ️ Index already exists on collection ${collection.collectionName}`)
-                return
+                console.error(`❌ Duplicate data prevents creating unique index on collection ${collection.collectionName}: ${error.message}`)
+                throw error
             }
             
             // Handle index already exists error
@@ -316,4 +316,221 @@ export async function dropAllTTLIndexes(collection: Collection<any>): Promise<vo
         console.error(`❌ Failed to drop TTL indexes from collection ${collection.collectionName}:`, error)
         throw error
     }
+}
+
+/**
+ * Batch create multiple indexes with proper error handling and logging
+ * @param collection The MongoDB collection
+ * @param indexSpecs Array of index specifications
+ * @returns Promise resolving to batch creation results
+ */
+export async function batchCreateIndexes(collection: Collection<any>, indexSpecs: Array<{ name: string, spec: any, options?: any }>): Promise<{
+    successful: number,
+    failed: number,
+    details: string[]
+}> {
+    const results = { successful: 0, failed: 0, details: [] as string[] }
+    
+    if (indexSpecs.length === 0) {
+        results.details.push(`No indexes to create for collection ${collection.collectionName}`)
+        return results
+    }
+    
+    console.log(`📋 Creating ${indexSpecs.length} indexes for collection ${collection.collectionName}`)
+    
+    for (const indexSpec of indexSpecs) {
+        try {
+            await safeCreateIndex(collection, indexSpec.spec, indexSpec.options)
+            results.successful++
+            results.details.push(`✅ Created index: ${indexSpec.name}`)
+        } catch (error) {
+            results.failed++
+            const errorMsg = `❌ Failed to create index ${indexSpec.name}: ${error instanceof Error ? error.message : String(error)}`
+            results.details.push(errorMsg)
+            console.error(errorMsg)
+        }
+    }
+    
+    const summary = `Batch index creation completed for ${collection.collectionName}: ${results.successful} successful, ${results.failed} failed`
+    results.details.push(summary)
+    console.log(summary)
+    
+    return results
+}
+
+/**
+ * Batch drop multiple indexes with proper error handling
+ * @param collection The MongoDB collection
+ * @param indexNames Array of index names to drop
+ * @returns Promise resolving to batch drop results
+ */
+export async function batchDropIndexes(collection: Collection<any>, indexNames: string[]): Promise<{
+    successful: number,
+    failed: number,
+    details: string[]
+}> {
+    const results = { successful: 0, failed: 0, details: [] as string[] }
+    
+    if (indexNames.length === 0) {
+        results.details.push(`No indexes to drop for collection ${collection.collectionName}`)
+        return results
+    }
+    
+    console.log(`🗑️ Dropping ${indexNames.length} indexes from collection ${collection.collectionName}`)
+    
+    for (const indexName of indexNames) {
+        try {
+            await safeDropIndex(collection, indexName)
+            results.successful++
+            results.details.push(`✅ Dropped index: ${indexName}`)
+        } catch (error) {
+            results.failed++
+            const errorMsg = `❌ Failed to drop index ${indexName}: ${error instanceof Error ? error.message : String(error)}`
+            results.details.push(errorMsg)
+            console.error(errorMsg)
+        }
+    }
+    
+    const summary = `Batch index drop completed for ${collection.collectionName}: ${results.successful} successful, ${results.failed} failed`
+    results.details.push(summary)
+    console.log(summary)
+    
+    return results
+}
+
+/**
+ * Recreate indexes by dropping and creating them
+ * Useful for index option changes or corruption recovery
+ * @param collection The MongoDB collection
+ * @param indexSpecs Array of index specifications to recreate
+ * @returns Promise resolving to recreation results
+ */
+export async function recreateIndexes(collection: Collection<any>, indexSpecs: Array<{ name: string, spec: any, options?: any }>): Promise<{
+    successful: number,
+    failed: number,
+    details: string[]
+}> {
+    const results = { successful: 0, failed: 0, details: [] as string[] }
+    
+    if (indexSpecs.length === 0) {
+        results.details.push(`No indexes to recreate for collection ${collection.collectionName}`)
+        return results
+    }
+    
+    console.log(`🔄 Recreating ${indexSpecs.length} indexes for collection ${collection.collectionName}`)
+    
+    // First, try to drop existing indexes
+    const indexNames = []
+    for (const indexSpec of indexSpecs) {
+        try {
+            // Find existing index by key pattern
+            const existingIndexName = await findIndexByKeyPattern(collection, indexSpec.spec)
+            if (existingIndexName) {
+                indexNames.push(existingIndexName)
+            }
+        } catch (error) {
+            results.details.push(`⚠️ Could not find existing index for ${indexSpec.name}, will create new`)
+        }
+    }
+    
+    // Drop existing indexes if found
+    if (indexNames.length > 0) {
+        const dropResults = await batchDropIndexes(collection, indexNames)
+        results.details.push(...dropResults.details)
+    }
+    
+    // Create all indexes
+    const createResults = await batchCreateIndexes(collection, indexSpecs)
+    results.successful = createResults.successful
+    results.failed = createResults.failed
+    results.details.push(...createResults.details)
+    
+    return results
+}
+
+/**
+ * Validate index health by checking if all expected indexes exist with correct options
+ * @param collection The MongoDB collection
+ * @param expectedIndexes Array of expected index specifications
+ * @returns Promise resolving to health check results
+ */
+export async function validateIndexHealth(collection: Collection<any>, expectedIndexes: Array<{ name: string, spec: any, options?: any }>): Promise<{
+    healthy: boolean,
+    missing: string[],
+    optionMismatches: string[],
+    unexpected: string[],
+    details: string[]
+}> {
+    const results = {
+        healthy: true,
+        missing: [] as string[],
+        optionMismatches: [] as string[],
+        unexpected: [] as string[],
+        details: [] as string[]
+    }
+    
+    try {
+        const existingIndexes = await collection.indexes()
+        const existingIndexMap = new Map()
+        
+        // Build map of existing indexes (excluding _id)
+        existingIndexes.forEach(idx => {
+            if (idx.name !== '_id_') {
+                existingIndexMap.set(JSON.stringify(idx.key), idx)
+            }
+        })
+        
+        // Check for missing indexes and option mismatches
+        for (const expected of expectedIndexes) {
+            const keyString = JSON.stringify(expected.spec)
+            const existing = existingIndexMap.get(keyString)
+            
+            if (!existing) {
+                results.missing.push(expected.name)
+                results.healthy = false
+                results.details.push(`❌ Missing index: ${expected.name}`)
+            } else {
+                // Check critical options
+                const criticalOptions = ['unique', 'expireAfterSeconds', 'sparse']
+                for (const option of criticalOptions) {
+                    const expectedValue = expected.options?.[option]
+                    const existingValue = existing[option]
+                    
+                    if (expectedValue !== existingValue) {
+                        // Special handling for TTL tolerance
+                        if (option === 'expireAfterSeconds' && typeof expectedValue === 'number' && typeof existingValue === 'number') {
+                            if (Math.abs(expectedValue - existingValue) <= 60) { // 1 minute tolerance
+                                continue
+                            }
+                        }
+                        
+                        results.optionMismatches.push(`${expected.name} (${option}: expected ${expectedValue}, got ${existingValue})`)
+                        results.healthy = false
+                        results.details.push(`⚠️ Option mismatch in ${expected.name}: ${option}`)
+                    }
+                }
+            }
+        }
+        
+        // Check for unexpected indexes (informational only)
+        const expectedKeyStrings = new Set(expectedIndexes.map(idx => JSON.stringify(idx.spec)))
+        for (const [keyString, existing] of existingIndexMap.entries()) {
+            if (!expectedKeyStrings.has(keyString)) {
+                results.unexpected.push(existing.name || 'unnamed')
+                results.details.push(`ℹ️ Unexpected index found: ${existing.name}`)
+            }
+        }
+        
+        if (results.healthy) {
+            results.details.push(`✅ All ${expectedIndexes.length} indexes are healthy for collection ${collection.collectionName}`)
+        } else {
+            results.details.push(`❌ Index health issues found for collection ${collection.collectionName}`)
+        }
+        
+    } catch (error) {
+        results.healthy = false
+        results.details.push(`❌ Failed to validate index health: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    
+    return results
 }

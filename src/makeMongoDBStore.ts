@@ -34,6 +34,8 @@ import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
 import { LidHandler } from './utils/lidHandler'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
+import { shouldCreateIndexes, IndexSpec, IndexCheckResult, clearCollectionCache } from './utils/collectionHelper'
+import { batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
 
 const DEFAULT_TTL_DAYS = 30
 
@@ -234,8 +236,17 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         ttlMonitoring,
         lidHandler: lidHandlerConfig,
         connectionConfig,
-        useSharedConnections = true
+        useSharedConnections = true,
+        indexManagement
     } = config
+    
+    // Configure smart index management with defaults
+    const indexConfig = {
+        skipExistingCollectionIndexes: indexManagement?.skipExistingCollectionIndexes ?? true,
+        forceRecreateIndexes: indexManagement?.forceRecreateIndexes ?? false,
+        enableIndexHealthLogging: indexManagement?.enableIndexHealthLogging ?? true,
+        indexCreationTimeout: indexManagement?.indexCreationTimeout ?? 30000
+    }
     
     // Validate instance ID
     const validatedInstanceId = validateInstanceId(instanceId)
@@ -1462,7 +1473,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }, 100)
     }
     
-    // Enhanced index creation with retry logic and categorization
+    // Smart index creation with collection existence checking
     const createIndexes = async () => {
         const ttlSeconds = ttlDays * 24 * 60 * 60
         
@@ -1494,126 +1505,221 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         // Run migration before creating new indexes
         await dropObsoleteTTLIndexes()
         
-        // Define indexes by priority - critical indexes must succeed
-        const criticalIndexes = [
-            // Primary lookup indexes - essential for query performance
-            { collection: 'chats', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'chats_primary' },
-            { collection: 'contacts', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'contacts_primary' },
-            { collection: 'messages', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true }, name: 'messages_primary' },
-            { collection: 'messages', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {}, name: 'messages_query' },
-            { collection: 'groupMetadata', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'groups_primary' },
-            { collection: 'state', spec: { instanceId: 1 }, options: { unique: true }, name: 'state_primary' },
-            { collection: 'presences', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'presences_primary' },
-            { collection: 'labels', spec: { instanceId: 1, id: 1 }, options: { unique: true }, name: 'labels_primary' },
-            { collection: 'labelAssociations', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true }, name: 'label_assoc_primary' }
-        ]
+        // Define all indexes by collection with standardized format
+        const indexDefinitions: Record<string, IndexSpec[]> = {
+            chats: [
+                { name: 'chats_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                { name: 'chats_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+            ],
+            contacts: [
+                { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+            ],
+            messages: [
+                { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
+                { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
+                { name: 'messages_keyid', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
+                { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+            ],
+            groupMetadata: [
+                { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                // No TTL - persists indefinitely
+            ],
+            state: [
+                { name: 'state_primary', spec: { instanceId: 1 }, options: { unique: true } }
+            ],
+            presences: [
+                { name: 'presences_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                { name: 'presences_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+            ],
+            labels: [
+                { name: 'labels_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                // No TTL - persists indefinitely
+            ],
+            labelAssociations: [
+                { name: 'label_assoc_primary', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true } },
+                { name: 'label_assoc_chat', spec: { instanceId: 1, chatId: 1 }, options: {} },
+                { name: 'label_assoc_message', spec: { instanceId: 1, messageId: 1 }, options: {} }
+                // No TTL - persists indefinitely
+            ]
+        }
         
-        const optimizationIndexes = [
-            // Performance optimization indexes - improve speed but not essential
-            { collection: 'labelAssociations', spec: { instanceId: 1, chatId: 1 }, options: {}, name: 'label_assoc_chat' },
-            { collection: 'labelAssociations', spec: { instanceId: 1, messageId: 1 }, options: {}, name: 'label_assoc_message' },
-            // Dedicated index for direct key.id lookups (prevents inefficient index selection)
-            { collection: 'messages', spec: { instanceId: 1, 'key.id': 1 }, options: {}, name: 'messages_keyid' }
-        ]
+        // Smart index creation logic with configuration support
+        const createResults: Array<{ collection: string, created: number, skipped: boolean, details: string[] }> = []
+        let totalCreated = 0
+        let totalSkipped = 0
         
-        const ttlIndexes = [
-            // TTL indexes for automatic cleanup - can be recreated later if needed
-            { collection: 'chats', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'chats_ttl' },
-            { collection: 'contacts', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'contacts_ttl' },
-            { collection: 'messages', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'messages_ttl' },
-            // groupMetadata - removed from TTL indexes (will persist indefinitely)
-            { collection: 'presences', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds }, name: 'presences_ttl' }
-            // labels - removed from TTL indexes (will persist indefinitely)
-            // labelAssociations - removed from TTL indexes (will persist indefinitely)
-        ]
+        if (indexConfig.enableIndexHealthLogging) {
+            console.log(`🔧 Smart index management for instance ${instanceId}...`)
+            console.log(`   Settings: skipExisting=${indexConfig.skipExistingCollectionIndexes}, forceRecreate=${indexConfig.forceRecreateIndexes}`)
+        }
         
-        const createIndexWithRetry = async (indexDef: any, maxRetries = 3): Promise<{ success: boolean; error?: Error }> => {
-            const { collection, spec, options, name } = indexDef
-            
-            for (let attempt = 1; attempt <= maxRetries; attempt++) {
-                try {
-                    await withConnection(() => collections[collection as keyof MongoCollections].createIndex(spec, options))
-                    console.log(`✅ Index created: ${name} (attempt ${attempt})`)
-                    return { success: true }
-                } catch (error) {
-                    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000) // Max 5s delay
-                    console.warn(`❌ Index creation failed: ${name} (attempt ${attempt}/${maxRetries}):`, error)
-                    
-                    if (attempt < maxRetries) {
-                        console.log(`⏳ Retrying ${name} in ${delay}ms...`)
-                        await new Promise(resolve => setTimeout(resolve, delay))
-                    } else {
-                        return { success: false, error: error as Error }
+        // Process each collection
+        for (const [collectionName, requiredIndexes] of Object.entries(indexDefinitions)) {
+            try {
+                const collection = collections[collectionName as keyof MongoCollections]
+                
+                // Handle force recreation mode
+                if (indexConfig.forceRecreateIndexes) {
+                    if (indexConfig.enableIndexHealthLogging) {
+                        console.log(`🔄 Collection ${collectionName}: Force recreating all ${requiredIndexes.length} indexes`)
                     }
+                    
+                    // Force recreate: drop and recreate all indexes with timeout applied
+                    const timedIndexes = requiredIndexes.map(idx => ({
+                        ...idx,
+                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                    }))
+                    const batchResult = await withConnection(() => 
+                        recreateIndexes(collection, timedIndexes)
+                    )
+                    
+                    createResults.push({
+                        collection: collectionName,
+                        created: batchResult.successful,
+                        skipped: false,
+                        details: batchResult.details
+                    })
+                    totalCreated += batchResult.successful
+                } else if (indexConfig.skipExistingCollectionIndexes) {
+                    // Smart mode: check what indexes are needed
+                    const checkResult = await shouldCreateIndexes(collection, requiredIndexes)
+                    
+                    if (checkResult.missingIndexes.length === 0) {
+                        if (indexConfig.enableIndexHealthLogging) {
+                            console.log(`✅ Collection ${collectionName}: All ${checkResult.requiredCount} indexes exist, skipping creation`)
+                        }
+                        createResults.push({
+                            collection: collectionName,
+                            created: 0,
+                            skipped: true,
+                            details: [`All ${checkResult.requiredCount} indexes already exist`]
+                        })
+                        totalSkipped += checkResult.requiredCount
+                    } else {
+                        const missingCount = checkResult.missingIndexes.length
+                        const action = checkResult.collectionExists ? 'Creating missing' : 'Creating all'
+                        if (indexConfig.enableIndexHealthLogging) {
+                            console.log(`🔨 Collection ${collectionName}: ${action} ${missingCount} indexes`)
+                        }
+                        
+                        // Create missing indexes using batch operation with timeout applied
+                        const timedMissingIndexes = checkResult.missingIndexes.map(idx => ({
+                            ...idx,
+                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                        }))
+                        const batchResult = await withConnection(() => 
+                            batchCreateIndexes(collection, timedMissingIndexes)
+                        )
+                        
+                        createResults.push({
+                            collection: collectionName,
+                            created: batchResult.successful,
+                            skipped: false,
+                            details: batchResult.details
+                        })
+                        
+                        totalCreated += batchResult.successful
+                        
+                        // Critical indexes must succeed (unique and primary key indexes)
+                        const createdNames = new Set(
+                            batchResult.details
+                                .filter(d => d.startsWith('✅ Created index: '))
+                                .map(d => d.replace('✅ Created index: ', '').trim())
+                        )
+                        const criticalIndexes = checkResult.missingIndexes.filter(idx => 
+                            idx.options?.unique || /primary|unique/i.test(idx.name)
+                        )
+                        const failedCriticalIndexes = criticalIndexes.filter(idx => !createdNames.has(idx.name))
+                        
+                        if (batchResult.failed > 0) {
+                            if (failedCriticalIndexes.length > 0) {
+                                throw new Error(`Critical indexes failed for ${collectionName}: ${failedCriticalIndexes.map(idx => idx.name).join(', ')}`)
+                            } else {
+                                console.warn(`⚠️ Some non-critical indexes failed for ${collectionName}: ${batchResult.failed} failures`)
+                            }
+                        }
+                    }
+                } else {
+                    // Legacy mode: create all indexes without smart checking
+                    if (indexConfig.enableIndexHealthLogging) {
+                        console.log(`🔧 Collection ${collectionName}: Creating all ${requiredIndexes.length} indexes (legacy mode)`)
+                    }
+                    
+                    // Apply timeout to all indexes for legacy mode
+                    const timedIndexes = requiredIndexes.map(idx => ({
+                        ...idx,
+                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                    }))
+                    const batchResult = await withConnection(() => 
+                        batchCreateIndexes(collection, timedIndexes)
+                    )
+                    
+                    createResults.push({
+                        collection: collectionName,
+                        created: batchResult.successful,
+                        skipped: false,
+                        details: batchResult.details
+                    })
+                    totalCreated += batchResult.successful
                 }
+            } catch (error) {
+                console.error(`❌ Failed to process indexes for collection ${collectionName}:`, error)
+                throw error // Re-throw to halt initialization if critical
             }
-            return { success: false }
         }
         
-        // Create critical indexes first - these MUST succeed
-        console.log(`🔧 Creating critical indexes for instance ${instanceId}...`)
-        const criticalResults = await Promise.allSettled(
-            criticalIndexes.map(idx => createIndexWithRetry(idx, 5)) // More retries for critical indexes
-        )
-        
-        const failedCritical = criticalResults
-            .map((result, i) => ({ result, index: criticalIndexes[i] }))
-            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success))
-        
-        if (failedCritical.length > 0) {
-            const errorDetails = failedCritical.map(({ index }) => index.name).join(', ')
-            throw new Error(`Critical indexes failed to create: ${errorDetails}. Query performance will be severely impacted. Please check MongoDB permissions and server status.`)
+        // Summary logging
+        const totalRequired = Object.values(indexDefinitions).reduce((sum, indexes) => sum + indexes.length, 0)
+        if (indexConfig.enableIndexHealthLogging) {
+            console.log(`✅ Smart index management completed for instance ${instanceId}:`)
+            console.log(`   📊 Total indexes: ${totalRequired} required`)
+            console.log(`   🔨 Created: ${totalCreated}`)
+            console.log(`   ⏭️  Skipped (existing): ${totalSkipped}`)
+            console.log(`   📈 Efficiency: ${Math.round((totalSkipped / totalRequired) * 100)}% reduction in index operations`)
         }
         
-        // Create optimization indexes - failures are acceptable but logged
-        console.log(`⚡ Creating optimization indexes for instance ${instanceId}...`)
-        const optimizationResults = await Promise.allSettled(
-            optimizationIndexes.map(idx => createIndexWithRetry(idx, 2))
-        )
-        
-        const failedOptimization = optimizationResults
-            .map((result, i) => ({ result, index: optimizationIndexes[i] }))
-            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success))
-        
-        if (failedOptimization.length > 0) {
-            console.warn(`⚠️  Some optimization indexes failed: ${failedOptimization.map(({ index }) => index.name).join(', ')}`)
-        }
-        
-        // Create TTL indexes - failures are logged but don't block operation
-        log(`🗑️  Creating TTL indexes for instance ${instanceId}...`)
-        const ttlResults = await Promise.allSettled(
-            ttlIndexes.map(idx => createIndexWithRetry(idx, 2))
-        )
-        
-        const failedTTL = ttlResults
-            .map((result, i) => ({ result, index: ttlIndexes[i] }))
-            .filter(({ result }) => result.status === 'rejected' || (result.status === 'fulfilled' && !result.value.success))
-        
-        if (failedTTL.length > 0) {
-            console.warn(`⚠️  Some TTL indexes failed: ${failedTTL.map(({ index }) => index.name).join(', ')} - automatic data cleanup may not work`)
-        }
-        
-        const totalCreated = criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length - failedOptimization.length - failedTTL.length
-        console.log(`✅ Index creation completed for instance ${instanceId}: ${totalCreated}/${criticalIndexes.length + optimizationIndexes.length + ttlIndexes.length} indexes created`)
-        
-        // Verify TTL indexes if monitoring is enabled
-        if (ttlMonitor && failedTTL.length === 0) {
-            log('[TTL Monitor] Verifying TTL indexes...')
-            const verificationResults = await Promise.all([
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}chats`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
-                // groupMetadata - removed from TTL verification (no TTL)
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`)
-                // labels - removed from TTL verification (no TTL)
-                // labelAssociations - removed from TTL verification (no TTL)
-            ])
+        // Detailed logging if any indexes were created
+        if (totalCreated > 0) {
+            if (indexConfig.enableIndexHealthLogging) {
+                console.log('📋 Index creation details:')
+                createResults.forEach(result => {
+                    if (result.created > 0) {
+                        console.log(`   ${result.collection}: ${result.created} created`)
+                    }
+                })
+            }
             
-            const invalidTTL = verificationResults.filter(r => !r.isValid)
-            if (invalidTTL.length > 0) {
-                logWarn(`[TTL Monitor] Found ${invalidTTL.length} invalid TTL indexes:`, invalidTTL.map(r => r.collection))
+            // Clear collection cache since new collections may have been created
+            clearCollectionCache()
+            if (indexConfig.enableIndexHealthLogging) {
+                console.log('🧹 Cleared collection cache after index creation')
+            }
+        }
+        
+        // Verify TTL indexes if monitoring is enabled and TTL indexes were created
+        if (ttlMonitor && totalCreated > 0) {
+            const ttlCollections = ['chats', 'contacts', 'messages', 'presences']
+            const createdTTLCollections = createResults
+                .filter(r => r.created > 0 && ttlCollections.includes(r.collection))
+                .map(r => r.collection)
+            
+            if (createdTTLCollections.length > 0) {
+                log('[TTL Monitor] Verifying newly created TTL indexes...')
+                const verificationPromises = createdTTLCollections.map(collectionName => 
+                    ttlMonitor.verifyTTLIndex(`${collectionPrefix}${collectionName}`)
+                )
+                
+                const verificationResults = await Promise.all(verificationPromises)
+                const invalidTTL = verificationResults.filter(r => !r.isValid)
+                
+                if (invalidTTL.length > 0) {
+                    console.warn(`[TTL Monitor] Found ${invalidTTL.length} invalid TTL indexes:`, invalidTTL.map(r => r.collection))
+                } else {
+                    log('[TTL Monitor] ✅ All newly created TTL indexes verified successfully')
+                }
             } else {
-                log('[TTL Monitor] All TTL indexes verified successfully')
+                log('[TTL Monitor] No new TTL indexes to verify')
             }
         }
     }
@@ -3118,16 +3224,74 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         },
         
         async recreateIndexes(): Promise<{ created: number; failed: number; details: string[] }> {
-            const results: string[] = []
-            try {
-                await createIndexes()
-                const totalIndexes = 18 // Total number of indexes we try to create
-                results.push(`Index recreation completed successfully`)
-                return { created: totalIndexes, failed: 0, details: results }
-            } catch (error) {
-                results.push(`Index recreation failed: ${error}`)
-                throw error
-            }
+            return withConnection(async () => {
+                let totalCreated = 0
+                let totalFailed = 0
+                const allDetails: string[] = []
+                
+                // Define index definitions (same as in createIndexes)
+                const ttlSeconds = ttlDays * 24 * 60 * 60
+                const indexDefinitions: Record<string, IndexSpec[]> = {
+                    chats: [
+                        { name: 'chats_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'chats_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                    ],
+                    contacts: [
+                        { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                    ],
+                    messages: [
+                        { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
+                        { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
+                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                    ],
+                    groupMetadata: [
+                        { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                    ],
+                    state: [
+                        { name: 'state_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                    ],
+                    presences: [
+                        { name: 'presences_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'presences_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                    ],
+                    labels: [
+                        { name: 'labels_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                    ],
+                    labelAssociations: [
+                        { name: 'labelAssociations_primary', spec: { instanceId: 1, chatId: 1, messageId: 1, labelId: 1 }, options: { unique: true } },
+                        { name: 'labelAssociations_chatId_labelId', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: {} },
+                        { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} }
+                    ]
+                }
+                
+                // Process each collection
+                for (const [collectionName, requiredIndexes] of Object.entries(indexDefinitions)) {
+                    try {
+                        const collection = collections[collectionName as keyof MongoCollections]
+                        
+                        // Apply timeout to indexes
+                        const timedIndexes = requiredIndexes.map(idx => ({
+                            ...idx,
+                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                        }))
+                        
+                        const result = await recreateIndexes(collection, timedIndexes)
+                        totalCreated += result.successful
+                        totalFailed += result.failed
+                        
+                        result.details.forEach(detail => {
+                            allDetails.push(`${collectionName}: ${detail}`)
+                        })
+                    } catch (error) {
+                        const errorMsg = `${collectionName}: Recreation failed - ${error}`
+                        allDetails.push(errorMsg)
+                        totalFailed += 1
+                    }
+                }
+                
+                return { created: totalCreated, failed: totalFailed, details: allDetails }
+            })
         },
 
         async getIndexStatus(): Promise<{ collection: string; indexes: any[] }[]> {

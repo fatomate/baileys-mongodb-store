@@ -41,8 +41,8 @@ import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
-import { safeDropIndex, safeCreateIndex } from './utils/indexHelper'
-import { IndexLockManager } from './utils/indexLock'
+import { safeDropIndex, safeCreateIndex, batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
+import { shouldCreateIndexes, IndexSpec, IndexCheckResult, clearCollectionCache } from './utils/collectionHelper'
 // @ts-ignore - Type is used in annotations
 import type { ConnectionConfig } from './types/connection'
 import { EventEmitter } from 'events'
@@ -523,8 +523,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         lidHandler: lidHandlerConfig,
         connectionConfig,
         useSharedConnections = true,
-        profilePictureConfig
+        profilePictureConfig,
+        indexManagement
     } = config
+    
+    // Configure smart index management with defaults
+    const indexConfig = {
+        skipExistingCollectionIndexes: indexManagement?.skipExistingCollectionIndexes ?? true,
+        forceRecreateIndexes: indexManagement?.forceRecreateIndexes ?? false,
+        enableIndexHealthLogging: indexManagement?.enableIndexHealthLogging ?? true,
+        indexCreationTimeout: indexManagement?.indexCreationTimeout ?? 30000
+    }
     
     // Socket can be set later using setSock() method
     let sock = config.sock || null
@@ -581,51 +590,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         CONNECTING = 'connecting',
         CONNECTED = 'connected',
         RECONNECTING = 'reconnecting',
-        DISCONNECTING = 'disconnecting',
         FAILED = 'failed'
     }
     
     let mongoConnectionState = MongoConnectionState.DISCONNECTED
     const connectionStateEmitter = new EventEmitter()
     // Fix EventEmitter memory leak warning by setting reasonable limit
-    connectionStateEmitter.setMaxListeners(100)
-    
-    // Track listeners for cleanup
-    const activeListeners = new Map<string, { event: string, handler: (...args: any[]) => void }>()
-    
-    // Enhanced listener management - commented out for future use when needed
-    // const addManagedListener = (event: string, handler: (...args: any[]) => void): string => {
-    //     const wrappedHandler = (...args: any[]) => {
-    //         try {
-    //             return handler(...args)
-    //         } catch (error) {
-    //             logError(`Error in event handler for ${event}:`, error)
-    //         }
-    //     }
-    //     
-    //     const listenerId = `${event}_${Date.now()}_${Math.random()}`
-    //     activeListeners.set(listenerId, { event, handler: wrappedHandler })
-    //     
-    //     connectionStateEmitter.on(event, wrappedHandler)
-    //     
-    //     return listenerId
-    // }
-    // 
-    // const removeManagedListener = (listenerId: string): void => {
-    //     const listener = activeListeners.get(listenerId)
-    //     if (listener) {
-    //         connectionStateEmitter.off(listener.event, listener.handler)
-    //         activeListeners.delete(listenerId)
-    //     }
-    // }
-    
-    const cleanupAllListeners = (): void => {
-        for (const [_listenerId, listener] of activeListeners) {
-            connectionStateEmitter.off(listener.event, listener.handler)
-        }
-        activeListeners.clear()
-        connectionStateEmitter.removeAllListeners()
-    }
+    connectionStateEmitter.setMaxListeners(50)
     
     // Initialize health monitor
     const healthMonitor = new ConnectionHealthMonitor({
@@ -660,10 +631,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
-            mongoConnectionState = MongoConnectionState.CONNECTED
-            
-            // Start health monitoring for shared connection
-            healthMonitor.startMonitoring(db)
             
             log(`Using shared connection for instance ${instanceId}`)
         } catch (error) {
@@ -678,12 +645,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
             await client.connect()
             db = client.db(dbName)
-            mongoConnectionState = MongoConnectionState.CONNECTED
             isUsingSharedConnection = false
             connectionManager = null
-            
-            // Start health monitoring for fallback connection
-            healthMonitor.startMonitoring(db)
         }
     } else {
         // Use dedicated connection (original behavior)
@@ -734,9 +697,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Don't throw - LID handler is optional
         }
     }
-    
-    // Initialize index lock manager for distributed index operations
-    const indexLockManager = new IndexLockManager(db, validatedInstanceId, collectionPrefix)
     
     // Get collections
     const getCollections = (): MongoCollections => {
@@ -820,21 +780,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Re-initialize LID handler if needed with retry
                     if (lidHandler) {
-                        try {
-                            const reinitResult = await retryWithBackoff(
-                                () => lidHandler!.initialize(db, collectionPrefix),
-                                { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
-                                (attempt, error, delay) => {
-                                    log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
-                                }
-                            )
-                            if (!reinitResult.success) {
-                                logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
-                            } else {
-                                log('[LID Handler] Successfully re-initialized after reconnection')
+                        const reinitResult = await retryWithBackoff(
+                            () => lidHandler!.initialize(db, collectionPrefix),
+                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+                            (attempt, error, delay) => {
+                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
                             }
-                        } catch (error) {
-                            logWarn('[LID Handler] Error during re-initialization:', error)
+                        )
+                        if (!reinitResult.success) {
+                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
                         }
                     }
                     
@@ -863,21 +817,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     // Re-initialize LID handler if needed with retry
                     if (lidHandler) {
-                        try {
-                            const reinitResult = await retryWithBackoff(
-                                () => lidHandler!.initialize(db, collectionPrefix),
-                                { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
-                                (attempt, error, delay) => {
-                                    log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
-                                }
-                            )
-                            if (!reinitResult.success) {
-                                logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
-                            } else {
-                                log('[LID Handler] Successfully re-initialized after reconnection')
+                        const reinitResult = await retryWithBackoff(
+                            () => lidHandler!.initialize(db, collectionPrefix),
+                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+                            (attempt, error, delay) => {
+                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
                             }
-                        } catch (error) {
-                            logWarn('[LID Handler] Error during re-initialization:', error)
+                        )
+                        if (!reinitResult.success) {
+                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
                         }
                     }
                     
@@ -911,12 +859,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Re-initialize LID handler if needed
                 if (lidHandler) {
-                    try {
-                        await lidHandler.initialize(db, collectionPrefix)
-                        log('[LID Handler] Successfully re-initialized after reconnection')
-                    } catch (error) {
-                        logWarn('[LID Handler] Error during re-initialization:', error)
-                    }
+                    await lidHandler.initialize(db, collectionPrefix)
                 }
                 
                 reconnectAttempts = 0
@@ -943,16 +886,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         operation: () => Promise<T>,
         retryOptions?: Partial<RetryOptions>
     ): Promise<T> => {
-        // Check if store is closing or closed
-        if (isClosing) {
-            throw new Error('Store is closing, operation cancelled')
-        }
-        
-        if (mongoConnectionState === MongoConnectionState.DISCONNECTING ||
-            mongoConnectionState === MongoConnectionState.DISCONNECTED) {
-            throw new Error('Store is disconnected, operation cancelled')
-        }
-        
         const startTime = Date.now()
         
         // Define retry options with defaults
@@ -963,62 +896,34 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             factor: retryOptions?.factor ?? 2,
             jitter: retryOptions?.jitter ?? true,
             shouldRetry: (error: any) => {
-                // Don't retry if store is closing
-                if (isClosing || mongoConnectionState === MongoConnectionState.DISCONNECTING) {
-                    return false
-                }
-                
-                // Don't retry certain errors during shutdown
-                if (error.message?.includes('Store is closing') ||
-                    error.message?.includes('Store is disconnected') ||
-                    error.name === 'MongoPoolClosedError' ||
-                    error.message?.includes('Cannot use a session that has ended')) {
-                    return false
-                }
-                
                 // Use the default retry logic from connectionRetry
                 return isRetryableError(error)
             }
         }
         
-        try {
-            const result = await retryWithBackoff(
-                async () => {
-                    // Check again before operation
-                    if (isClosing) {
-                        throw new Error('Store is closing, operation cancelled')
-                    }
-                    
-                    await ensureConnection()
-                    return await operation()
-                },
-                options,
-                (attempt, error, delay) => {
-                    if (!isClosing) {
-                        logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
-                    }
-                }
-            )
-            
-            if (!result.success) {
-                logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
-                healthMonitor.recordFailure()
-                throw result.error
+        const result = await retryWithBackoff(
+            async () => {
+                await ensureConnection()
+                return await operation()
+            },
+            options,
+            (attempt, error, delay) => {
+                logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
             }
-            
-            // Track success metrics
-            const responseTime = Date.now() - startTime
-            trackActivity(responseTime)
-            healthMonitor.recordSuccess(responseTime)
-            
-            return result.result as T
-        } catch (error) {
-            // Don't log if we're closing
-            if (!isClosing) {
-                logError(`[withConnection] Operation failed:`, error)
-            }
-            throw error
+        )
+        
+        if (!result.success) {
+            logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
+            healthMonitor.recordFailure()
+            throw result.error
         }
+        
+        // Track success metrics
+        const responseTime = Date.now() - startTime
+        trackActivity(responseTime)
+        healthMonitor.recordSuccess(responseTime)
+        
+        return result.result as T
     }
     
     // Queue configuration
@@ -1608,59 +1513,34 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // const associationId = `${association.labelId}_${association.chatId || (association as any).messageId}`
             
             if (type === 'upsert') {
-                const filter: any = {
-                    instanceId: validatedInstanceId,
-                    type: association.type,
-                    chatId: association.chatId,
-                    labelId: association.labelId
-                }
-                if (association.type === 'label_message' && 'messageId' in association && (association as any).messageId) {
-                    filter.messageId = (association as any).messageId
-                }
-                try {
-                    await withConnection(async () =>
-                        collections.labelAssociations.replaceOne(
-                            filter,
-                            {
-                                ...association,
-                                instanceId: validatedInstanceId,
-                                updatedAt: new Date()
-                            },
-                            { upsert: true }
-                        )
+                await withConnection(async () =>
+                    collections.labelAssociations.replaceOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            labelId: association.labelId,
+                            chatId: association.chatId,
+                            messageId: (association as any).messageId
+                        },
+                        {
+                            ...association,
+                            instanceId: validatedInstanceId,
+                            updatedAt: new Date()
+                        },
+                        { upsert: true }
                     )
-                } catch (error: any) {
-                    if (error?.code === 11000 || (typeof error?.message === 'string' && error.message.includes('duplicate key'))) {
-                        await withConnection(async () =>
-                            collections.labelAssociations.updateOne(
-                                filter,
-                                {
-                                    $set: {
-                                        ...association,
-                                        instanceId: validatedInstanceId,
-                                        updatedAt: new Date()
-                                    }
-                                }
-                            )
-                        )
-                    } else {
-                        throw error
-                    }
-                }
+                )
+                
                 return { success: true }
             } else if (type === 'delete') {
-                const filter: any = {
-                    instanceId: validatedInstanceId,
-                    type: association.type,
-                    chatId: association.chatId,
-                    labelId: association.labelId
-                }
-                if (association.type === 'label_message' && 'messageId' in association && (association as any).messageId) {
-                    filter.messageId = (association as any).messageId
-                }
                 await withConnection(async () =>
-                    collections.labelAssociations.deleteOne(filter)
+                    collections.labelAssociations.deleteOne({
+                        instanceId: validatedInstanceId,
+                        labelId: association.labelId,
+                        chatId: association.chatId,
+                        messageId: (association as any).messageId
+                    })
                 )
+                
                 return { success: true }
             }
             
@@ -2448,39 +2328,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`[Label Queue] No existing documents found for ${association.chatId}/${association.labelId}`)
                         }
                         
-                        let result
-                        try {
-                            result = await withConnection(async () =>
-                                collections.labelAssociations.replaceOne(
-                                    filter,
-                                    {
-                                        ...association,
-                                        instanceId,
-                                        updatedAt: new Date()
-                                    },
-                                    { upsert: true }
-                                )
+                        const result = await withConnection(async () =>
+                            collections.labelAssociations.replaceOne(
+                                filter,
+                                {
+                                    ...association,
+                                    instanceId,
+                                    updatedAt: new Date()
+                                },
+                                { upsert: true }
                             )
-                        } catch (error: any) {
-                            if (error?.code === 11000 || (typeof error?.message === 'string' && error.message.includes('duplicate key'))) {
-                                await withConnection(async () =>
-                                    collections.labelAssociations.updateOne(
-                                        filter,
-                                        {
-                                            $set: {
-                                                ...association,
-                                                instanceId,
-                                                updatedAt: new Date()
-                                            }
-                                        }
-                                    )
-                                )
-                                // fabricate a minimal-like result to pass validation below
-                                result = { upsertedCount: 0, modifiedCount: 1 }
-                            } else {
-                                throw error
-                            }
-                        }
+                        )
                         
                         // Validate operation succeeded
                         if (result.upsertedCount === 0 && result.modifiedCount === 0) {
@@ -2918,211 +2776,240 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         }
     }
     
-    // Create indexes with custom TTL
+    // Smart index creation with collection existence checking and custom TTL
     const createIndexes = async () => {
-        // Sequential execution to prevent race conditions
-        log(`🔧 Starting sequential index creation for instance ${instanceId}...`)
+        // Migration: Drop obsolete TTL indexes from collections that should persist indefinitely
+        const migrationPromises = [
+            withConnection(async () => safeDropIndex(collections.groupMetadata, 'updatedAt_1')).catch(() => {}),
+            withConnection(async () => safeDropIndex(collections.labels, 'updatedAt_1')).catch(() => {}),
+            withConnection(async () => safeDropIndex(collections.labelAssociations, 'updatedAt_1')).catch(() => {})
+        ]
         
-        // Chats indexes with distributed lock
-        const chatsTTL = getTTLForCollection('chats') * 24 * 60 * 60
-        await indexLockManager.withLock(
-            `${collectionPrefix}chats`,
-            async () => withConnection(async () => {
-                await safeCreateIndex(collections.chats, { instanceId: 1, id: 1 }, { unique: true })
-                await safeCreateIndex(collections.chats, { updatedAt: 1 }, { expireAfterSeconds: chatsTTL })
-            }),
-            15000 // 15 second timeout for lock acquisition
-        )
+        await Promise.all(migrationPromises)
+        log('🔄 Migration completed: Removed obsolete TTL indexes')
         
-        // Contacts indexes with distributed lock
-        const contactsTTL = getTTLForCollection('contacts') * 24 * 60 * 60
-        await indexLockManager.withLock(
-            `${collectionPrefix}contacts`,
-            async () => withConnection(async () => {
-                await safeCreateIndex(collections.contacts, { instanceId: 1, id: 1 }, { unique: true })
-                await safeCreateIndex(collections.contacts, { updatedAt: 1 }, { expireAfterSeconds: contactsTTL })
-            }),
-            15000
-        )
+        // Define all indexes by collection with standardized format
+        const indexDefinitions: Record<string, IndexSpec[]> = {
+            chats: [
+                { name: 'chats_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                { name: 'chats_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('chats') * 24 * 60 * 60 } }
+            ],
+            contacts: [
+                { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('contacts') * 24 * 60 * 60 } }
+            ],
+            messages: [
+                { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
+                { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
+                { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
+                { name: 'messages_media_dedup', spec: { instanceId: 1, mediaHash: 1 }, options: { sparse: true } },
+                { name: 'messages_remote_fallback', spec: { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }, options: {} },
+                { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} }
+            ],
+            groupMetadata: [
+                { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                // No TTL - persists indefinitely
+            ],
+            state: [
+                { name: 'state_primary', spec: { instanceId: 1 }, options: { unique: true } },
+                { name: 'state_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('state') * 24 * 60 * 60 } }
+            ],
+            presences: [
+                { name: 'presences_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                { name: 'presences_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('presences') * 24 * 60 * 60 } }
+            ],
+            labels: [
+                { name: 'labels_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                // No TTL - persists indefinitely
+            ],
+            labelAssociations: [
+                { name: 'label_assoc_primary', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true } }
+                // No TTL - persists indefinitely
+            ]
+        }
         
-        // Messages indexes with distributed lock
-        const messagesTTL = getTTLForCollection('messages') * 24 * 60 * 60
-        await indexLockManager.withLock(
-            `${collectionPrefix}messages`,
-            async () => withConnection(async () => {
-                await safeCreateIndex(collections.messages, { instanceId: 1, jid: 1, 'key.id': 1 }, { unique: true })
-                await safeCreateIndex(collections.messages, { instanceId: 1, jid: 1, messageTimestamp: -1 })
-                await safeCreateIndex(collections.messages, { updatedAt: 1 }, { expireAfterSeconds: messagesTTL })
-                // Index for media deduplication
-                await safeCreateIndex(collections.messages, { instanceId: 1, mediaHash: 1 }, { sparse: true })
-                // Compound index for fallback queries using key.remoteJid (optimized for poll messages and edge cases)
-                await safeCreateIndex(collections.messages, { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 })
-                // Dedicated index for direct key.id lookups (prevents inefficient index selection)
-                await safeCreateIndex(collections.messages, { instanceId: 1, 'key.id': 1 })
-            }),
-            15000
-        )
+        // Smart index creation logic with configuration support
+        const createResults: Array<{ collection: string, created: number, skipped: boolean, details: string[] }> = []
+        let totalCreated = 0
+        let totalSkipped = 0
         
-        // No TTL for groupMetadata - data persists indefinitely
-        // Drop existing TTL index if it exists (migration from older versions)
-        await indexLockManager.withLock(
-            `${collectionPrefix}groupMetadata`,
-            async () => withConnection(async () => {
-                // Execute all index operations sequentially within a single connection context
-                await safeDropIndex(collections.groupMetadata, 'updatedAt_1')
+        if (indexConfig.enableIndexHealthLogging) {
+            log(`🔧 Smart index management for enhanced instance ${instanceId}...`)
+            log(`   Settings: skipExisting=${indexConfig.skipExistingCollectionIndexes}, forceRecreate=${indexConfig.forceRecreateIndexes}`)
+        }
+        
+        // Process each collection
+        for (const [collectionName, requiredIndexes] of Object.entries(indexDefinitions)) {
+            try {
+                const collection = collections[collectionName as keyof typeof collections]
                 
-                // Create unique index without TTL
-                await safeCreateIndex(collections.groupMetadata, { instanceId: 1, id: 1 }, { unique: true })
-            }),
-            15000 // 15 second timeout for lock acquisition
-        )
-        // TTL index removed - groupMetadata will persist until explicitly deleted
-        
-        // State indexes
-        const stateTTL = getTTLForCollection('state') * 24 * 60 * 60
-        await indexLockManager.withLock(
-            `${collectionPrefix}state`,
-            async () => withConnection(async () => {
-                await safeCreateIndex(collections.state, { instanceId: 1 }, { unique: true })
-                await safeCreateIndex(collections.state, { updatedAt: 1 }, { expireAfterSeconds: stateTTL })
-            }),
-            15000 // 15 second timeout for lock acquisition
-        )
-        
-        // Presences indexes
-        const presencesTTL = getTTLForCollection('presences') * 24 * 60 * 60
-        await indexLockManager.withLock(
-            `${collectionPrefix}presences`,
-            async () => withConnection(async () => {
-                await safeCreateIndex(collections.presences, { instanceId: 1, id: 1 }, { unique: true })
-                await safeCreateIndex(collections.presences, { updatedAt: 1 }, { expireAfterSeconds: presencesTTL })
-            }),
-            15000 // 15 second timeout for lock acquisition
-        )
-        
-        // No TTL for labels - data persists indefinitely
-        // Drop existing TTL index if it exists (migration from older versions)
-        await indexLockManager.withLock(
-            `${collectionPrefix}labels`,
-            async () => withConnection(async () => {
-                // Execute all index operations sequentially within a single connection context
-                await safeDropIndex(collections.labels, 'updatedAt_1')
-                
-                // Create unique index without TTL
-                await safeCreateIndex(collections.labels, { instanceId: 1, id: 1 }, { unique: true })
-            }),
-            15000 // 15 second timeout for lock acquisition
-        )
-        // TTL index removed - labels will persist until explicitly deleted
-        
-        // No TTL for labelAssociations - data persists indefinitely
-        // Drop legacy indexes and create partial unique indexes for proper uniqueness semantics
-        await indexLockManager.withLock(
-            `${collectionPrefix}labelAssociations`,
-            async () => withConnection(async () => {
-                // Execute all index operations sequentially within a single connection context
-                // Drop legacy indexes first
-                await safeDropIndex(collections.labelAssociations, 'updatedAt_1')
-                
-                // Legacy unique index without type field (causes E11000 when mixing types)
-                await safeDropIndex(collections.labelAssociations, 'instanceId_1_chatId_1_labelId_1')
-                
-                // Previous unique index without messageId (blocks multiple message labels per chat)
-                await safeDropIndex(collections.labelAssociations, 'instanceId_1_type_1_chatId_1_labelId_1')
-                
-                // Create partial unique index for chat-level labels (label_jid)
-                await safeCreateIndex(
-                    collections.labelAssociations,
-                    { instanceId: 1, type: 1, chatId: 1, labelId: 1 },
-                    { 
-                        unique: true, 
-                        name: 'label_jid_unique_partial',
-                        partialFilterExpression: { type: 'label_jid' } 
+                // Handle force recreation mode
+                if (indexConfig.forceRecreateIndexes) {
+                    if (indexConfig.enableIndexHealthLogging) {
+                        log(`🔄 Collection ${collectionName}: Force recreating all ${requiredIndexes.length} indexes`)
                     }
-                )
-                
-                // Create partial unique index for message-level labels (label_message)
-                await safeCreateIndex(
-                    collections.labelAssociations,
-                    { instanceId: 1, type: 1, chatId: 1, labelId: 1, messageId: 1 },
-                    { 
-                        unique: true, 
-                        name: 'label_message_unique_partial',
-                        partialFilterExpression: { type: 'label_message' } 
+                    
+                    // Force recreate: drop and recreate all indexes with timeout applied
+                    const timedIndexes = requiredIndexes.map(idx => ({
+                        ...idx,
+                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                    }))
+                    const batchResult = await withConnection(() => 
+                        recreateIndexes(collection, timedIndexes)
+                    )
+                    
+                    createResults.push({
+                        collection: collectionName,
+                        created: batchResult.successful,
+                        skipped: false,
+                        details: batchResult.details
+                    })
+                    totalCreated += batchResult.successful
+                } else if (indexConfig.skipExistingCollectionIndexes) {
+                    // Smart mode: check what indexes are needed
+                    const checkResult = await shouldCreateIndexes(collection, requiredIndexes)
+                    
+                    if (checkResult.missingIndexes.length === 0) {
+                        if (indexConfig.enableIndexHealthLogging) {
+                            log(`✅ Collection ${collectionName}: All ${checkResult.requiredCount} indexes exist, skipping creation`)
+                        }
+                        createResults.push({
+                            collection: collectionName,
+                            created: 0,
+                            skipped: true,
+                            details: [`All ${checkResult.requiredCount} indexes already exist`]
+                        })
+                        totalSkipped += checkResult.requiredCount
+                    } else {
+                        const missingCount = checkResult.missingIndexes.length
+                        const action = checkResult.collectionExists ? 'Creating missing' : 'Creating all'
+                        if (indexConfig.enableIndexHealthLogging) {
+                            log(`🔨 Collection ${collectionName}: ${action} ${missingCount} indexes`)
+                        }
+                        
+                        // Create missing indexes using batch operation with timeout applied
+                        const timedMissingIndexes = checkResult.missingIndexes.map(idx => ({
+                            ...idx,
+                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                        }))
+                        const batchResult = await withConnection(() => 
+                            batchCreateIndexes(collection, timedMissingIndexes)
+                        )
+                        
+                        createResults.push({
+                            collection: collectionName,
+                            created: batchResult.successful,
+                            skipped: false,
+                            details: batchResult.details
+                        })
+                        
+                        totalCreated += batchResult.successful
+                        
+                        // Critical indexes must succeed (unique and primary key indexes)
+                        const createdNames = new Set(
+                            batchResult.details
+                                .filter(d => d.startsWith('✅ Created index: '))
+                                .map(d => d.replace('✅ Created index: ', '').trim())
+                        )
+                        const criticalIndexes = checkResult.missingIndexes.filter(idx => 
+                            idx.options?.unique || /primary|unique/i.test(idx.name)
+                        )
+                        const failedCriticalIndexes = criticalIndexes.filter(idx => !createdNames.has(idx.name))
+                        
+                        if (batchResult.failed > 0) {
+                            if (failedCriticalIndexes.length > 0) {
+                                throw new Error(`Critical indexes failed for ${collectionName}: ${failedCriticalIndexes.map(idx => idx.name).join(', ')}`)
+                            } else {
+                                console.warn(`⚠️ Some non-critical indexes failed for ${collectionName}: ${batchResult.failed} failures`)
+                            }
+                        }
                     }
-                )
-            }),
-            15000 // 15 second timeout for lock acquisition
-        )
-        // Indexes updated - labelAssociations will persist until explicitly deleted
+                } else {
+                    // Legacy mode: create all indexes without smart checking
+                    if (indexConfig.enableIndexHealthLogging) {
+                        log(`🔧 Collection ${collectionName}: Creating all ${requiredIndexes.length} indexes (legacy mode)`)
+                    }
+                    
+                    // Apply timeout to all indexes for legacy mode
+                    const timedIndexes = requiredIndexes.map(idx => ({
+                        ...idx,
+                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                    }))
+                    const batchResult = await withConnection(() => 
+                        batchCreateIndexes(collection, timedIndexes)
+                    )
+                    
+                    createResults.push({
+                        collection: collectionName,
+                        created: batchResult.successful,
+                        skipped: false,
+                        details: batchResult.details
+                    })
+                    totalCreated += batchResult.successful
+                }
+            } catch (error) {
+                console.error(`❌ Failed to process indexes for collection ${collectionName}:`, error)
+                throw error // Re-throw to halt initialization if critical
+            }
+        }
         
-        log(`✅ All indexes created successfully with custom TTL settings for instance ${instanceId}`)
+        // Summary logging
+        const totalRequired = Object.values(indexDefinitions).reduce((sum, indexes) => sum + indexes.length, 0)
+        if (indexConfig.enableIndexHealthLogging) {
+            log(`✅ Smart enhanced index management completed for instance ${instanceId}:`)
+            log(`   📊 Total indexes: ${totalRequired} required`)
+            log(`   🔨 Created: ${totalCreated}`)
+            log(`   ⏭️  Skipped (existing): ${totalSkipped}`)
+            log(`   📈 Efficiency: ${Math.round((totalSkipped / totalRequired) * 100)}% reduction in index operations`)
+        }
         
-        // Verify TTL indexes if monitoring is enabled
-        if (ttlMonitor) {
-            log('[TTL Monitor] Verifying TTL indexes...')
-            const verificationResults = await Promise.all([
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}chats`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}contacts`),
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}messages`),
-                // groupMetadata - removed from TTL verification (no TTL)
-                ttlMonitor.verifyTTLIndex(`${collectionPrefix}presences`)
-                // labels - removed from TTL verification (no TTL)
-                // labelAssociations - removed from TTL verification (no TTL)
-            ])
+        // Detailed logging if any indexes were created
+        if (totalCreated > 0) {
+            if (indexConfig.enableIndexHealthLogging) {
+                log('📋 Enhanced index creation details:')
+                createResults.forEach(result => {
+                    if (result.created > 0) {
+                        log(`   ${result.collection}: ${result.created} created`)
+                    }
+                })
+            }
             
-            const invalidTTL = verificationResults.filter(r => !r.isValid)
-            if (invalidTTL.length > 0) {
-                logWarn(`[TTL Monitor] Found ${invalidTTL.length} invalid TTL indexes:`, invalidTTL.map(r => r.collection))
+            // Clear collection cache since new collections may have been created
+            clearCollectionCache()
+            if (indexConfig.enableIndexHealthLogging) {
+                log('🧹 Cleared collection cache after index creation')
+            }
+        }
+        
+        // Verify TTL indexes if monitoring is enabled and TTL indexes were created
+        if (ttlMonitor && totalCreated > 0) {
+            const ttlCollections = ['chats', 'contacts', 'messages', 'state', 'presences']
+            const createdTTLCollections = createResults
+                .filter(r => r.created > 0 && ttlCollections.includes(r.collection))
+                .map(r => r.collection)
+            
+            if (createdTTLCollections.length > 0) {
+                log('[TTL Monitor] Verifying newly created TTL indexes...')
+                const verificationPromises = createdTTLCollections.map(collectionName => 
+                    ttlMonitor.verifyTTLIndex(`${collectionPrefix}${collectionName}`)
+                )
+                
+                const verificationResults = await Promise.all(verificationPromises)
+                const invalidTTL = verificationResults.filter(r => !r.isValid)
+                
+                if (invalidTTL.length > 0) {
+                    logWarn(`[TTL Monitor] Found ${invalidTTL.length} invalid TTL indexes:`, invalidTTL.map(r => r.collection))
+                } else {
+                    log('[TTL Monitor] ✅ All newly created TTL indexes verified successfully')
+                }
             } else {
-                log('[TTL Monitor] All TTL indexes verified successfully')
+                log('[TTL Monitor] No new TTL indexes to verify')
             }
         }
     }
     
     // Initialize indexes
     await createIndexes()
-    
-    // Verify critical indexes were created successfully
-    try {
-        const allIndexes = await withConnection(async () => {
-            const labelAssocIndexes = await collections.labelAssociations.listIndexes().toArray()
-            return labelAssocIndexes
-        })
-        
-        // Check for the critical partial unique indexes
-        const hasLabelJidIndex = allIndexes.some(idx => 
-            idx.name === 'label_jid_unique_partial'
-        )
-        const hasLabelMessageIndex = allIndexes.some(idx => 
-            idx.name === 'label_message_unique_partial'
-        )
-        
-        if (!hasLabelJidIndex || !hasLabelMessageIndex) {
-            const existingIndexNames = allIndexes.map(idx => idx.name).filter(name => name !== '_id_')
-            logWarn(`⚠️ Missing expected partial unique indexes on labelAssociations collection.`)
-            logWarn(`  Expected: label_jid_unique_partial, label_message_unique_partial`)
-            logWarn(`  Found: ${existingIndexNames.join(', ') || 'none'}`)
-            
-            // Log details of any indexes with similar key patterns
-            const similarIndexes = allIndexes.filter(idx => {
-                const keyStr = JSON.stringify(idx.key)
-                return keyStr.includes('instanceId') && keyStr.includes('type') && 
-                       keyStr.includes('chatId') && keyStr.includes('labelId')
-            })
-            
-            if (similarIndexes.length > 0) {
-                logWarn(`  Indexes with similar key patterns:`)
-                similarIndexes.forEach(idx => {
-                    logWarn(`    - ${idx.name}: ${JSON.stringify(idx.key)}`)
-                })
-            }
-        } else {
-            log(`✅ Verified labelAssociations partial unique indexes are present`)
-        }
-    } catch (verifyError) {
-        logWarn(`⚠️ Could not verify labelAssociations indexes:`, verifyError)
-    }
     
     // Track binding state to prevent duplicate bindings
     let isBound = false
@@ -4552,38 +4439,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 filter.messageId = association.messageId
             }
             
-            let result
-            try {
-                result = await withConnection(async () =>
-                    collections.labelAssociations.replaceOne(
-                        filter,
-                        {
-                            ...association,
-                            instanceId,
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
-                    )
+            const result = await withConnection(async () =>
+                collections.labelAssociations.replaceOne(
+                    filter,
+                    {
+                        ...association,
+                        instanceId,
+                        updatedAt: new Date()
+                    },
+                    { upsert: true }
                 )
-            } catch (error: any) {
-                if (error?.code === 11000 || (typeof error?.message === 'string' && error.message.includes('duplicate key'))) {
-                    await withConnection(async () =>
-                        collections.labelAssociations.updateOne(
-                            filter,
-                            {
-                                $set: {
-                                    ...association,
-                                    instanceId,
-                                    updatedAt: new Date()
-                                }
-                            }
-                        )
-                    )
-                    result = { upsertedCount: 0, modifiedCount: 1 }
-                } else {
-                    throw error
-                }
-            }
+            )
             
             // Validate operation succeeded
             if (result.upsertedCount === 0 && result.modifiedCount === 0) {
@@ -5576,35 +5442,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         // Health check method for store and database connection
         async isHealthy(): Promise<boolean> {
-            // Check closing state first
-            if (isClosing || mongoConnectionState === MongoConnectionState.DISCONNECTING) {
-                return false // Not healthy if closing
-            }
-            
-            if (mongoConnectionState !== MongoConnectionState.CONNECTED) {
-                return false
-            }
-            
             try {
-                // Perform actual health check with timeout
-                const healthCheckPromise = db.admin().ping()
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Health check timeout')), 5000)
-                )
+                // Check MongoDB connection state
+                if (mongoConnectionState !== MongoConnectionState.CONNECTED) {
+                    log(`[${instanceId}] Health check failed: MongoDB not connected`)
+                    return false
+                }
                 
-                await Promise.race([healthCheckPromise, timeoutPromise])
+                // Ping the database to ensure it's responsive
+                await db.admin().ping()
                 
                 // Check Redis connection if Bull is initialized
                 if (bullInitialized && redisConnection) {
                     await redisConnection.ping()
                 }
                 
+                log(`[${instanceId}] Health check passed`)
                 return true
             } catch (error) {
-                // Don't log if we're closing
-                if (!isClosing) {
-                    logError(`[${instanceId}] Health check failed:`, error)
-                }
+                logError(`[${instanceId}] Health check failed:`, error)
                 return false
             }
         },
@@ -5908,12 +5764,74 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         
         async recreateIndexes(): Promise<{ created: number; failed: number; details: string[] }> {
-            try {
-                await createIndexes()
-                return { created: 16, failed: 0, details: ['All indexes recreated successfully'] }
-            } catch (error) {
-                return { created: 0, failed: 16, details: [`Index recreation failed: ${error}`] }
-            }
+            return withConnection(async () => {
+                let totalCreated = 0
+                let totalFailed = 0
+                const allDetails: string[] = []
+                
+                // Define index definitions (same as in createIndexes)
+                const indexDefinitions: Record<string, IndexSpec[]> = {
+                    chats: [
+                        { name: 'chats_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'chats_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('chats') * 24 * 60 * 60 } }
+                    ],
+                    contacts: [
+                        { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('contacts') * 24 * 60 * 60 } }
+                    ],
+                    messages: [
+                        { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
+                        { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
+                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } }
+                    ],
+                    groupMetadata: [
+                        { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                    ],
+                    state: [
+                        { name: 'state_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'state_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('state') * 24 * 60 * 60 } }
+                    ],
+                    presences: [
+                        { name: 'presences_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'presences_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('presences') * 24 * 60 * 60 } }
+                    ],
+                    labels: [
+                        { name: 'labels_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
+                    ],
+                    labelAssociations: [
+                        { name: 'labelAssociations_primary', spec: { instanceId: 1, chatId: 1, messageId: 1, labelId: 1 }, options: { unique: true } },
+                        { name: 'labelAssociations_chatId_labelId', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: {} },
+                        { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} }
+                    ]
+                }
+                
+                // Process each collection
+                for (const [collectionName, requiredIndexes] of Object.entries(indexDefinitions)) {
+                    try {
+                        const collection = collections[collectionName as keyof typeof collections]
+                        
+                        // Apply timeout to indexes
+                        const timedIndexes = requiredIndexes.map(idx => ({
+                            ...idx,
+                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
+                        }))
+                        
+                        const result = await recreateIndexes(collection, timedIndexes)
+                        totalCreated += result.successful
+                        totalFailed += result.failed
+                        
+                        result.details.forEach(detail => {
+                            allDetails.push(`${collectionName}: ${detail}`)
+                        })
+                    } catch (error) {
+                        const errorMsg = `${collectionName}: Recreation failed - ${error}`
+                        allDetails.push(errorMsg)
+                        totalFailed += 1
+                    }
+                }
+                
+                return { created: totalCreated, failed: totalFailed, details: allDetails }
+            })
         },
 
         async getIndexStatus(): Promise<{ collection: string; indexes: any[] }[]> {
@@ -5945,73 +5863,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             return indexStatus
-        },
-
-        async verifyExpectedIndexes(): Promise<{
-            collection: string
-            missing: string[]
-            unexpected: string[]
-            correct: string[]
-        }[]> {
-            // Define expected indexes for each collection
-            const expectedIndexes: Record<string, string[]> = {
-                chats: ['instanceId_1_id_1'],
-                contacts: ['instanceId_1_id_1'],
-                messages: [
-                    'instanceId_1_jid_1_key.id_1',
-                    'instanceId_1_key.id_1',
-                    'instanceId_1_key.remoteJid_1_key.id_1',
-                    'instanceId_1_jid_1_key.fromMe_-1_key.id_-1',
-                    'instanceId_1_messageTimestamp_-1',
-                    'instanceId_1_mediaHash_1'
-                ],
-                groupMetadata: ['instanceId_1_id_1'],
-                state: ['instanceId_1_type_1_subtype_1', 'instanceId_1_type_1_subtype_1_id_1'],
-                presences: ['instanceId_1_id_1', 'instanceId_1_id_1_participant_1'],
-                labels: ['instanceId_1_id_1'],
-                labelAssociations: [
-                    'label_jid_unique_partial',
-                    'label_message_unique_partial'
-                ]
-            }
-            
-            const status = await this.getIndexStatus()
-            const results = []
-            
-            for (const collName of Object.keys(expectedIndexes)) {
-                const fullCollName = `${collectionPrefix}${collName}`
-                const collectionStatus = status.find(s => s.collection === fullCollName)
-                
-                if (!collectionStatus) {
-                    results.push({
-                        collection: fullCollName,
-                        missing: expectedIndexes[collName],
-                        unexpected: [],
-                        correct: []
-                    })
-                    continue
-                }
-                
-                const existingIndexNames = collectionStatus.indexes
-                    .map(idx => idx.name)
-                    .filter(name => name !== '_id_') // Exclude default _id index
-                
-                const expected = expectedIndexes[collName]
-                const missing = expected.filter(name => !existingIndexNames.includes(name))
-                const unexpected = existingIndexNames.filter(name => 
-                    !expected.includes(name) && !name.endsWith('_ttl') // TTL indexes are dynamic
-                )
-                const correct = expected.filter(name => existingIndexNames.includes(name))
-                
-                results.push({
-                    collection: fullCollName,
-                    missing,
-                    unexpected,
-                    correct
-                })
-            }
-            
-            return results
         },
 
         async getTTLStatus(): Promise<any> {
@@ -6224,44 +6075,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         
         async close(): Promise<void> {
-            // Check if already closing to prevent duplicate close calls
-            if (isClosing) {
-                log(`[${instanceId}] Already closing, skipping duplicate close call`)
-                return
-            }
-            
             // Set closing flag to stop background operations
             isClosing = true
-            mongoConnectionState = MongoConnectionState.DISCONNECTING
-            
-            // Emit closing event to stop all pending operations
-            connectionStateEmitter.emit('closing')
-            
-            // Stop all background tasks FIRST
-            const cleanupTasks: Promise<any>[] = []
-            
-            // Clear history debounce timer and pending data
-            if (historyDebounceTimer) {
-                clearTimeout(historyDebounceTimer)
-                historyDebounceTimer = null
-                pendingHistoryData.length = 0
-            }
-            
-            // Cancel all pending operations
-            if (pendingOperations && pendingOperations.size > 0) {
-                log(`[${instanceId}] Cancelling ${pendingOperations.size} pending operations`)
-                for (const operation of pendingOperations) {
-                    // Operations are Promises, we can't cancel them directly but we track them
-                    cleanupTasks.push(
-                        operation.catch(() => {
-                            // Ignore errors during shutdown
-                            return null
-                        })
-                    )
-                }
-                pendingOperations.clear()
-                pendingOperationsMetadata.clear()
-            }
             
             // Unbind all event listeners to prevent memory leaks
             if (isBound && currentEventEmitter) {
@@ -6345,43 +6160,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 ttlMonitor = null
             }
             
-            // Wait for all cleanup tasks to complete
-            await Promise.allSettled(cleanupTasks)
-            
             // Handle connection cleanup based on connection type
             if (isUsingSharedConnection && connectionManager) {
-                try {
-                    // Unregister from connection manager
-                    await connectionManager.unregisterInstance(validatedInstanceId)
-                    // Wait for connection pool to actually close
-                    await new Promise(resolve => setTimeout(resolve, 100))
-                } catch (error) {
-                    logWarn(`Error unregistering from connection manager: ${(error as Error).message}`)
-                }
+                // Unregister from connection manager
+                await connectionManager.unregisterInstance(validatedInstanceId)
                 connectionManager = null
             } else if (client && !isUsingSharedConnection) {
-                try {
-                    // Close dedicated connection with force flag
-                    await client.close(true)
-                    // Wait for connection to fully close
-                    await new Promise(resolve => setTimeout(resolve, 100))
-                } catch (error) {
-                    logWarn(`Error closing MongoDB client: ${(error as Error).message}`)
-                }
+                // Close dedicated connection
+                await client.close()
             }
             
             // Reset connection state
             mongoConnectionState = MongoConnectionState.DISCONNECTED
             reconnectAttempts = 0
             
-            // Clean up all managed listeners and EventEmitter to prevent memory leaks
-            cleanupAllListeners()
+            // Clean up EventEmitter to prevent memory leaks
+            connectionStateEmitter.removeAllListeners()
             
-            // Reset all flags
+            // Reset binding state
             isBound = false
-            isClosing = false
-            
-            log(`[${instanceId}] Store closed successfully`)
         }
     }
 
