@@ -1,4 +1,4 @@
-import { Collection, Db } from 'mongodb'
+import { Db } from 'mongodb'
 
 export interface IndexSpec {
     name: string
@@ -161,13 +161,23 @@ export function findMissingIndexesEnhanced(existingIndexes: any[], requiredIndex
  * @param requiredIndexes Array of required index specifications
  * @returns Promise resolving to IndexCheckResult with creation strategy
  */
-export async function shouldCreateIndexes(collection: Collection, requiredIndexes: IndexSpec[]): Promise<IndexCheckResult> {
+export async function shouldCreateIndexes(collection: any, requiredIndexes: IndexSpec[]): Promise<IndexCheckResult> {
     try {
-        const db = collection.db
         const collectionName = collection.collectionName
         
-        // Check if collection exists
-        const collectionExists = await checkCollectionExists(db, collectionName)
+        // Attempt to determine if the collection exists when a Db instance is available.
+        // In MongoDB driver v6, Collection no longer exposes a public 'db' property,
+        // so we fallback to assuming the collection exists when 'db' is not available.
+        let collectionExists = true
+        try {
+            const maybeDb = (collection as any).db as Db | undefined
+            if (maybeDb) {
+                collectionExists = await checkCollectionExists(maybeDb, collectionName)
+            }
+        } catch (_err) {
+            // On any error, assume it exists and continue with safe behavior
+            collectionExists = true
+        }
         
         if (!collectionExists) {
             // New collection - create all indexes

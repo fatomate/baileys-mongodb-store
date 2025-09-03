@@ -34,7 +34,7 @@ import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
 import { LidHandler } from './utils/lidHandler'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
-import { shouldCreateIndexes, IndexSpec, IndexCheckResult, clearCollectionCache } from './utils/collectionHelper'
+import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
 import { batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
 
 const DEFAULT_TTL_DAYS = 30
@@ -1583,7 +1583,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     totalCreated += batchResult.successful
                 } else if (indexConfig.skipExistingCollectionIndexes) {
                     // Smart mode: check what indexes are needed
-                    const checkResult = await shouldCreateIndexes(collection, requiredIndexes)
+                    const checkResult = await shouldCreateIndexes(collection as any, requiredIndexes)
                     
                     if (checkResult.missingIndexes.length === 0) {
                         if (indexConfig.enableIndexHealthLogging) {
@@ -1698,7 +1698,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }
         
         // Verify TTL indexes if monitoring is enabled and TTL indexes were created
-        if (ttlMonitor && totalCreated > 0) {
+        if (ttlMonitor !== null && totalCreated > 0) {
             const ttlCollections = ['chats', 'contacts', 'messages', 'presences']
             const createdTTLCollections = createResults
                 .filter(r => r.created > 0 && ttlCollections.includes(r.collection))
@@ -1707,7 +1707,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             if (createdTTLCollections.length > 0) {
                 log('[TTL Monitor] Verifying newly created TTL indexes...')
                 const verificationPromises = createdTTLCollections.map(collectionName => 
-                    ttlMonitor.verifyTTLIndex(`${collectionPrefix}${collectionName}`)
+                    ttlMonitor!.verifyTTLIndex(`${collectionPrefix}${collectionName}`)
                 )
                 
                 const verificationResults = await Promise.all(verificationPromises)
