@@ -2867,7 +2867,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     totalCreated += batchResult.successful
                 } else if (indexConfig.skipExistingCollectionIndexes) {
                     // Smart mode: check what indexes are needed
-                    const checkResult = await shouldCreateIndexes(collection, requiredIndexes)
+                    const checkResult = await shouldCreateIndexes(collection as any, requiredIndexes)
                     
                     if (checkResult.missingIndexes.length === 0) {
                         if (indexConfig.enableIndexHealthLogging) {
@@ -2982,7 +2982,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         }
         
         // Verify TTL indexes if monitoring is enabled and TTL indexes were created
-        if (ttlMonitor && totalCreated > 0) {
+        if (ttlMonitor !== null && totalCreated > 0) {
             const ttlCollections = ['chats', 'contacts', 'messages', 'state', 'presences']
             const createdTTLCollections = createResults
                 .filter(r => r.created > 0 && ttlCollections.includes(r.collection))
