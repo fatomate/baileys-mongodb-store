@@ -15,7 +15,7 @@ import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
 import type { MongoDBStoreConfig, MongoDBStore } from './types'
 import NodeCache from 'node-cache'
 import PQueue from 'p-queue'
-import { Queue, Worker, Job } from 'bullmq'
+import * as BullMQ from 'bullmq'
 import Redis from 'ioredis'
 import { 
     validateJID, 
@@ -34,7 +34,7 @@ import type { ConnectionConfig } from './types/connection'
 import { TTLMonitor } from './utils/ttl'
 import { LidHandler } from './utils/lidHandler'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
-import { shouldCreateIndexes, IndexSpec, IndexCheckResult, clearCollectionCache } from './utils/collectionHelper'
+import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
 import { batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
 
 const DEFAULT_TTL_DAYS = 30
@@ -1707,7 +1707,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             if (createdTTLCollections.length > 0) {
                 log('[TTL Monitor] Verifying newly created TTL indexes...')
                 const verificationPromises = createdTTLCollections.map(collectionName => 
-                    ttlMonitor.verifyTTLIndex(`${collectionPrefix}${collectionName}`)
+                    ttlMonitor!.verifyTTLIndex(`${collectionPrefix}${collectionName}`)
                 )
                 
                 const verificationResults = await Promise.all(verificationPromises)

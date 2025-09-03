@@ -1,4 +1,4 @@
-import { Queue, Worker, Job, QueueEvents } from 'bullmq'
+import * as BullMQ from 'bullmq'
 import Redis from 'ioredis'
 import { EventEmitter } from 'events'
 

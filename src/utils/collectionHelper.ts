@@ -161,9 +161,9 @@ export function findMissingIndexesEnhanced(existingIndexes: any[], requiredIndex
  * @param requiredIndexes Array of required index specifications
  * @returns Promise resolving to IndexCheckResult with creation strategy
  */
-export async function shouldCreateIndexes(collection: Collection, requiredIndexes: IndexSpec[]): Promise<IndexCheckResult> {
+export async function shouldCreateIndexes(collection: Collection<any>, requiredIndexes: IndexSpec[]): Promise<IndexCheckResult> {
     try {
-        const db = collection.db
+        const db = (collection as any).db as Db
         const collectionName = collection.collectionName
         
         // Check if collection exists
