@@ -30,7 +30,8 @@ async function findIndexByKeyPattern(collection: Collection<any>, keyPattern: an
  * @param indexName The name of the index to drop
  * @returns Promise that resolves when the operation is complete
  */
-export async function safeDropIndex(collection: Collection<any>, indexName: string): Promise<void> {
+export async function safeDropIndex(collection: Collection<any>, indexName: string, options?: { silent?: boolean }): Promise<void> {
+    const silent = options?.silent === true
     const maxRetries = 3
     let retryCount = 0
     
@@ -42,7 +43,7 @@ export async function safeDropIndex(collection: Collection<any>, indexName: stri
             
             if (indexExists) {
                 await collection.dropIndex(indexName)
-                console.log(`✅ Dropped index ${indexName} from collection ${collection.collectionName}`)
+                if (!silent) console.log(`✅ Dropped index ${indexName} from collection ${collection.collectionName}`)
                 
                 // Verify the index is actually dropped with retry logic
                 let verifyRetries = 0
@@ -64,7 +65,7 @@ export async function safeDropIndex(collection: Collection<any>, indexName: stri
                         verifyRetries++
                     } catch (verifyError) {
                         // If we can't verify, assume it's dropped
-                        console.log(`⚠️ Could not verify index drop for ${indexName}, proceeding`)
+                        if (!silent) console.log(`⚠️ Could not verify index drop for ${indexName}, proceeding`)
                         break
                     }
                 }
@@ -73,14 +74,14 @@ export async function safeDropIndex(collection: Collection<any>, indexName: stri
                 await new Promise(resolve => setTimeout(resolve, 100))
             } else {
                 // Index doesn't exist, no need to drop
-                console.log(`ℹ️ Index ${indexName} does not exist in collection ${collection.collectionName}, skipping drop`)
+                if (!silent) console.log(`ℹ️ Index ${indexName} does not exist in collection ${collection.collectionName}, skipping drop`)
             }
             return // Success
         } catch (error: any) {
             // Handle specific MongoDB error codes
             if (error.code === 27 || error.codeName === 'IndexNotFound') {
                 // Index not found - this is fine, we wanted to drop it anyway
-                console.log(`ℹ️ Index ${indexName} not found in collection ${collection.collectionName}, already dropped`)
+                if (!silent) console.log(`ℹ️ Index ${indexName} not found in collection ${collection.collectionName}, already dropped`)
                 return
             }
             

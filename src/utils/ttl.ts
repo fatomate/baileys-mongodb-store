@@ -24,6 +24,26 @@ export interface TTLConfig {
      * Alert threshold - alert if data older than TTL + threshold days exists
      */
     alertThresholdDays?: number
+
+    /**
+     * Optional collection name prefix used by the store (e.g., 'wabot_')
+     * When provided, the monitor will look up collections using this prefix
+     * while reporting friendly (unprefixed) names in warnings/metrics.
+     */
+    collectionPrefix?: string
+
+    /**
+     * List of logical collection names to check (without prefix).
+     * If omitted, falls back to the legacy full set of collections.
+     * Stores should pass only TTL-managed collections to reduce noise.
+     */
+    collectionsToCheck?: string[]
+
+    /**
+     * When true, only emit critical alerts (e.g., expired documents or very old data),
+     * and suppress non-critical warnings such as missing TTL index messages.
+     */
+    onlyCriticalAlerts?: boolean
 }
 
 export interface TTLIndexInfo {
@@ -60,7 +80,15 @@ export interface TTLMetrics {
  */
 export class TTLMonitor {
     private db: Db
-    private config: Required<TTLConfig>
+    private config: {
+        days: number
+        enableMonitoring: boolean
+        checkIntervalMinutes: number
+        alertThresholdDays: number
+        collectionPrefix?: string
+        collectionsToCheck?: string[]
+        onlyCriticalAlerts?: boolean
+    }
     private metrics: TTLMetrics = {
         lastCheck: new Date(),
         collectionsChecked: 0,
@@ -76,7 +104,10 @@ export class TTLMonitor {
             days: config.days,
             enableMonitoring: config.enableMonitoring ?? true,
             checkIntervalMinutes: config.checkIntervalMinutes ?? 60,
-            alertThresholdDays: config.alertThresholdDays ?? 1
+            alertThresholdDays: config.alertThresholdDays ?? 1,
+            collectionPrefix: config.collectionPrefix,
+            collectionsToCheck: config.collectionsToCheck,
+            onlyCriticalAlerts: config.onlyCriticalAlerts
         }
     }
     
@@ -189,8 +220,10 @@ export class TTLMonitor {
         fieldName: string = 'updatedAt'
     ): Promise<TTLVerificationResult> {
         try {
-            const collection = this.db.collection(collectionName)
-            const ttlInfo = await this.verifyTTLIndex(collectionName, fieldName)
+            // Support prefixed collection names when checking
+            const dbCollectionName = `${this.config.collectionPrefix ?? ''}${collectionName}`
+            const collection = this.db.collection(dbCollectionName)
+            const ttlInfo = await this.verifyTTLIndex(dbCollectionName, fieldName)
             
             // Calculate expiry date
             const expiryDate = new Date()
@@ -221,6 +254,7 @@ export class TTLMonitor {
             }
             
             return {
+                // Report friendly (unprefixed) name in results
                 collection: collectionName,
                 totalDocuments,
                 expiredDocuments,
@@ -243,7 +277,8 @@ export class TTLMonitor {
      * Perform TTL check on all collections
      */
     private async performTTLCheck(onAlert?: (message: string) => void): Promise<void> {
-        const collections = [
+        const collections = this.config.collectionsToCheck ?? [
+            // Legacy default: full set (may include non-TTL collections)
             'chats', 'contacts', 'messages', 'groupMetadata',
             'state', 'presences', 'labels', 'labelAssociations'
         ]
@@ -263,7 +298,7 @@ export class TTLMonitor {
                 
                 if (!result.ttlIndexExists) {
                     this.metrics.warnings.push(`TTL index missing for ${collectionName}`)
-                    if (onAlert) {
+                    if (onAlert && !this.config.onlyCriticalAlerts) {
                         onAlert(`Warning: TTL index missing for collection ${collectionName}`)
                     }
                 }
@@ -346,7 +381,7 @@ export class TTLMonitor {
         }
         details: TTLVerificationResult[]
     }> {
-        const collections = [
+        const collections = this.config.collectionsToCheck ?? [
             'chats', 'contacts', 'messages', 'groupMetadata',
             'state', 'presences', 'labels', 'labelAssociations'
         ]

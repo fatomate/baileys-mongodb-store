@@ -154,7 +154,7 @@ export class LidHandler {
         if (this.lidMappingsCollection) {
             // Drop existing TTL index if it exists (migration from older versions)
             promises.push(
-                safeDropIndex(this.lidMappingsCollection, 'lastSeen_1')
+                safeDropIndex(this.lidMappingsCollection, 'lastSeen_1', { silent: true })
             )
             
             promises.push(

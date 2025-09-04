@@ -664,13 +664,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         healthMonitor.startMonitoring(db)
     }
     
-    // Initialize TTL monitor after DB connection
+    // Initialize TTL monitor after DB connection (do not start yet)
     if (ttlMonitoring) {
         const globalTTL = ttlDays || DEFAULT_TTL_DAYS
-        ttlMonitor = new TTLMonitor(db, { days: globalTTL, ...ttlMonitoring })
-        ttlMonitor.startMonitoring((message) => {
-            logWarn(`[TTL Monitor] ${message}`)
+        const ttlManagedCollections = ['chats', 'contacts', 'messages', 'state', 'presences']
+        ttlMonitor = new TTLMonitor(db, { 
+            days: globalTTL, 
+            ...ttlMonitoring,
+            collectionPrefix,
+            collectionsToCheck: ttlManagedCollections,
+            // Silence non-critical TTL warnings unless verbose logging
+            onlyCriticalAlerts: logLevel !== 'all'
         })
+        // Start will be called after indexes are created
     }
     
     // Initialize LID handler after DB connection with retry logic
@@ -2739,8 +2745,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         if (collectionTTL[collectionName] !== undefined) {
             return collectionTTL[collectionName]!
         }
-        
-        return ttlDays
+        // Tightened sensible defaults for enhanced store
+        switch (collectionName) {
+            case 'presences':
+                // Presence updates are highly ephemeral
+                return 1
+            case 'state':
+                // Connection state can be short-lived
+                return Math.min(ttlDays, 7)
+            case 'messages':
+            case 'chats':
+            case 'contacts':
+            default:
+                return ttlDays
+        }
     }
     
     // Update event metrics
@@ -2780,9 +2798,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const createIndexes = async () => {
         // Migration: Drop obsolete TTL indexes from collections that should persist indefinitely
         const migrationPromises = [
-            withConnection(async () => safeDropIndex(collections.groupMetadata, 'updatedAt_1')).catch(() => {}),
-            withConnection(async () => safeDropIndex(collections.labels, 'updatedAt_1')).catch(() => {}),
-            withConnection(async () => safeDropIndex(collections.labelAssociations, 'updatedAt_1')).catch(() => {})
+            withConnection(async () => safeDropIndex(collections.groupMetadata, 'updatedAt_1', { silent: true })).catch(() => {}),
+            withConnection(async () => safeDropIndex(collections.labels, 'updatedAt_1', { silent: true })).catch(() => {}),
+            withConnection(async () => safeDropIndex(collections.labelAssociations, 'updatedAt_1', { silent: true })).catch(() => {})
         ]
         
         await Promise.all(migrationPromises)
@@ -3010,6 +3028,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Initialize indexes
     await createIndexes()
+    
+    // Start TTL monitor after indexes are ensured
+    if (ttlMonitor) {
+        ttlMonitor.startMonitoring((message: string) => {
+            logWarn(`[TTL Monitor] ${message}`)
+        })
+    }
     
     // Track binding state to prevent duplicate bindings
     let isBound = false

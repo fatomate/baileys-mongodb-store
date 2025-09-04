@@ -378,11 +378,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             connectionError = null
             reconnectAttempts = 0
             
-            // Initialize TTL monitor after DB connection
+            // Initialize TTL monitor after DB connection (do not start yet)
             if (ttlMonitoring && !ttlMonitor) {
-                ttlMonitor = new TTLMonitor(db, { days: ttlDays, ...ttlMonitoring })
-                ttlMonitor.startMonitoring((message) => {
-                    logWarn(`[TTL Monitor] ${message}`)
+                const ttlManagedCollections = ['chats', 'contacts', 'messages', 'presences']
+                ttlMonitor = new TTLMonitor(db, { 
+                    days: ttlDays, 
+                    ...ttlMonitoring,
+                    collectionPrefix,
+                    collectionsToCheck: ttlManagedCollections,
+                    // Silence non-critical TTL warnings unless verbose logging
+                    onlyCriticalAlerts: logLevel !== 'all'
                 })
             }
             
@@ -1761,6 +1766,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     
     // Initialize indexes - critical indexes must succeed
     await createIndexes()
+
+    // Start TTL monitor after indexes are ensured
+    if (ttlMonitor !== null) {
+        const monitor = ttlMonitor as TTLMonitor
+        monitor.startMonitoring((message: string) => {
+            logWarn(`[TTL Monitor] ${message}`)
+        })
+    }
     
     // Create a proxy to automatically wrap all async methods with connection checking
     const createStoreProxy = (target: any): MongoDBStore => {
