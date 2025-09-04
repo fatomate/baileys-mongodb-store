@@ -35,7 +35,7 @@ export class LidHandler {
     private db: Db | null = null
     private cache: NodeCache
     private ensureConnectionCb?: () => Promise<void>
-    private config: Required<LidHandlerConfig>
+    private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean }
     private instanceId: string
     private isInitialized: boolean = false
 
@@ -44,10 +44,9 @@ export class LidHandler {
         this.config = {
             cacheTTL: config?.cacheTTL ?? 3600,
             enableCache: config?.enableCache ?? true,
-            skipIndexCreation: config?.skipIndexCreation ?? true,
-            ensureConnection: config?.ensureConnection
+            skipIndexCreation: config?.skipIndexCreation ?? true
         }
-        this.ensureConnectionCb = this.config.ensureConnection
+        this.ensureConnectionCb = config?.ensureConnection
         
         // Initialize cache with configured TTL
         this.cache = new NodeCache({ 

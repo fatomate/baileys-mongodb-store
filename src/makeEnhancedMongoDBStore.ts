@@ -679,35 +679,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // Start will be called after indexes are created
     }
     
-    // Initialize LID handler after DB connection with retry logic
-    if (lidHandlerConfig) {
-        // Ensure LidHandler uses store's connection lifecycle and skip index creation by default
-        lidHandler = new LidHandler(validatedInstanceId, {
-            skipIndexCreation: true,
-            ...lidHandlerConfig,
-            ensureConnection: ensureConnection
-        })
-        const initResult = await retryWithBackoff(
-            () => lidHandler!.initialize(db, collectionPrefix),
-            {
-                maxAttempts: 3,
-                initialDelay: 500,
-                maxDelay: 5000,
-                factor: 2,
-                jitter: true
-            },
-            (attempt, error, delay) => {
-                logWarn(`[LID Handler] Retry attempt ${attempt} for initialization after error: ${error.message}. Waiting ${delay}ms...`)
-            }
-        )
-        
-        if (initResult.success) {
-            log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
-        } else {
-            logError(`[LID Handler] Failed to initialize after ${initResult.attempts} attempts:`, initResult.error)
-            // Don't throw - LID handler is optional
-        }
-    }
+    // LID handler will be initialized after ensureConnection is declared
     
     // Get collections
     const getCollections = (): MongoCollections => {
@@ -889,6 +861,36 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             throw new Error(`Failed to connect to MongoDB: ${(error as Error).message}`)
         } finally {
             // Connection state is managed by enum now
+        }
+    }
+    
+    // Initialize LID handler after ensureConnection is available
+    if (lidHandlerConfig) {
+        // Ensure LidHandler uses store's connection lifecycle and skip index creation by default
+        lidHandler = new LidHandler(validatedInstanceId, {
+            skipIndexCreation: true,
+            ...lidHandlerConfig,
+            ensureConnection: ensureConnection
+        })
+        const initResult = await retryWithBackoff(
+            () => lidHandler!.initialize(db, collectionPrefix),
+            {
+                maxAttempts: 3,
+                initialDelay: 500,
+                maxDelay: 5000,
+                factor: 2,
+                jitter: true
+            },
+            (attempt, error, delay) => {
+                logWarn(`[LID Handler] Retry attempt ${attempt} for initialization after error: ${error.message}. Waiting ${delay}ms...`)
+            }
+        )
+        
+        if (initResult.success) {
+            log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
+        } else {
+            logError(`[LID Handler] Failed to initialize after ${initResult.attempts} attempts:`, initResult.error)
+            // Don't throw - LID handler is optional
         }
     }
     
