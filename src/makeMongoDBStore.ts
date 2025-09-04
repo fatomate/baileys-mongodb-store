@@ -958,7 +958,14 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                 if (processingTime > QUEUE_STALE_THRESHOLD) {
                                     logWarn(`⚠️ Stale job detected in ${queueType}: ${job.id} (${processingTime}ms)`)
                                     // Move stale job back to waiting
-                                    await job.moveToFailed(new Error('Job stale, moving to failed'), false)
+                                    // BullMQ v5 requires a lock token as the second argument
+                                    const token = (job as any).token as string | undefined
+                                    if (typeof token === 'string') {
+                                        await job.moveToFailed(new Error('Job stale, moving to failed'), token, false)
+                                    } else {
+                                        // If token is unavailable, skip moving to failed to avoid runtime errors
+                                        logWarn(`Skipping moveToFailed for job ${job.id}: missing lock token`)
+                                    }
                                 }
                             }
                         } catch (error) {
