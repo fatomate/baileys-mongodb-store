@@ -344,21 +344,31 @@ export class LidHandler {
         const now = new Date()
         const cleanedPushName = (typeof pushName === 'string' ? pushName.trim() : '') || undefined
         
-        // Decide whether to update pushName to avoid unnecessary writes
+        // Decide whether to update fields to avoid unnecessary writes
         let shouldSetPushName = false
-        if (cleanedPushName) {
-            try {
-                const existing = await this.lidMappingsCollection.findOne(
-                    { instanceId: this.instanceId, lid: normalizedLid },
-                    { projection: { pushName: 1 } }
-                )
-                if (!existing || existing.pushName !== cleanedPushName) {
+        let shouldSetPhoneNumber = true // default true; will turn false if existing doc has same phone
+        try {
+            const existing = await this.lidMappingsCollection.findOne(
+                { instanceId: this.instanceId, lid: normalizedLid },
+                { projection: { pushName: 1, phoneNumber: 1 } }
+            )
+            if (existing) {
+                if (cleanedPushName && existing.pushName !== cleanedPushName) {
                     shouldSetPushName = true
                 }
-            } catch (_err) {
-                // If read fails, fall back to setting it; update will be idempotent if equal
-                shouldSetPushName = true
+                // Only set phoneNumber if changed
+                if (existing.phoneNumber === normalizedPhone) {
+                    shouldSetPhoneNumber = false
+                }
+            } else {
+                // New document: set phone and pushName (if provided)
+                shouldSetPhoneNumber = true
+                shouldSetPushName = !!cleanedPushName
             }
+        } catch (_err) {
+            // If read fails, proceed with setting both (safe; idempotent if equal)
+            shouldSetPhoneNumber = true
+            shouldSetPushName = !!cleanedPushName
         }
         
         try {
@@ -370,7 +380,7 @@ export class LidHandler {
                 },
                 {
                     $set: {
-                        phoneNumber: normalizedPhone,
+                        ...(shouldSetPhoneNumber ? { phoneNumber: normalizedPhone } : {}),
                         lastSeen: now,
                         updatedAt: now,
                         ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
