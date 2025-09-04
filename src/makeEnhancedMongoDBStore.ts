@@ -669,7 +669,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize TTL monitor after DB connection (do not start yet)
     if (ttlMonitoring) {
         const globalTTL = ttlDays || DEFAULT_TTL_DAYS
-        const ttlManagedCollections = ['chats', 'contacts', 'messages', 'state', 'presences']
+        // Disable TTL monitoring for contacts (no TTL for contacts)
+        const ttlManagedCollections = ['chats', 'messages', 'state', 'presences']
         ttlMonitor = new TTLMonitor(db, { 
             days: globalTTL, 
             ...ttlMonitoring,
@@ -1171,18 +1172,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             trackActivity()
             
             if (type === 'upsert' && contacts) {
-                // Bulk upsert
-                const bulkOps = contacts.map((contact: Contact) => ({
-                    replaceOne: {
-                        filter: { instanceId: validatedInstanceId, id: contact.id },
-                        replacement: {
-                            ...contact,
-                            instanceId: validatedInstanceId,
-                            updatedAt: new Date()
-                        },
-                        upsert: true
+                // Bulk upsert without overriding user-saved notify
+                const bulkOps = contacts.map((contact: Contact) => {
+                    const { notify, ...rest } = (contact as any) || {}
+                    return {
+                        updateOne: {
+                            filter: { instanceId: validatedInstanceId, id: contact.id },
+                            update: {
+                                $set: {
+                                    ...rest,
+                                    instanceId: validatedInstanceId,
+                                    updatedAt: new Date()
+                                },
+                                $setOnInsert: {
+                                    instanceId: validatedInstanceId,
+                                    id: contact.id,
+                                    ...(notify !== undefined ? { notify } : {})
+                                }
+                            },
+                            upsert: true
+                        }
                     }
-                }))
+                })
                 
                 await withConnection(async () =>
                     collections.contacts.bulkWrite(bulkOps)
@@ -1190,14 +1201,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 return { success: true, count: contacts.length }
             } else if (type === 'update' && contact) {
-                // Single update
+                // Single update without overriding user-saved notify
+                const { notify, ...rest } = (contact as any) || {}
                 await withConnection(async () =>
-                    collections.contacts.replaceOne(
+                    collections.contacts.updateOne(
                         { instanceId: validatedInstanceId, id: contact.id },
                         {
-                            ...contact,
-                            instanceId: validatedInstanceId,
-                            updatedAt: new Date()
+                            $set: {
+                                ...rest,
+                                instanceId: validatedInstanceId,
+                                updatedAt: new Date()
+                            },
+                            $setOnInsert: {
+                                instanceId: validatedInstanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
                         },
                         { upsert: true }
                     )
@@ -2081,13 +2100,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 trackActivity() // Track request
                 
                 if (type === 'upsert' && contacts) {
-                    const bulkOps = contacts.map((contact: Contact) => ({
-                        replaceOne: {
-                            filter: { instanceId, id: contact.id },
-                            replacement: { ...contact, instanceId, updatedAt: new Date() },
-                            upsert: true
+                    const bulkOps = contacts.map((contact: Contact) => {
+                        const { notify, ...rest } = (contact as any) || {}
+                        return {
+                            updateOne: {
+                                filter: { instanceId, id: contact.id },
+                                update: {
+                                    $set: { ...rest, instanceId, updatedAt: new Date() },
+                                    $setOnInsert: {
+                                        instanceId,
+                                        id: contact.id,
+                                        ...(notify !== undefined ? { notify } : {})
+                                    }
+                                },
+                                upsert: true
+                            }
                         }
-                    }))
+                    })
                     await withConnection(async () =>
                         collections.contacts.bulkWrite(bulkOps, { ordered: false })
                     )
@@ -2155,10 +2184,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
+                    const { notify, ...rest } = (contact as any) || {}
                     await withConnection(async () =>
-                        collections.contacts.replaceOne(
+                        collections.contacts.updateOne(
                             { instanceId, id: contact.id },
-                            { ...contact, instanceId, updatedAt: new Date() },
+                            {
+                                $set: { ...rest, instanceId, updatedAt: new Date() },
+                                $setOnInsert: {
+                                    instanceId,
+                                    id: contact.id,
+                                    ...(notify !== undefined ? { notify } : {})
+                                }
+                            },
                             { upsert: true }
                         )
                     )
@@ -2824,7 +2861,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             ],
             contacts: [
                 { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('contacts') * 24 * 60 * 60 } }
+                { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
+                // No TTL for contacts
             ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
@@ -5826,7 +5864,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     ],
                     contacts: [
                         { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                        { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('contacts') * 24 * 60 * 60 } }
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
                     ],
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },

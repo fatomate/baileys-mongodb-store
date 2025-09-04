@@ -9,7 +9,6 @@ import {
     extractLidPhonePair
 } from './jidUtils'
 import { retryWithBackoff } from './connectionRetry'
-import { safeDropIndex } from './indexHelper'
 
 export interface LidMapping {
     instanceId: string
@@ -27,15 +26,22 @@ export interface LidHandlerConfig {
     enableCache?: boolean // Enable caching (default: true)
     skipIndexCreation?: boolean // Skip creating indexes here (default: true; smart manager handles it)
     ensureConnection?: () => Promise<void> // Optional callback to ensure connection before operations
+    /**
+     * When true, a successful legacy read from lidMappings triggers a best-effort
+     * auto-fill into contacts to migrate the mapping forward (no pushName).
+     * Default: false
+     */
+    autoFillFromLegacy?: boolean
 }
 
 export class LidHandler {
-    private lidMappingsCollection: Collection<LidMapping> | null = null
+    private lidMappingsCollection: Collection<LidMapping> | null = null // legacy read-only fallback
+    private contactsCollection: Collection<any> | null = null
     private messagesCollection: Collection<any> | null = null
     private db: Db | null = null
     private cache: NodeCache
     private ensureConnectionCb?: () => Promise<void>
-    private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean }
+    private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean; autoFillFromLegacy: boolean }
     private instanceId: string
     private isInitialized: boolean = false
 
@@ -44,7 +50,8 @@ export class LidHandler {
         this.config = {
             cacheTTL: config?.cacheTTL ?? 3600,
             enableCache: config?.enableCache ?? true,
-            skipIndexCreation: config?.skipIndexCreation ?? true
+            skipIndexCreation: config?.skipIndexCreation ?? true,
+            autoFillFromLegacy: config?.autoFillFromLegacy ?? true
         }
         this.ensureConnectionCb = config?.ensureConnection
         
@@ -60,8 +67,13 @@ export class LidHandler {
      * Initialize the handler with MongoDB connection
      */
     async initialize(db: Db, collectionPrefix = ''): Promise<void> {
-        const collectionName = collectionPrefix ? `${collectionPrefix}lidMappings` : 'lidMappings'
-        this.lidMappingsCollection = db.collection<LidMapping>(collectionName)
+        // Legacy: keep lidMappings reference for temporary read fallback only
+        const legacyCollectionName = collectionPrefix ? `${collectionPrefix}lidMappings` : 'lidMappings'
+        this.lidMappingsCollection = db.collection<LidMapping>(legacyCollectionName)
+        
+        // Primary: contacts collection for centralized mapping
+        const contactsCollectionName = collectionPrefix ? `${collectionPrefix}contacts` : 'contacts'
+        this.contactsCollection = db.collection(contactsCollectionName)
         
         // Also get reference to messages collection for reverse lookups
         const messagesCollectionName = collectionPrefix ? `${collectionPrefix}messages` : 'messages'
@@ -83,7 +95,7 @@ export class LidHandler {
     private isConnected(): boolean {
         // Treat handler as connected if initialized and we have a DB/collection reference.
         // Actual connection issues will be caught during operations and handled there.
-        return this.isInitialized && !!this.db && !!this.lidMappingsCollection
+        return this.isInitialized && !!this.db && !!this.contactsCollection
     }
 
     /**
@@ -158,27 +170,15 @@ export class LidHandler {
         
         const promises: Promise<any>[] = []
         
-        // Create indexes for lidMappings collection
-        if (this.lidMappingsCollection) {
-            // Drop existing TTL index if it exists (migration from older versions)
+        // Create indexes for contacts collection (centralized mapping)
+        if (this.contactsCollection) {
+            // Unique lid per instance across contacts where lid exists
             promises.push(
-                safeDropIndex(this.lidMappingsCollection, 'lastSeen_1', { silent: true })
-            )
-            
-            promises.push(
-                // Compound index for instance + lid lookup
                 createIndexWithRetry(
-                    this.lidMappingsCollection,
+                    this.contactsCollection,
                     { instanceId: 1, lid: 1 },
-                    { unique: true, background: true }
-                ),
-                // Compound index for instance + phone number lookup
-                createIndexWithRetry(
-                    this.lidMappingsCollection,
-                    { instanceId: 1, phoneNumber: 1 },
-                    { background: true }
+                    { unique: true, background: true, partialFilterExpression: { lid: { $type: 'string' } } }
                 )
-                // TTL index removed - lid mappings will persist until explicitly deleted
             )
         }
         
@@ -315,8 +315,8 @@ export class LidHandler {
             return
         }
         
-        if (!this.lidMappingsCollection) {
-            console.warn('LidHandler not initialized with database')
+        if (!this.contactsCollection) {
+            console.warn('LidHandler not initialized with contacts collection')
             return
         }
         
@@ -346,49 +346,50 @@ export class LidHandler {
         
         // Decide whether to update fields to avoid unnecessary writes
         let shouldSetPushName = false
-        let shouldSetPhoneNumber = true // default true; will turn false if existing doc has same phone
+        let shouldSetLid = true // default true; will turn false if existing doc has same lid
         try {
-            const existing = await this.lidMappingsCollection.findOne(
-                { instanceId: this.instanceId, lid: normalizedLid },
-                { projection: { pushName: 1, phoneNumber: 1 } }
+            const existing = await this.contactsCollection.findOne(
+                { instanceId: this.instanceId, id: normalizedPhone },
+                { projection: { pushName: 1, lid: 1 } }
             )
             if (existing) {
                 if (cleanedPushName && existing.pushName !== cleanedPushName) {
                     shouldSetPushName = true
                 }
-                // Only set phoneNumber if changed
-                if (existing.phoneNumber === normalizedPhone) {
-                    shouldSetPhoneNumber = false
+                // Only set lid if changed
+                if (existing.lid === normalizedLid) {
+                    shouldSetLid = false
                 }
             } else {
                 // New document: set phone and pushName (if provided)
-                shouldSetPhoneNumber = true
+                shouldSetLid = true
                 shouldSetPushName = !!cleanedPushName
             }
         } catch (_err) {
             // If read fails, proceed with setting both (safe; idempotent if equal)
-            shouldSetPhoneNumber = true
+            shouldSetLid = true
             shouldSetPushName = !!cleanedPushName
         }
         
         try {
-            // Upsert the mapping
-            await this.lidMappingsCollection.updateOne(
+            // Upsert the mapping into contacts (by phone JID as contact id)
+            await this.contactsCollection.updateOne(
                 { 
                     instanceId: this.instanceId, 
-                    lid: normalizedLid 
+                    id: normalizedPhone 
                 },
                 {
                     $set: {
-                        ...(shouldSetPhoneNumber ? { phoneNumber: normalizedPhone } : {}),
-                        lastSeen: now,
+                        ...(shouldSetLid ? { lid: normalizedLid } : {}),
+                        lidLastSeen: now,
+                        lidMappingUpdatedAt: now,
                         updatedAt: now,
                         ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
                     },
                     $setOnInsert: {
                         instanceId: this.instanceId,
-                        lid: normalizedLid,
-                        firstSeen: now
+                        id: normalizedPhone,
+                        lidFirstSeen: now
                     }
                 },
                 { upsert: true }
@@ -401,7 +402,7 @@ export class LidHandler {
                 this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
             }
             
-            console.log(`[LidHandler] Stored mapping: ${normalizedLid} -> ${normalizedPhone}`)
+            console.log(`[LidHandler] Stored mapping in contacts: ${normalizedLid} -> ${normalizedPhone}`)
         } catch (error) {
             console.error('[LidHandler] Failed to store LID mapping:', error)
         }
@@ -423,31 +424,50 @@ export class LidHandler {
         // Query database with connection check
         return await this.withConnectionCheck(
             async () => {
-                if (!this.lidMappingsCollection) {
+                if (!this.contactsCollection) {
                     return null
                 }
                 
-                const mapping = await this.lidMappingsCollection.findOne({
+                const contact = await this.contactsCollection.findOne({
                     instanceId: this.instanceId,
                     lid: normalizedLid
-                })
+                }, { projection: { id: 1 } })
                 
-                if (mapping) {
+                if (contact?.id) {
                     // Update cache
                     if (this.config.enableCache) {
-                        this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, mapping.phoneNumber)
+                        this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, contact.id)
                     }
                     
-                    // Update lastSeen (fire and forget, don't wait)
-                    this.lidMappingsCollection.updateOne(
-                        { _id: mapping._id },
-                        { $set: { lastSeen: new Date() } }
+                    // Update lidLastSeen (fire and forget)
+                    this.contactsCollection.updateOne(
+                        { instanceId: this.instanceId, id: contact.id },
+                        { $set: { lidLastSeen: new Date() } }
                     ).catch(err => {
-                        // Silently ignore update errors
-                        console.debug('[LidHandler] Failed to update lastSeen:', err.message)
+                        console.debug('[LidHandler] Failed to update lidLastSeen:', err.message)
                     })
                     
-                    return mapping.phoneNumber
+                    return contact.id
+                }
+                
+                // Fallback: read from legacy lidMappings (no writes)
+                if (this.lidMappingsCollection) {
+                    const legacy = await this.lidMappingsCollection.findOne({ instanceId: this.instanceId, lid: normalizedLid })
+                    if (legacy?.phoneNumber) {
+                        if (this.config.enableCache) {
+                            this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, legacy.phoneNumber)
+                        }
+                        // Optional auto-fill into contacts to migrate mapping forward
+                        if (this.config.autoFillFromLegacy) {
+                            try {
+                                await this.storeLidMapping(normalizedLid, legacy.phoneNumber)
+                            } catch (e) {
+                                // Best-effort only
+                                console.debug('[LidHandler] Auto-fill from legacy failed:', (e as any)?.message)
+                            }
+                        }
+                        return legacy.phoneNumber
+                    }
                 }
                 
                 return null
@@ -473,22 +493,39 @@ export class LidHandler {
         // Query database with connection check
         return await this.withConnectionCheck(
             async () => {
-                if (!this.lidMappingsCollection) {
+                if (!this.contactsCollection) {
                     return null
                 }
                 
-                const mapping = await this.lidMappingsCollection.findOne({
+                const contact = await this.contactsCollection.findOne({
                     instanceId: this.instanceId,
-                    phoneNumber: normalizedPhone
-                })
+                    id: normalizedPhone
+                }, { projection: { lid: 1 } })
                 
-                if (mapping) {
-                    // Update cache
+                if (contact?.lid) {
                     if (this.config.enableCache) {
-                        this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, mapping.lid)
+                        this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, contact.lid)
                     }
-                    
-                    return mapping.lid
+                    return contact.lid
+                }
+                
+                // Fallback: read from legacy lidMappings (no writes)
+                if (this.lidMappingsCollection) {
+                    const legacy = await this.lidMappingsCollection.findOne({ instanceId: this.instanceId, phoneNumber: normalizedPhone })
+                    if (legacy?.lid) {
+                        if (this.config.enableCache) {
+                            this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, legacy.lid)
+                        }
+                        // Optional auto-fill into contacts to migrate mapping forward
+                        if (this.config.autoFillFromLegacy) {
+                            try {
+                                await this.storeLidMapping(legacy.lid, normalizedPhone)
+                            } catch (e) {
+                                console.debug('[LidHandler] Auto-fill from legacy failed:', (e as any)?.message)
+                            }
+                        }
+                        return legacy.lid
+                    }
                 }
                 
                 return null
@@ -807,13 +844,22 @@ export class LidHandler {
     async getAllMappings(): Promise<LidMapping[]> {
         return await this.withConnectionCheck(
             async () => {
-                if (!this.lidMappingsCollection) {
+                if (!this.contactsCollection) {
                     return []
                 }
-                
-                return await this.lidMappingsCollection
-                    .find({ instanceId: this.instanceId })
+                const docs = await this.contactsCollection
+                    .find({ instanceId: this.instanceId, lid: { $exists: true, $nin: [null, ''] } }, { projection: { id: 1, lid: 1, lidFirstSeen: 1, lidLastSeen: 1, lidMappingUpdatedAt: 1, pushName: 1, pushNameUpdatedAt: 1 } })
                     .toArray()
+                return docs.map((d: any) => ({
+                    instanceId: this.instanceId,
+                    lid: d.lid,
+                    phoneNumber: d.id,
+                    firstSeen: d.lidFirstSeen || d.lidMappingUpdatedAt || new Date(),
+                    lastSeen: d.lidLastSeen || d.lidMappingUpdatedAt || new Date(),
+                    updatedAt: d.lidMappingUpdatedAt || new Date(),
+                    pushName: d.pushName,
+                    pushNameUpdatedAt: d.pushNameUpdatedAt
+                }))
             },
             [],
             'getAllMappings'
@@ -826,20 +872,18 @@ export class LidHandler {
     async cleanupOldMappings(daysOld: number = 90): Promise<number> {
         return await this.withConnectionCheck(
             async () => {
-                if (!this.lidMappingsCollection) {
+                if (!this.contactsCollection) {
                     return 0
                 }
-                
                 const cutoffDate = new Date()
                 cutoffDate.setDate(cutoffDate.getDate() - daysOld)
-                
-                const result = await this.lidMappingsCollection.deleteMany({
-                    instanceId: this.instanceId,
-                    lastSeen: { $lt: cutoffDate }
-                })
-                
-                console.log(`[LidHandler] Cleaned up ${result.deletedCount} old mappings`)
-                return result.deletedCount
+                // Unset stale mapping fields but do not delete contacts
+                const result = await this.contactsCollection.updateMany(
+                    { instanceId: this.instanceId, lidLastSeen: { $lt: cutoffDate } },
+                    { $unset: { lid: '', lidFirstSeen: '', lidLastSeen: '', lidMappingUpdatedAt: '' } }
+                )
+                console.log(`[LidHandler] Cleaned up stale LID mappings from ${result.modifiedCount} contacts`)
+                return result.modifiedCount
             },
             0,
             'cleanupOldMappings'

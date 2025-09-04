@@ -380,7 +380,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Initialize TTL monitor after DB connection (do not start yet)
             if (ttlMonitoring && !ttlMonitor) {
-                const ttlManagedCollections = ['chats', 'contacts', 'messages', 'presences']
+                const ttlManagedCollections = ['chats', 'messages', 'presences']
                 ttlMonitor = new TTLMonitor(db, { 
                     days: ttlDays, 
                     ...ttlMonitoring,
@@ -843,18 +843,36 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const { type, contacts, contact } = job.data
                 
                 if (type === 'upsert' && contacts) {
-                    const bulkOps = contacts.map(contact => ({
-                        replaceOne: {
-                            filter: { instanceId, id: contact.id },
-                            replacement: { ...contact, instanceId, updatedAt: new Date() },
-                            upsert: true
+                    const bulkOps = contacts.map(contact => {
+                        const { notify, ...rest } = (contact as any) || {}
+                        return {
+                            updateOne: {
+                                filter: { instanceId, id: contact.id },
+                                update: {
+                                    $set: { ...rest, instanceId, updatedAt: new Date() },
+                                    $setOnInsert: {
+                                        instanceId,
+                                        id: contact.id,
+                                        ...(notify !== undefined ? { notify } : {})
+                                    }
+                                },
+                                upsert: true
+                            }
                         }
-                    }))
+                    })
                     await collections.contacts.bulkWrite(bulkOps, { ordered: false })
                 } else if (type === 'update' && contact) {
-                    await collections.contacts.replaceOne(
+                    const { notify, ...rest } = (contact as any) || {}
+                    await collections.contacts.updateOne(
                         { instanceId, id: contact.id },
-                        { ...contact, instanceId, updatedAt: new Date() },
+                        {
+                            $set: { ...rest, instanceId, updatedAt: new Date() },
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
+                        },
                         { upsert: true }
                     )
                 }
@@ -1523,10 +1541,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 { name: 'chats_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
                 { name: 'chats_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
             ],
-            contacts: [
-                { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
-            ],
+                    contacts: [
+                        { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
+                    ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                 { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
@@ -3258,7 +3276,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     ],
                     contacts: [
                         { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                        { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
                     ],
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
