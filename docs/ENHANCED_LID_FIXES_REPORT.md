@@ -59,6 +59,34 @@ The updates deliver:
   - Upsert logic enriches `$set` and `$setOnInsert` accordingly
   - File: `src/utils/lidHandler.ts:304–339`
 
+## Post‑Test Fixes (Follow‑ups from Validation)
+
+- Smart index manager runtime error fixed:
+  - Issue: `❌ Failed to process indexes for collection lidMappings: TypeError: Cannot read properties of undefined (reading 'collectionName')`
+  - Root cause: `lidMappings` collection wasn’t exposed in `MongoCollections` map; `collection` was undefined during index processing.
+  - Fix: Added `lidMappings` to `MongoCollections` type and `getCollections()` return value.
+  - Files: `src/makeEnhancedMongoDBStore.ts` (imports `LidMapping`, extends `MongoCollections`, adds `db.collection(…lidMappings)`)
+
+- Build error (ensureConnection used before declaration) fixed:
+  - Issue: TS2448/TS2454 at LidHandler construction with `ensureConnection` before its declaration.
+  - Fix: Moved LidHandler initialization to after `ensureConnection` is defined.
+  - File: `src/makeEnhancedMongoDBStore.ts` (LidHandler init relocated below `ensureConnection`)
+
+- Build error (optional callback typing) fixed:
+  - Issue: TS2322 because `ensureConnection` was optional but treated as required in `Required<LidHandlerConfig>`.
+  - Fix: Store a concrete config shape for non-optional fields and keep `ensureConnection` separately as optional (`ensureConnectionCb?`).
+  - File: `src/utils/lidHandler.ts:32–50`
+
+- Mongo update operator conflict resolved:
+  - Issue: `MongoServerError: Updating the path 'pushName' would create a conflict at 'pushName'` (code 40), caused by setting `pushName` in both `$set` and `$setOnInsert`.
+  - Fix: Only set `pushName`/`pushNameUpdatedAt` via `$set`; removed from `$setOnInsert`.
+  - File: `src/utils/lidHandler.ts` (upsert logic)
+
+- Write minimization guards added:
+  - Skip updating `pushName` if unchanged; still set on insert or when value changes.
+  - Skip updating `phoneNumber` if unchanged; always refresh `lastSeen`/`updatedAt`.
+  - File: `src/utils/lidHandler.ts` (single `findOne` projection with conditional `$set` spreads)
+
 ## Why These Changes Fix the Issues
 
 - The recurring “Database not connected” was due to a fragile topology probe. By attempting the operation and falling back only on real errors, valid lookups now proceed without noise.
@@ -78,11 +106,15 @@ The updates deliver:
 - `src/makeEnhancedMongoDBStore.ts`
   - Added index definitions and proactive mapping logic
   - Injected `ensureConnection` and default `skipIndexCreation` to LidHandler
+  - Exposed `lidMappings` in `MongoCollections` and `getCollections()` to support smart index processing
+  - Reordered initialization: LidHandler now constructed after `ensureConnection` is declared
 
 - `src/utils/lidHandler.ts`
   - Connectivity logic modernized
   - `storeLidMapping` extended to accept `pushName`; schema enriched
   - PushName persisted only for incoming messages
+  - Removed `$setOnInsert` for `pushName` to avoid update path conflicts
+  - Guards to skip `pushName`/`phoneNumber` updates when unchanged
 
 - `src/utils/backfillLidMappings.ts` (utility only; not auto-run)
   - A safe, indexed backfill helper left for optional future use
@@ -103,4 +135,3 @@ The updates deliver:
 
 - Add a guarded, one-time background backfill at startup, configurable via store options, if historical data normalization is needed.
 - Consider a small metric/export endpoint to inspect mapping counts and recent mapping rates per instance.
-
