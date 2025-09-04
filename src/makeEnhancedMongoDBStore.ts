@@ -681,7 +681,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Initialize LID handler after DB connection with retry logic
     if (lidHandlerConfig) {
-        lidHandler = new LidHandler(validatedInstanceId, lidHandlerConfig)
+        // Ensure LidHandler uses store's connection lifecycle and skip index creation by default
+        lidHandler = new LidHandler(validatedInstanceId, {
+            skipIndexCreation: true,
+            ...lidHandlerConfig,
+            ensureConnection: ensureConnection
+        })
         const initResult = await retryWithBackoff(
             () => lidHandler!.initialize(db, collectionPrefix),
             {
@@ -2822,7 +2827,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
                 { name: 'messages_media_dedup', spec: { instanceId: 1, mediaHash: 1 }, options: { sparse: true } },
                 { name: 'messages_remote_fallback', spec: { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }, options: {} },
-                { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} }
+                { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
+                // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
+                { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} }
             ],
             groupMetadata: [
                 { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -2843,6 +2850,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             labelAssociations: [
                 { name: 'label_assoc_primary', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true } }
                 // No TTL - persists indefinitely
+            ],
+            // Include LidHandler's collection in smart index management
+            lidMappings: [
+                { name: 'lidMappings_primary', spec: { instanceId: 1, lid: 1 }, options: { unique: true } },
+                { name: 'lidMappings_phone_lookup', spec: { instanceId: 1, phoneNumber: 1 }, options: {} }
             ]
         }
         
@@ -4691,7 +4703,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
                                     
                                     // Store the mapping
-                                    await lidHandler.storeLidMapping(remoteJid, senderPn)
+                                    await lidHandler.storeLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName)
                                     
                                     // Update message to use phone number
                                     msg.key.remoteJid = senderPn
@@ -4714,6 +4726,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         
                                         if (phoneNumber) {
                                             log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
+                                            // Outgoing message: do not persist pushName (it's our own)
                                             await lidHandler.storeLidMapping(remoteJid, phoneNumber)
                                             await lidHandler.updateExistingMessages(remoteJid, phoneNumber)
                                         }
@@ -4727,6 +4740,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     } else {
                                         log(`[LID] Warning: Could not resolve LID ${remoteJid} for fromMe message`)
                                     }
+                                }
+                                // Pattern X: FromMe=false, senderLid present and remoteJid already a phone number
+                                // Proactively store mapping with pushName
+                                else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] Pattern X: FromMe=false, senderLid with phone remoteJid`)
+                                    await lidHandler.storeLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName)
                                 }
                                 // Pattern 3: FromMe=false with only senderLid (no phone yet)
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && !senderPn) {

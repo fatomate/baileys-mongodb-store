@@ -18,17 +18,23 @@ export interface LidMapping {
     firstSeen: Date
     lastSeen: Date
     updatedAt: Date
+    pushName?: string
+    pushNameUpdatedAt?: Date
 }
 
 export interface LidHandlerConfig {
     cacheTTL?: number // Cache TTL in seconds (default: 3600)
     enableCache?: boolean // Enable caching (default: true)
+    skipIndexCreation?: boolean // Skip creating indexes here (default: true; smart manager handles it)
+    ensureConnection?: () => Promise<void> // Optional callback to ensure connection before operations
 }
 
 export class LidHandler {
     private lidMappingsCollection: Collection<LidMapping> | null = null
     private messagesCollection: Collection<any> | null = null
+    private db: Db | null = null
     private cache: NodeCache
+    private ensureConnectionCb?: () => Promise<void>
     private config: Required<LidHandlerConfig>
     private instanceId: string
     private isInitialized: boolean = false
@@ -37,8 +43,11 @@ export class LidHandler {
         this.instanceId = instanceId
         this.config = {
             cacheTTL: config?.cacheTTL ?? 3600,
-            enableCache: config?.enableCache ?? true
+            enableCache: config?.enableCache ?? true,
+            skipIndexCreation: config?.skipIndexCreation ?? true,
+            ensureConnection: config?.ensureConnection
         }
+        this.ensureConnectionCb = this.config.ensureConnection
         
         // Initialize cache with configured TTL
         this.cache = new NodeCache({ 
@@ -58,34 +67,24 @@ export class LidHandler {
         // Also get reference to messages collection for reverse lookups
         const messagesCollectionName = collectionPrefix ? `${collectionPrefix}messages` : 'messages'
         this.messagesCollection = db.collection(messagesCollectionName)
-        
+        this.db = db
         this.isInitialized = true
         
-        // Create indexes for efficient lookups with retry logic
-        await this.createIndexes()
+        // Create indexes for efficient lookups with retry logic (optional)
+        if (!this.config.skipIndexCreation) {
+            await this.createIndexes()
+        } else {
+            console.log('[LidHandler] Skipping index creation (managed by smart index manager)')
+        }
     }
 
     /**
      * Check if the handler is properly initialized and connected
      */
     private isConnected(): boolean {
-        if (!this.isInitialized || !this.lidMappingsCollection) {
-            return false
-        }
-        
-        try {
-            // Check if the collection's client is connected
-            const client = (this.lidMappingsCollection as any).s?.client
-            if (!client) return false
-            
-            // Check MongoDB client connection state
-            const topology = client.topology || client.s?.topology
-            if (!topology) return false
-            
-            return topology.isConnected?.() || topology.s?.state === 'connected'
-        } catch (error) {
-            return false
-        }
+        // Treat handler as connected if initialized and we have a DB/collection reference.
+        // Actual connection issues will be caught during operations and handled there.
+        return this.isInitialized && !!this.db && !!this.lidMappingsCollection
     }
 
     /**
@@ -96,12 +95,22 @@ export class LidHandler {
         fallback: T,
         operationName: string
     ): Promise<T> {
-        if (!this.isConnected()) {
-            console.warn(`[LidHandler] ${operationName}: Database not connected, returning fallback`)
-            return fallback
-        }
+        // Best-effort: even if our connectivity heuristic says "not connected",
+        // attempt the operation and fall back only on real connection errors.
         
         try {
+            // Let the caller ensure/repair connection (shared ConnectionManager) if provided
+            if (this.ensureConnectionCb) {
+                try {
+                    await this.ensureConnectionCb()
+                } catch (e) {
+                    // If ensureConnection fails, still attempt the operation; it'll fall back on error
+                    console.debug(`[LidHandler] ${operationName}: ensureConnection failed, attempting operation anyway`)
+                }
+            }
+            if (!this.isConnected()) {
+                console.debug(`[LidHandler] ${operationName}: connectivity uncertain, attempting operation`)
+            }
             return await operation()
         } catch (error: any) {
             // Check if this is a connection error
@@ -111,7 +120,7 @@ export class LidHandler {
                 error.message?.includes('server is closed') ||
                 error.message?.includes('Topology is closed')) {
                 console.warn(`[LidHandler] ${operationName}: Connection lost during operation, returning fallback`)
-                this.isInitialized = false // Mark as not initialized
+                this.isInitialized = false // Mark as not initialized so caller can re-init after reconnection
                 return fallback
             }
             
@@ -292,7 +301,7 @@ export class LidHandler {
     /**
      * Store or update a LID to phone number mapping
      */
-    async storeLidMapping(lid: string, phoneNumber: string): Promise<void> {
+    async storeLidMapping(lid: string, phoneNumber: string, pushName?: string): Promise<void> {
         if (!this.isConnected()) {
             console.debug('[LidHandler] Cannot store LID mapping - database not connected')
             // Still update cache if enabled
@@ -334,6 +343,8 @@ export class LidHandler {
         }
         
         const now = new Date()
+        const cleanedPushName = (typeof pushName === 'string' ? pushName.trim() : '') || undefined
+        const pushNameUpdate: any = cleanedPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {}
         
         try {
             // Upsert the mapping
@@ -346,12 +357,14 @@ export class LidHandler {
                     $set: {
                         phoneNumber: normalizedPhone,
                         lastSeen: now,
-                        updatedAt: now
+                        updatedAt: now,
+                        ...pushNameUpdate
                     },
                     $setOnInsert: {
                         instanceId: this.instanceId,
                         lid: normalizedLid,
-                        firstSeen: now
+                        firstSeen: now,
+                        ...(cleanedPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
                     }
                 },
                 { upsert: true }
@@ -689,7 +702,9 @@ export class LidHandler {
                 console.log(`[LidHandler] Reverse lookup successful: ${lidInfo.lid} -> ${discoveredPhone}`)
                 lidInfo.phoneNumber = discoveredPhone
                 normalizedJid = discoveredPhone
-                mappingStored = true // Mapping was stored during discovery
+                // Outgoing message: do not persist pushName (it's our own display)
+                await this.storeLidMapping(lidInfo.lid, discoveredPhone)
+                mappingStored = true
             } else {
                 // Try existing mapping as fallback
                 const existingPhone = await this.getPhoneNumberFromLid(lidInfo.lid)
@@ -715,7 +730,9 @@ export class LidHandler {
                 console.warn(`[LidHandler] Skipping invalid mapping where phone number is also a LID: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
             } else {
                 console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
-                await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber)
+                const fromMe = !!message.key?.fromMe
+                const pushName = !fromMe ? ((message as any)?.pushName || (message as any)?.verifiedBizName) : undefined
+                await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber, pushName)
                 mappingStored = true
                 normalizedJid = lidInfo.phoneNumber
             }
