@@ -37,6 +37,7 @@ import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
 import { LidHandler } from './utils/lidHandler'
+import type { LidMapping } from './utils/lidHandler'
 import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
@@ -165,6 +166,7 @@ interface MongoCollections {
     presences: Collection<{ instanceId: string; id: string; presences: { [participant: string]: PresenceData }; updatedAt: Date }>
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
+    lidMappings: Collection<LidMapping>
 }
 
 // Cache for Binary conversions
@@ -694,7 +696,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
             labels: db.collection(`${collectionPrefix}labels`),
-            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`),
+            lidMappings: db.collection(`${collectionPrefix}lidMappings`)
         }
     }
     
