@@ -343,7 +343,9 @@ export class LidHandler {
         
         const now = new Date()
         const cleanedPushName = (typeof pushName === 'string' ? pushName.trim() : '') || undefined
-        const pushNameUpdate: any = cleanedPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {}
+        const pushNameUpdate: Record<string, unknown> = cleanedPushName
+            ? { pushName: cleanedPushName, pushNameUpdatedAt: now }
+            : {}
         
         try {
             // Upsert the mapping
@@ -362,8 +364,7 @@ export class LidHandler {
                     $setOnInsert: {
                         instanceId: this.instanceId,
                         lid: normalizedLid,
-                        firstSeen: now,
-                        ...(cleanedPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
+                        firstSeen: now
                     }
                 },
                 { upsert: true }
