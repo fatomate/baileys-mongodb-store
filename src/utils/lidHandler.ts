@@ -343,9 +343,23 @@ export class LidHandler {
         
         const now = new Date()
         const cleanedPushName = (typeof pushName === 'string' ? pushName.trim() : '') || undefined
-        const pushNameUpdate: Record<string, unknown> = cleanedPushName
-            ? { pushName: cleanedPushName, pushNameUpdatedAt: now }
-            : {}
+        
+        // Decide whether to update pushName to avoid unnecessary writes
+        let shouldSetPushName = false
+        if (cleanedPushName) {
+            try {
+                const existing = await this.lidMappingsCollection.findOne(
+                    { instanceId: this.instanceId, lid: normalizedLid },
+                    { projection: { pushName: 1 } }
+                )
+                if (!existing || existing.pushName !== cleanedPushName) {
+                    shouldSetPushName = true
+                }
+            } catch (_err) {
+                // If read fails, fall back to setting it; update will be idempotent if equal
+                shouldSetPushName = true
+            }
+        }
         
         try {
             // Upsert the mapping
@@ -359,7 +373,7 @@ export class LidHandler {
                         phoneNumber: normalizedPhone,
                         lastSeen: now,
                         updatedAt: now,
-                        ...pushNameUpdate
+                        ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
                     },
                     $setOnInsert: {
                         instanceId: this.instanceId,
