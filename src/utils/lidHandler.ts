@@ -381,8 +381,6 @@ export class LidHandler {
                 {
                     $set: {
                         ...(shouldSetLid ? { lid: normalizedLid } : {}),
-                        lidLastSeen: now,
-                        lidMappingUpdatedAt: now,
                         updatedAt: now,
                         ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
                     },
@@ -438,14 +436,6 @@ export class LidHandler {
                     if (this.config.enableCache) {
                         this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, contact.id)
                     }
-                    
-                    // Update lidLastSeen (fire and forget)
-                    this.contactsCollection.updateOne(
-                        { instanceId: this.instanceId, id: contact.id },
-                        { $set: { lidLastSeen: new Date() } }
-                    ).catch(err => {
-                        console.debug('[LidHandler] Failed to update lidLastSeen:', err.message)
-                    })
                     
                     return contact.id
                 }
@@ -848,15 +838,18 @@ export class LidHandler {
                     return []
                 }
                 const docs = await this.contactsCollection
-                    .find({ instanceId: this.instanceId, lid: { $exists: true, $nin: [null, ''] } }, { projection: { id: 1, lid: 1, lidFirstSeen: 1, lidLastSeen: 1, lidMappingUpdatedAt: 1, pushName: 1, pushNameUpdatedAt: 1 } })
+                    .find(
+                        { instanceId: this.instanceId, lid: { $exists: true, $nin: [null, ''] } },
+                        { projection: { id: 1, lid: 1, lidFirstSeen: 1, updatedAt: 1, pushName: 1, pushNameUpdatedAt: 1 } }
+                    )
                     .toArray()
                 return docs.map((d: any) => ({
                     instanceId: this.instanceId,
                     lid: d.lid,
                     phoneNumber: d.id,
-                    firstSeen: d.lidFirstSeen || d.lidMappingUpdatedAt || new Date(),
-                    lastSeen: d.lidLastSeen || d.lidMappingUpdatedAt || new Date(),
-                    updatedAt: d.lidMappingUpdatedAt || new Date(),
+                    firstSeen: d.lidFirstSeen || d.updatedAt || new Date(),
+                    lastSeen: d.updatedAt || new Date(),
+                    updatedAt: d.updatedAt || new Date(),
                     pushName: d.pushName,
                     pushNameUpdatedAt: d.pushNameUpdatedAt
                 }))
@@ -869,24 +862,8 @@ export class LidHandler {
     /**
      * Delete old mappings that haven't been seen in specified days
      */
-    async cleanupOldMappings(daysOld: number = 90): Promise<number> {
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.contactsCollection) {
-                    return 0
-                }
-                const cutoffDate = new Date()
-                cutoffDate.setDate(cutoffDate.getDate() - daysOld)
-                // Unset stale mapping fields but do not delete contacts
-                const result = await this.contactsCollection.updateMany(
-                    { instanceId: this.instanceId, lidLastSeen: { $lt: cutoffDate } },
-                    { $unset: { lid: '', lidFirstSeen: '', lidLastSeen: '', lidMappingUpdatedAt: '' } }
-                )
-                console.log(`[LidHandler] Cleaned up stale LID mappings from ${result.modifiedCount} contacts`)
-                return result.modifiedCount
-            },
-            0,
-            'cleanupOldMappings'
-        )
+    async cleanupOldMappings(_daysOld: number = 90): Promise<number> {
+        // No-op: contacts do not use lidLastSeen/lidMappingUpdatedAt anymore; avoid unintended cleanup
+        return 0
     }
 }

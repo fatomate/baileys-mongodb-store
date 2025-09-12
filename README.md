@@ -39,6 +39,17 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - 💪 Smart caching with automatic invalidation
 - 🎮 Connection pooling and queue management
 
+## LID Handling (LID → Phone Mapping)
+
+- Centralized on `contacts` collection. No new data is written to legacy `lidMappings` (read-only fallback may be used internally).
+- Proactive mapping on incoming messages (fromMe=false):
+  - If `remoteJid` is a LID and `senderPn` is a phone, the mapping is saved and the message is normalized to phone. Historical messages with the LID may be updated.
+  - If `senderLid` is a LID and `remoteJid` is a phone, the mapping is saved.
+- Outgoing messages (fromMe=true) with LID use reverse lookup; mapping is saved without `pushName` when discovered.
+- `pushName` is captured only for incoming messages.
+- Schema on contacts: `lid`, `lidFirstSeen`, `updatedAt`, optional `pushName`, `pushNameUpdatedAt`.
+- Removed: `lidLastSeen`, `lidMappingUpdatedAt`.
+
 ## Installation
 
 Add to your `package.json`:
@@ -63,11 +74,11 @@ yarn install
 ```javascript
 const makeWASocket = require('@whiskeysockets/baileys').default
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const { makeMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
+const { makeEnhancedMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
 
 async function connectToWhatsApp() {
     // Create MongoDB store with your configuration
-    const store = await makeMongoDBStore({
+    const store = await makeEnhancedMongoDBStore({
         uri: 'mongodb://localhost:27017',
         database: 'whatsapp_bot',
         instanceId: 'instance_001', // Unique ID for each WhatsApp instance
@@ -108,8 +119,9 @@ connectToWhatsApp()
 
 ## Configuration Options
 
-### Basic Configuration (v1 - Still Supported)
+### Basic Configuration (v1 - Deprecated)
 
+Deprecated: v1 basic store remains available for backward compatibility but is no longer recommended. Use the enhanced store (`makeEnhancedMongoDBStore`) for new setups.
 ```typescript
 interface MongoDBStoreConfig {
     // MongoDB connection URI
@@ -383,8 +395,11 @@ The store creates the following collections with appropriate indexes:
 
 All collections include:
 - `instanceId` field for multi-instance isolation
-- `updatedAt` field with TTL index for automatic expiration
+- `updatedAt` field
 - Optimized indexes for query performance
+
+Notes:
+- TTL indexes apply to most collections. Contacts do not use TTL and persist indefinitely.
 
 ## TTL (Time To Live) Feature
 
