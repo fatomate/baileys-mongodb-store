@@ -1613,7 +1613,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     totalCreated += batchResult.successful
                 } else if (indexConfig.skipExistingCollectionIndexes) {
                     // Smart mode: check what indexes are needed
-                    const checkResult = await shouldCreateIndexes(collection as any, requiredIndexes)
+                    const checkResult = await withConnection(() => shouldCreateIndexes(collection as any, requiredIndexes))
                     
                     if (checkResult.missingIndexes.length === 0) {
                         if (indexConfig.enableIndexHealthLogging) {
@@ -1638,9 +1638,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             ...idx,
                             options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
                         }))
-                        const batchResult = await withConnection(() => 
-                            batchCreateIndexes(collection, timedMissingIndexes)
-                        )
+                        const batchResult = await batchCreateIndexes(collection, timedMissingIndexes, withConnection)
                         
                         createResults.push({
                             collection: collectionName,
@@ -1681,9 +1679,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         ...idx,
                         options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
                     }))
-                    const batchResult = await withConnection(() => 
-                        batchCreateIndexes(collection, timedIndexes)
-                    )
+                    const batchResult = await batchCreateIndexes(collection, timedIndexes, withConnection)
                     
                     createResults.push({
                         collection: collectionName,
