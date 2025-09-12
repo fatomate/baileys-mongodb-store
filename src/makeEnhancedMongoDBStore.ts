@@ -673,11 +673,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const ttlManagedCollections = ['chats', 'messages', 'state', 'presences']
         ttlMonitor = new TTLMonitor(db, { 
             days: globalTTL, 
+            // Safer defaults: require explicit enableMonitoring and use daily checks by default
+            enableMonitoring: ttlMonitoring.enableMonitoring === true,
+            checkIntervalMinutes: ttlMonitoring.checkIntervalMinutes ?? 1440,
             ...ttlMonitoring,
             collectionPrefix,
             collectionsToCheck: ttlManagedCollections,
             // Silence non-critical TTL warnings unless verbose logging
-            onlyCriticalAlerts: logLevel !== 'all'
+            onlyCriticalAlerts: ttlMonitoring.onlyCriticalAlerts ?? (logLevel !== 'all')
         })
         // Start will be called after indexes are created
     }
@@ -3084,8 +3087,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize indexes
     await createIndexes()
     
-    // Start TTL monitor after indexes are ensured
-    if (ttlMonitor) {
+    // Start TTL monitor after indexes are ensured (only if explicitly enabled)
+    if (ttlMonitor && ttlMonitoring?.enableMonitoring === true) {
         ttlMonitor.startMonitoring((message: string) => {
             logWarn(`[TTL Monitor] ${message}`)
         })
@@ -3343,13 +3346,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             log(`📝 [Contacts] Saving ${contacts.length} contacts to database`)
             
-            // Fetch existing contacts to preserve profile picture data
-            const existingContacts = await withConnection(async () =>
-                collections.contacts.find({
-                    instanceId,
-                    id: { $in: contacts.map(c => c.id) }
-                }).toArray()
-            ) as any[]
+            // Fetch existing contacts to preserve profile picture data (chunked + projected)
+            const ids = contacts.map(c => c.id)
+            const existingContacts: any[] = []
+            const idChunkSize = 5000
+            for (let i = 0; i < ids.length; i += idChunkSize) {
+                const idChunk = ids.slice(i, i + idChunkSize)
+                const chunk = await withConnection(async () =>
+                    collections.contacts.find(
+                        { instanceId, id: { $in: idChunk } },
+                        { projection: { id: 1, profilePic: 1, profilePicUpdatedAt: 1 } }
+                    ).toArray()
+                ) as any[]
+                existingContacts.push(...chunk)
+            }
             
             // Create a map of existing profile picture data
             const existingDataMap = new Map(

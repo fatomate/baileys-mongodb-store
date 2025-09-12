@@ -15,6 +15,7 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - **🚀 Redis Bull Queue**: Full Redis Bull queue support for reliable background processing
 - **📸 Media Download**: Automatic download and storage of media files with URL tracking
 - **👤 Profile Picture Auto-Retrieval**: Automatically fetch and update contact profile pictures
+ - **🧭 Low‑Cost TTL Monitoring (Opt‑in)**: Metadata-based counts, daily checks by default, optional oldest-document lookup
 
 ### Existing Features
 - **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes
@@ -271,6 +272,8 @@ await store.upsertContacts([
 ])
 ```
 
+Performance note: bulk contact upserts now prefetch existing records in chunks with a narrow projection (`id`, `profilePic`, `profilePicUpdatedAt`) to reduce query load and memory usage on large imports.
+
 ### Group Management
 
 ```typescript
@@ -401,6 +404,33 @@ This helps:
 - Comply with data retention policies
 - Reduce storage costs
 - Maintain performance
+
+### Advanced TTL Monitoring (Enhanced Store)
+
+The enhanced store includes an optional TTL monitor that validates TTL indexes and checks for expired data with minimal overhead:
+
+```typescript
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_bot',
+    instanceId: 'my_instance',
+    ttlMonitoring: {
+        // Opt-in. If omitted/false, the monitor won't run periodically
+        enableMonitoring: true,
+        // Default is daily (1440 minutes). Use higher frequency only if needed
+        checkIntervalMinutes: 1440,
+        // Emit only critical alerts by default
+        onlyCriticalAlerts: true,
+        // Optional: get oldest document age (uses indexed sort)
+        enableOldestDocumentLookup: false
+    }
+})
+```
+
+Optimizations:
+- Total document count uses `estimatedDocumentCount()` (no full scan)
+- Expired document count uses `countDocuments` with a hint on `updatedAt`
+- Oldest document lookup is disabled by default; enable only when needed
 
 ## Error Handling & Cleanup
 
