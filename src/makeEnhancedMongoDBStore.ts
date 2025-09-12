@@ -5881,7 +5881,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                         { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
-                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } }
+                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
+                        // Ensure compound index exists for manual per-instance cleanup
+                        { name: 'messages_instance_updatedAt', spec: { instanceId: 1, updatedAt: 1 }, options: {} }
                     ],
                     groupMetadata: [
                         { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }

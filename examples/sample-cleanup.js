@@ -937,6 +937,31 @@ class UnifiedCleanupManager {
             const mongoClient = new MongoClient(config.mongo_uri);
             await mongoClient.connect();
             const db = mongoClient.db('wabotv3');
+
+            // Resolve an appropriate hint for deletion. If the compound index does not exist,
+            // attempt to create it. Fallback gracefully to unhinted delete.
+            const messagesCollection = db.collection('wabot_messages');
+            let deletionHint = undefined;
+            try {
+                const indexes = await messagesCollection.listIndexes().toArray();
+                const hasCompound = indexes.find(idx => {
+                    const key = idx.key || {};
+                    return key.instanceId === 1 && key.updatedAt === 1;
+                });
+                if (hasCompound) {
+                    deletionHint = { instanceId: 1, updatedAt: 1 };
+                } else {
+                    // Try to create the index if missing
+                    await messagesCollection.createIndex(
+                        { instanceId: 1, updatedAt: 1 },
+                        { name: 'messages_instance_updatedAt' }
+                    );
+                    deletionHint = { instanceId: 1, updatedAt: 1 };
+                }
+            } catch (e) {
+                console.warn('[Cleanup] Could not resolve/create deletion index; proceeding without hint:', e?.message || e);
+                deletionHint = undefined;
+            }
             
             // Get all active WhatsApp instances with their retention settings
             const [instances] = await promisePool.query(
@@ -985,15 +1010,13 @@ class UnifiedCleanupManager {
                     const cutoffDate = new Date(Date.now() - (retentionDays * 24 * 60 * 60 * 1000));
                     
                     // Delete messages older than retention period (messages only)
-                    const messagesCollection = db.collection('wabot_messages');
+                    const deleteOptions = deletionHint ? { hint: deletionHint } : undefined;
                     const deleteResult = await messagesCollection.deleteMany(
                         {
                             instanceId: instance.instance_id,
                             updatedAt: { $lt: cutoffDate }
                         },
-                        {
-                            hint: 'messages_instance_updatedAt'
-                        }
+                        deleteOptions
                     );
 
                     if (deleteResult.deletedCount > 0) {
