@@ -2003,13 +2003,23 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             }
             
             // Fallback to direct write
-            const bulkOps = contacts.map(contact => ({
-                replaceOne: {
-                    filter: { instanceId, id: contact.id },
-                    replacement: { ...contact, instanceId, updatedAt: new Date() },
-                    upsert: true
+            const bulkOps = contacts.map(contact => {
+                const { notify, ...rest } = (contact as any) || {}
+                return {
+                    updateOne: {
+                        filter: { instanceId, id: contact.id },
+                        update: {
+                            $set: { ...rest, instanceId, updatedAt: new Date() },
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
+                        },
+                        upsert: true
+                    }
                 }
-            }))
+            })
             
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
@@ -2988,6 +2998,32 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         if (lidInfo.mappingStored) {
                             log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
                         }
+                    }
+
+                    // Persist pushName to contacts.notify if available and not from me,
+                    // without overriding existing notify or name
+                    try {
+                        const pushName = (msg as any)?.pushName
+                        if (pushName && !msg.key.fromMe && jid && jid.endsWith('@s.whatsapp.net')) {
+                            const filter: any = {
+                                instanceId,
+                                id: jid,
+                                $or: [
+                                    { notify: { $exists: false } },
+                                    { notify: { $in: [null, ''] } }
+                                ]
+                            }
+                            await collections.contacts.updateOne(
+                                filter,
+                                {
+                                    $set: { notify: pushName, instanceId, updatedAt: new Date() },
+                                    $setOnInsert: { instanceId, id: jid }
+                                },
+                                { upsert: true }
+                            )
+                        }
+                    } catch (err) {
+                        log(`Failed to persist pushName for ${jid}: ${String(err)}`)
                     }
                     
                     await store.upsertMessage(jid, msg)

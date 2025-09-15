@@ -3344,7 +3344,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             log(`📝 [Contacts] Saving ${contacts.length} contacts to database`)
             
-            // Fetch existing contacts to preserve profile picture data (chunked + projected)
+            // Fetch existing contacts to preserve profile picture data and existing notify (chunked + projected)
             const ids = contacts.map(c => c.id)
             const existingContacts: any[] = []
             const idChunkSize = 5000
@@ -3353,7 +3353,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const chunk = await withConnection(async () =>
                     collections.contacts.find(
                         { instanceId, id: { $in: idChunk } },
-                        { projection: { id: 1, profilePic: 1, profilePicUpdatedAt: 1 } }
+                        { projection: { id: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
                     ).toArray()
                 ) as any[]
                 existingContacts.push(...chunk)
@@ -3363,26 +3363,36 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             const existingDataMap = new Map(
                 existingContacts.map(c => [c.id, {
                     profilePic: c.profilePic,
-                    profilePicUpdatedAt: c.profilePicUpdatedAt
+                    profilePicUpdatedAt: c.profilePicUpdatedAt,
+                    notify: c.notify
                 }])
             )
             
             // IMPORTANT: Save contacts directly to ensure data persistence
             // This bypasses the broken SharedQueueManager that causes processor conflicts
             const bulkOps = contacts.map(contact => {
+                const { notify, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
+                // Preserve existing notify; only set notify on insert
                 return {
-                    replaceOne: {
+                    updateOne: {
                         filter: { instanceId, id: contact.id },
-                        replacement: {
-                            ...contact,
-                            instanceId,
-                            updatedAt: new Date(),
-                            // Preserve existing profile picture data if it exists
-                            ...(existing?.profilePic && {
-                                profilePic: existing.profilePic,
-                                profilePicUpdatedAt: existing.profilePicUpdatedAt
-                            })
+                        update: {
+                            $set: {
+                                ...rest,
+                                instanceId,
+                                updatedAt: new Date(),
+                                // Preserve existing profile picture data if it exists
+                                ...(existing?.profilePic && {
+                                    profilePic: existing.profilePic,
+                                    profilePicUpdatedAt: existing.profilePicUpdatedAt
+                                })
+                            },
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
                         },
                         upsert: true
                     }
@@ -4857,6 +4867,35 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                             }
                             
+                            // Before storing, persist pushName to contacts.notify (no override),
+                            // only for incoming messages and user JIDs
+                            try {
+                                const pushName = (msg as any)?.pushName
+                                const targetJid = jid
+                                if (pushName && !msg.key.fromMe && targetJid && targetJid.endsWith('@s.whatsapp.net')) {
+                                    const filter: any = {
+                                        instanceId,
+                                        id: targetJid,
+                                        $or: [
+                                            { notify: { $exists: false } },
+                                            { notify: { $in: [null, ''] } }
+                                        ]
+                                    }
+                                    await withConnection(async () =>
+                                        collections.contacts.updateOne(
+                                            filter,
+                                            {
+                                                $set: { notify: pushName, instanceId, updatedAt: new Date() },
+                                                $setOnInsert: { instanceId, id: targetJid }
+                                            },
+                                            { upsert: true }
+                                        )
+                                    )
+                                }
+                            } catch (err) {
+                                logWarn(`⚠️ [Contacts] Failed to persist pushName for ${jid}: ${String(err)}`)
+                            }
+
                             // Store the message with normalized JID
                             if (jid) {
                                 await storeImpl.upsertMessage(jid, msg)
