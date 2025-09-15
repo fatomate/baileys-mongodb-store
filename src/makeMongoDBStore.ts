@@ -2009,7 +2009,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     updateOne: {
                         filter: { instanceId, id: contact.id },
                         update: {
-                            $set: { ...rest, instanceId, updatedAt: new Date() },
+                            $set: { ...rest, updatedAt: new Date() },
                             $setOnInsert: {
                                 instanceId,
                                 id: contact.id,
@@ -3016,7 +3016,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             await collections.contacts.updateOne(
                                 filter,
                                 {
-                                    $set: { notify: pushName, instanceId, updatedAt: new Date() },
+                                    $set: { notify: pushName, updatedAt: new Date() },
                                     $setOnInsert: { instanceId, id: jid }
                                 },
                                 { upsert: true }

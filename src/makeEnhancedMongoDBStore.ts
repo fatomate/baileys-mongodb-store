@@ -3380,7 +3380,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         update: {
                             $set: {
                                 ...rest,
-                                instanceId,
                                 updatedAt: new Date(),
                                 // Preserve existing profile picture data if it exists
                                 ...(existing?.profilePic && {
@@ -4885,7 +4884,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         collections.contacts.updateOne(
                                             filter,
                                             {
-                                                $set: { notify: pushName, instanceId, updatedAt: new Date() },
+                                                $set: { notify: pushName, updatedAt: new Date() },
                                                 $setOnInsert: { instanceId, id: targetJid }
                                             },
                                             { upsert: true }
