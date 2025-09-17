@@ -3579,6 +3579,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 trackActivity() // Track request
                 
                 const validJid = safeValidateJID(jid)
+                
+                // Fast-exit for placeholder IDs to avoid unnecessary DB queries
+                if (typeof id === 'string' && id.startsWith('PLACEHOLDER_')) {
+                    const nfKey1 = `nf_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(id)}`
+                    const nfKey2 = `nf_${validatedInstanceId}_${hashForLogging(id)}`
+                    notFoundCache.set(nfKey1, true)
+                    notFoundCache.set(nfKey2, true)
+                    return null
+                }
+                
                 const validId = safeValidateMessageId(id)
                 
                 // Early JID normalization: try normalized variant first when available
@@ -3636,12 +3646,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             'key.id': validId
                         }).limit(1)
                         try { cursor.hint({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }) } catch {}
-                        // @ts-ignore maxTimeMS may not be typed on cursor
-                        return (await cursor.maxTimeMS?.(150)?.toArray?.() || await cursor.toArray())[0] || null
+                        try {
+                            const arr = await cursor.maxTimeMS(150).toArray()
+                            return arr[0] || null
+                        } catch {
+                            const arr = await cursor.toArray()
+                            return arr[0] || null
+                        }
                     })
                     
                     if (message) {
                         log(`[getMessage] Found message using key.remoteJid fallback for ${validJid}/${validId}`)
+                        // Read-repair: ensure future primary lookups hit the primary index
+                        try {
+                            await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, 'key.id': validId },
+                                    { $set: { jid: validJid, 'key.remoteJid': validJid } }
+                                )
+                            )
+                        } catch {}
                     }
                 }
                     
@@ -3664,9 +3688,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             // Hint not supported, continue without it
                         }
                         
-                        // @ts-ignore maxTimeMS may not be typed on cursor
-                        const results = await (cursor.maxTimeMS?.(200)?.toArray?.() || cursor.toArray())
-                        return results[0] || null
+                        try {
+                            const results = await cursor.maxTimeMS(200).toArray()
+                            return results[0] || null
+                        } catch {
+                            const results = await cursor.toArray()
+                            return results[0] || null
+                        }
                     })
                     const queryTime = Date.now() - queryStart
                     if (queryTime > 100) {
