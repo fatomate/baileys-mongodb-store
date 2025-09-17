@@ -30,7 +30,8 @@ import {
     ValidationError,
     AuthorizationError,
     createSafeErrorMessage,
-    hashForLogging
+    hashForLogging,
+    safeNormalizeJid
 } from './utils/security'
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController } from './utils/memory'
@@ -3578,7 +3579,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const startTime = Date.now()
                 trackActivity() // Track request
                 
-                const validJid = safeValidateJID(jid)
+                // Normalize out any :XX suffixes for safe comparison/lookup
+                const validJid = safeValidateJID(safeNormalizeJid(jid))
                 
                 // Fast-exit for placeholder IDs to avoid unnecessary DB queries
                 if (typeof id === 'string' && id.startsWith('PLACEHOLDER_')) {
