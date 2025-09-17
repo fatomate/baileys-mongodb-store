@@ -862,11 +862,11 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     })
                     await collections.contacts.bulkWrite(bulkOps, { ordered: false })
                 } else if (type === 'update' && contact) {
-                    const { notify, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                     await collections.contacts.updateOne(
                         { instanceId, id: contact.id },
                         {
-                            $set: { ...rest, instanceId, updatedAt: new Date() },
+                        $set: { ...rest, updatedAt: new Date() },
                             $setOnInsert: {
                                 instanceId,
                                 id: contact.id,
@@ -2004,7 +2004,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Fallback to direct write
             const bulkOps = contacts.map(contact => {
-                const { notify, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                 return {
                     updateOne: {
                         filter: { instanceId, id: contact.id },
@@ -3013,14 +3013,27 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                     { notify: { $in: [null, ''] } }
                                 ]
                             }
-                            await collections.contacts.updateOne(
-                                filter,
-                                {
-                                    $set: { notify: pushName, updatedAt: new Date() },
-                                    $setOnInsert: { instanceId, id: jid }
-                                },
-                                { upsert: true }
-                            )
+                            try {
+                                await collections.contacts.updateOne(
+                                    filter,
+                                    {
+                                        $set: { notify: pushName, updatedAt: new Date() },
+                                        $setOnInsert: { instanceId, id: jid }
+                                    },
+                                    { upsert: true }
+                                )
+                            } catch (e: any) {
+                                if (e?.code === 11000) {
+                                    // Retry without upsert and keep the same conditional filter
+                                    await collections.contacts.updateOne(
+                                        filter,
+                                        { $set: { notify: pushName, updatedAt: new Date() } },
+                                        { upsert: false }
+                                    )
+                                } else {
+                                    throw e
+                                }
+                            }
                         }
                     } catch (err) {
                         log(`Failed to persist pushName for ${jid}: ${String(err)}`)

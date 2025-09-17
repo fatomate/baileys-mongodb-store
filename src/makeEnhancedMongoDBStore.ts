@@ -1177,14 +1177,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (type === 'upsert' && contacts) {
                 // Bulk upsert without overriding user-saved notify
                 const bulkOps = contacts.map((contact: Contact) => {
-                    const { notify, ...rest } = (contact as any) || {}
+                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                     return {
                         updateOne: {
                             filter: { instanceId: validatedInstanceId, id: contact.id },
                             update: {
                                 $set: {
                                     ...rest,
-                                    instanceId: validatedInstanceId,
+                                    // never set id/instanceId in $set; they are set on insert only
                                     updatedAt: new Date()
                                 },
                                 $setOnInsert: {
@@ -1205,14 +1205,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 return { success: true, count: contacts.length }
             } else if (type === 'update' && contact) {
                 // Single update without overriding user-saved notify
-                const { notify, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                 await withConnection(async () =>
                     collections.contacts.updateOne(
                         { instanceId: validatedInstanceId, id: contact.id },
                         {
                             $set: {
                                 ...rest,
-                                instanceId: validatedInstanceId,
+                                // never set id/instanceId in $set; they are set on insert only
                                 updatedAt: new Date()
                             },
                             $setOnInsert: {
@@ -2104,12 +2104,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 if (type === 'upsert' && contacts) {
                     const bulkOps = contacts.map((contact: Contact) => {
-                        const { notify, ...rest } = (contact as any) || {}
+                        const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                         return {
                             updateOne: {
                                 filter: { instanceId, id: contact.id },
                                 update: {
-                                    $set: { ...rest, instanceId, updatedAt: new Date() },
+                                    $set: { ...rest, updatedAt: new Date() },
                                     $setOnInsert: {
                                         instanceId,
                                         id: contact.id,
@@ -2187,12 +2187,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
-                    const { notify, ...rest } = (contact as any) || {}
+                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                     await withConnection(async () =>
                         collections.contacts.updateOne(
                             { instanceId, id: contact.id },
                             {
-                                $set: { ...rest, instanceId, updatedAt: new Date() },
+                                $set: { ...rest, updatedAt: new Date() },
                                 $setOnInsert: {
                                     instanceId,
                                     id: contact.id,
@@ -4880,16 +4880,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             { notify: { $in: [null, ''] } }
                                         ]
                                     }
-                                    await withConnection(async () =>
-                                        collections.contacts.updateOne(
-                                            filter,
-                                            {
-                                                $set: { notify: pushName, updatedAt: new Date() },
-                                                $setOnInsert: { instanceId, id: targetJid }
-                                            },
-                                            { upsert: true }
-                                        )
-                                    )
+                                    await withConnection(async () => {
+                                        try {
+                                            await collections.contacts.updateOne(
+                                                filter,
+                                                {
+                                                    $set: { notify: pushName, updatedAt: new Date() },
+                                                    $setOnInsert: { instanceId, id: targetJid }
+                                                },
+                                                { upsert: true }
+                                            )
+                                        } catch (e: any) {
+                                            // Handle rare race where another writer inserted the doc between filter check and upsert
+                                            if (e?.code === 11000) {
+                                                // Try a non-upsert update with the same conditional filter to avoid overriding existing notify
+                                                await collections.contacts.updateOne(
+                                                    filter,
+                                                    { $set: { notify: pushName, updatedAt: new Date() } },
+                                                    { upsert: false }
+                                                )
+                                            } else {
+                                                throw e
+                                            }
+                                        }
+                                    })
                                 }
                             } catch (err) {
                                 logWarn(`⚠️ [Contacts] Failed to persist pushName for ${jid}: ${String(err)}`)
