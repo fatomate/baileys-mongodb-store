@@ -373,25 +373,48 @@ export class LidHandler {
         
         try {
             // Upsert the mapping into contacts (by phone JID as contact id)
-            await this.contactsCollection.updateOne(
-                { 
-                    instanceId: this.instanceId, 
-                    id: normalizedPhone 
-                },
-                {
-                    $set: {
-                        ...(shouldSetLid ? { lid: normalizedLid } : {}),
-                        updatedAt: now,
-                        ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
+            try {
+                await this.contactsCollection.updateOne(
+                    { 
+                        instanceId: this.instanceId, 
+                        id: normalizedPhone 
                     },
-                    $setOnInsert: {
-                        instanceId: this.instanceId,
-                        id: normalizedPhone,
-                        lidFirstSeen: now
-                    }
-                },
-                { upsert: true }
-            )
+                    {
+                        $set: {
+                            ...(shouldSetLid ? { lid: normalizedLid } : {}),
+                            updatedAt: now,
+                            ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
+                        },
+                        $setOnInsert: {
+                            instanceId: this.instanceId,
+                            id: normalizedPhone,
+                            lidFirstSeen: now
+                        }
+                    },
+                    { upsert: true }
+                )
+            } catch (e: any) {
+                if (e?.code === 11000) {
+                    // Retry without upsert; don't override existing pushName if set
+                    await this.contactsCollection.updateOne(
+                        { 
+                            instanceId: this.instanceId, 
+                            id: normalizedPhone,
+                            ...(shouldSetPushName ? { $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ] } : {})
+                        } as any,
+                        {
+                            $set: {
+                                ...(shouldSetLid ? { lid: normalizedLid } : {}),
+                                updatedAt: now,
+                                ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
+                            }
+                        },
+                        { upsert: false }
+                    )
+                } else {
+                    throw e
+                }
+            }
             
             // Update cache if enabled (use normalized JIDs for cache keys)
             if (this.config.enableCache) {

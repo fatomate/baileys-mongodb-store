@@ -1667,7 +1667,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Set concurrency based on queue type
                 let concurrency: number
-                if (queueType === QueueType.LABEL_ASSOCIATIONS) {
+                if (queueType === QueueType.LABEL_ASSOCIATIONS || queueType === QueueType.CONTACTS) {
                     concurrency = 1
                 } else if (queueType === QueueType.PROFILE_PICTURES) {
                     concurrency = profilePictureConfig?.maxConcurrent || 5
@@ -3371,7 +3371,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // IMPORTANT: Save contacts directly to ensure data persistence
             // This bypasses the broken SharedQueueManager that causes processor conflicts
             const bulkOps = contacts.map(contact => {
-                const { notify, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
                 // Preserve existing notify; only set notify on insert
                 return {
@@ -3401,9 +3401,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE)
-                await withConnection(async () =>
-                    collections.contacts.bulkWrite(chunk, { ordered: false })
-                )
+                try {
+                    await withConnection(async () =>
+                        collections.contacts.bulkWrite(chunk, { ordered: false })
+                    )
+                } catch (e: any) {
+                    // Handle duplicate and path conflict errors by retrying without upsert
+                    if (e?.code === 11000 || e?.code === 40 || String(e?.message || '').includes("conflict at 'id'")) {
+                        const fallbackOps = chunk.map(op => {
+                            const u = (op as any).updateOne
+                            return {
+                                updateOne: {
+                                    filter: u.filter,
+                                    update: { $set: u.update?.$set || {} },
+                                    upsert: false
+                                }
+                            }
+                        })
+                        await withConnection(async () =>
+                            collections.contacts.bulkWrite(fallbackOps as any, { ordered: false })
+                        )
+                    } else {
+                        throw e
+                    }
+                }
             }
             
             log(`✅ [Contacts] Saved ${contacts.length} contacts to database`)
@@ -4872,38 +4893,52 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const pushName = (msg as any)?.pushName
                                 const targetJid = jid
                                 if (pushName && !msg.key.fromMe && targetJid && targetJid.endsWith('@s.whatsapp.net')) {
-                                    const filter: any = {
-                                        instanceId,
-                                        id: targetJid,
-                                        $or: [
-                                            { notify: { $exists: false } },
-                                            { notify: { $in: [null, ''] } }
-                                        ]
-                                    }
-                                    await withConnection(async () => {
-                                        try {
-                                            await collections.contacts.updateOne(
-                                                filter,
-                                                {
-                                                    $set: { notify: pushName, updatedAt: new Date() },
-                                                    $setOnInsert: { instanceId, id: targetJid }
-                                                },
-                                                { upsert: true }
-                                            )
-                                        } catch (e: any) {
-                                            // Handle rare race where another writer inserted the doc between filter check and upsert
-                                            if (e?.code === 11000) {
-                                                // Try a non-upsert update with the same conditional filter to avoid overriding existing notify
+                                    // Route through CONTACTS queue to serialize writes
+                                    if (queues.has(QueueType.CONTACTS)) {
+                                        const queue = queues.get(QueueType.CONTACTS)!
+                                        await queue.add(
+                                            'update',
+                                            {
+                                                type: 'update',
+                                                contact: { id: targetJid, notify: pushName },
+                                                instanceId,
+                                                timestamp: Date.now()
+                                            },
+                                            { ...defaultJobOptions, priority: 3 }
+                                        )
+                                    } else {
+                                        // Fallback to direct guarded update
+                                        const filter: any = {
+                                            instanceId,
+                                            id: targetJid,
+                                            $or: [
+                                                { notify: { $exists: false } },
+                                                { notify: { $in: [null, ''] } }
+                                            ]
+                                        }
+                                        await withConnection(async () => {
+                                            try {
                                                 await collections.contacts.updateOne(
                                                     filter,
-                                                    { $set: { notify: pushName, updatedAt: new Date() } },
-                                                    { upsert: false }
+                                                    {
+                                                        $set: { notify: pushName, updatedAt: new Date() },
+                                                        $setOnInsert: { instanceId, id: targetJid }
+                                                    },
+                                                    { upsert: true }
                                                 )
-                                            } else {
-                                                throw e
+                                            } catch (e: any) {
+                                                if (e?.code === 11000) {
+                                                    await collections.contacts.updateOne(
+                                                        filter,
+                                                        { $set: { notify: pushName, updatedAt: new Date() } },
+                                                        { upsert: false }
+                                                    )
+                                                } else {
+                                                    throw e
+                                                }
                                             }
-                                        }
-                                    })
+                                        })
+                                    }
                                 }
                             } catch (err) {
                                 logWarn(`⚠️ [Contacts] Failed to persist pushName for ${jid}: ${String(err)}`)

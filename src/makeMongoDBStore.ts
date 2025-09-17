@@ -511,8 +511,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 queues.set(queueType, queue)
                 
                 // Set concurrency based on queue type
-                // Label associations MUST have concurrency of 1 to maintain order
-                const concurrency = queueType === QueueType.LABEL_ASSOCIATIONS ? 1 : (redis.concurrency || 50)
+                // Label associations and CONTACTS MUST have concurrency of 1 to maintain order and avoid races
+                const concurrency = (queueType === QueueType.LABEL_ASSOCIATIONS || queueType === QueueType.CONTACTS)
+                    ? 1
+                    : (redis.concurrency || 50)
                 
                 // Create worker
                 const worker = new Worker<T>(
@@ -3005,33 +3007,47 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     try {
                         const pushName = (msg as any)?.pushName
                         if (pushName && !msg.key.fromMe && jid && jid.endsWith('@s.whatsapp.net')) {
-                            const filter: any = {
-                                instanceId,
-                                id: jid,
-                                $or: [
-                                    { notify: { $exists: false } },
-                                    { notify: { $in: [null, ''] } }
-                                ]
-                            }
-                            try {
-                                await collections.contacts.updateOne(
-                                    filter,
+                            // Route via CONTACTS queue to serialize writes
+                            if (bullInitialized && queues.has(QueueType.CONTACTS)) {
+                                const queue = queues.get(QueueType.CONTACTS)!
+                                await queue.add(
+                                    'update',
                                     {
-                                        $set: { notify: pushName, updatedAt: new Date() },
-                                        $setOnInsert: { instanceId, id: jid }
+                                        type: 'update',
+                                        contact: { id: jid, notify: pushName },
+                                        instanceId,
+                                        timestamp: Date.now()
                                     },
-                                    { upsert: true }
+                                    defaultJobOptions
                                 )
-                            } catch (e: any) {
-                                if (e?.code === 11000) {
-                                    // Retry without upsert and keep the same conditional filter
+                            } else {
+                                const filter: any = {
+                                    instanceId,
+                                    id: jid,
+                                    $or: [
+                                        { notify: { $exists: false } },
+                                        { notify: { $in: [null, ''] } }
+                                    ]
+                                }
+                                try {
                                     await collections.contacts.updateOne(
                                         filter,
-                                        { $set: { notify: pushName, updatedAt: new Date() } },
-                                        { upsert: false }
+                                        {
+                                            $set: { notify: pushName, updatedAt: new Date() },
+                                            $setOnInsert: { instanceId, id: jid }
+                                        },
+                                        { upsert: true }
                                     )
-                                } else {
-                                    throw e
+                                } catch (e: any) {
+                                    if (e?.code === 11000) {
+                                        await collections.contacts.updateOne(
+                                            filter,
+                                            { $set: { notify: pushName, updatedAt: new Date() } },
+                                            { upsert: false }
+                                        )
+                                    } else {
+                                        throw e
+                                    }
                                 }
                             }
                         }
