@@ -175,6 +175,19 @@ const binaryConversionCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
 // Negative cache for not-found lookups to avoid repeated slow fallbacks
 const notFoundCache = new NodeCache({ stdTTL: 60, checkperiod: 30, useClones: false })
 
+// Deduplication caches to prevent duplicate processing/log spam
+const processedEditCache = new NodeCache({ stdTTL: 10, checkperiod: 30 })
+const logThrottleCache = new NodeCache({ stdTTL: 2, checkperiod: 5 })
+
+// Helper to rate-limit repeated logs for the same key
+const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
+    if (logThrottleCache.get(key)) {
+        return false
+    }
+    logThrottleCache.set(key, true, ttlSeconds)
+    return true
+}
+
 // Helper function to convert MongoDB Binary objects to Buffers
 const convertBinaryToBuffer = (obj: any): any => {
     try {
@@ -1155,15 +1168,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 )
                 return { success: true, type: 'update' }
             } else if (type === 'delete' && deleteIds) {
-                // Delete messages
+                // Mark messages as revoked instead of deleting
                 await withConnection(async () =>
-                    collections.messages.deleteMany({
-                        instanceId: validatedInstanceId,
-                        jid,
-                        'key.id': { $in: deleteIds }
-                    })
+                    collections.messages.updateMany(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid,
+                            'key.id': { $in: deleteIds }
+                        },
+                        {
+                            $set: {
+                                revoked: true,
+                                revokedAt: new Date(),
+                                updatedAt: new Date()
+                            }
+                        }
+                    )
                 )
-                return { success: true, type: 'delete', count: deleteIds.length }
+                return { success: true, type: 'delete', count: deleteIds.length, marked: true }
             }
             
             return { success: false, error: 'Unknown message job type' }
@@ -2045,17 +2067,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         )
                     }
                 } else if (type === 'delete') {
+                    // Mark messages as revoked/deleted instead of deleting
                     if (deleteIds && deleteIds.length > 0) {
                         await withConnection(async () =>
-                            collections.messages.deleteMany({
-                                instanceId,
-                                jid,
-                                'key.id': { $in: deleteIds }
-                            })
+                            collections.messages.updateMany(
+                                { instanceId, jid, 'key.id': { $in: deleteIds } },
+                                { $set: { revoked: true, revokedAt: new Date(), updatedAt: new Date() } }
+                            )
                         )
                     } else {
                         await withConnection(async () =>
-                            collections.messages.deleteMany({ instanceId, jid })
+                            collections.messages.updateMany(
+                                { instanceId, jid },
+                                { $set: { deleted: true, deletedAt: new Date(), updatedAt: new Date() } }
+                            )
                         )
                     }
                 }
@@ -4177,15 +4202,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const originalTimestamp = existingMsg.messageTimestamp
                 
                 if (isMessageEdit) {
-                    log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
-                    log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                    if (shouldLogOnce(`um_det_${id}`, 5)) {
+                        log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
+                    }
+                    if (shouldLogOnce(`um_ts_${id}`, 5)) {
+                        log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                    }
                 }
                 
                 // Preserve original timestamp for edits
                 if (isMessageEdit && originalTimestamp) {
                     finalUpdate = { ...update }
                     finalUpdate.messageTimestamp = originalTimestamp
-                    log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                    if (shouldLogOnce(`um_pres_${id}`, 5)) {
+                        log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                    }
                 }
                 
                 // If existing message has quoted message and update has message content, preserve quoted structure
@@ -4281,16 +4312,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
-            // Fallback to direct delete
-            const filter: any = { instanceId: validatedInstanceId, jid: validJid }
-            
+            // Fallback to marking as revoked/deleted instead of deleting
             if (validIds && validIds.length > 0) {
-                filter['key.id'] = { $in: validIds }
+                await withConnection(async () =>
+                    collections.messages.updateMany(
+                        { instanceId: validatedInstanceId, jid: validJid, 'key.id': { $in: validIds } },
+                        { $set: { revoked: true, revokedAt: new Date(), updatedAt: new Date() } }
+                    )
+                )
+            } else {
+                await withConnection(async () =>
+                    collections.messages.updateMany(
+                        { instanceId: validatedInstanceId, jid: validJid },
+                        { $set: { deleted: true, deletedAt: new Date(), updatedAt: new Date() } }
+                    )
+                )
             }
-            
-            await withConnection(async () =>
-                collections.messages.deleteMany(filter)
-            )
             } catch (error) {
                 if (error instanceof ValidationError || error instanceof AuthorizationError) {
                     throw error
@@ -5139,6 +5176,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         jid = await lidHandler.normalizeJid(jid) || jid
                     }
                     
+                    // Deduplicate identical updates for the same message within a short window
+                    try {
+                        const updateSignature = JSON.stringify(update.update?.message?.editedMessage || update.update || {})
+                        const dedupKey = `mu_${update.key.id}_${hashForLogging(updateSignature)}`
+                        if (processedEditCache.get(dedupKey)) {
+                            continue
+                        }
+                        processedEditCache.set(dedupKey, true, 5)
+                    } catch {}
+
                     if (await shouldStoreEvent('messages.update', update)) {
                         try {
                             // For edited messages, we need to preserve the quoted message structure
@@ -5153,8 +5200,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const originalTimestamp = existingMessage.messageTimestamp
                                 
                                 if (isMessageEdit) {
-                                    log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
-                                    log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                    if (shouldLogOnce(`mu_det_${update.key.id}`, 5)) {
+                                        log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
+                                    }
+                                    if (shouldLogOnce(`mu_ts_${update.key.id}`, 5)) {
+                                        log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                    }
                                 }
                                 
                                 // Deep merge the update with existing message to preserve quoted messages
@@ -5170,7 +5221,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 // CRITICAL: Preserve original messageTimestamp for MESSAGE_EDIT
                                 if (isMessageEdit && originalTimestamp) {
                                     mergedUpdate.messageTimestamp = originalTimestamp
-                                    log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                                    if (shouldLogOnce(`mu_pres_${update.key.id}`, 5)) {
+                                        log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                                    }
                                 }
                                 
                                 // Preserve quoted message structure if it exists
@@ -5191,7 +5244,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 await storeImpl.updateMessage(jid, update.key.id!, mergedUpdate)
-                                log(`✅ Updated message ${update.key.id} preserving quoted message structure${isMessageEdit ? ' and original timestamp' : ''}`)
+                                if (shouldLogOnce(`mu_done_${update.key.id}`, 2)) {
+                                    log(`✅ Updated message ${update.key.id} preserving quoted message structure${isMessageEdit ? ' and original timestamp' : ''}`)
+                                }
                             } else {
                                 // If no existing message found, just apply the update
                                 await storeImpl.updateMessage(jid, update.key.id!, update.update!)
@@ -5221,13 +5276,35 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     const ids = item.keys.map(k => k.id).filter(id => id) as string[]
+                    const fromMe = item.keys[0]?.fromMe
                     if (await shouldStoreEvent('messages.delete', item)) {
                         try {
-                            await storeImpl.deleteMessages(jid, ids)
+                            // Retain original messages but mark them as revoked/deleted instead of removing
+                            const updateFields: any = {
+                                revoked: true,
+                                revokedAt: new Date(),
+                                updatedAt: new Date()
+                            }
+                            if (typeof fromMe === 'boolean') {
+                                updateFields.revokedBy = fromMe ? 'me' : 'remote'
+                            }
+                            await withConnection(async () =>
+                                collections.messages.updateMany(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': { $in: ids }
+                                    },
+                                    { $set: updateFields }
+                                )
+                            )
+                            if (shouldLogOnce(`md_mark_${hashForLogging(jid)}_${hashForLogging(ids.join(','))}`, 5)) {
+                                log(`✅ Marked ${ids.length} message(s) as revoked in ${jid}`)
+                            }
                             if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
                             if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
                         } catch (error) {
-                            logError(`Failed to delete messages for ${jid}:`, error)
+                            logError(`Failed to mark messages revoked for ${jid}:`, error)
                             if (enableMetrics) updateEventMetrics('messages.delete', 'error')
                         }
                     }
@@ -5242,11 +5319,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     if (await shouldStoreEvent('messages.delete', item)) {
                         try {
-                            await storeImpl.deleteMessages(jid)
+                            // Retain messages but mark them as deleted for the chat
+                            await withConnection(async () =>
+                                collections.messages.updateMany(
+                                    { instanceId, jid },
+                                    { $set: { deleted: true, deletedAt: new Date(), updatedAt: new Date() } }
+                                )
+                            )
+                            if (shouldLogOnce(`md_mark_all_${hashForLogging(jid)}`, 10)) {
+                                log(`✅ Marked all messages as deleted in ${jid}`)
+                            }
                             if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
                             if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
                         } catch (error) {
-                            logError(`Failed to delete all messages for ${item.jid}:`, error)
+                            logError(`Failed to mark all messages deleted for ${item.jid}:`, error)
                             if (enableMetrics) updateEventMetrics('messages.delete', 'error')
                         }
                     }
