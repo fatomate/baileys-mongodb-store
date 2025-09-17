@@ -171,6 +171,8 @@ interface MongoCollections {
 
 // Cache for Binary conversions
 const binaryConversionCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+// Negative cache for not-found lookups to avoid repeated slow fallbacks
+const notFoundCache = new NodeCache({ stdTTL: 60, checkperiod: 30, useClones: false })
 
 // Helper function to convert MongoDB Binary objects to Buffers
 const convertBinaryToBuffer = (obj: any): any => {
@@ -3579,6 +3581,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const validJid = safeValidateJID(jid)
                 const validId = safeValidateMessageId(id)
                 
+                // Early JID normalization: try normalized variant first when available
+                const candidateJids: string[] = [validJid]
+                if (lidHandler) {
+                    try {
+                        const normalized = await lidHandler.normalizeJid(validJid)
+                        if (normalized && normalized !== validJid) {
+                            candidateJids.unshift(normalized)
+                        }
+                    } catch {}
+                }
+                
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
                 
                 const cached = binaryConversionCache.get<proto.IWebMessageInfo>(cacheKey)
@@ -3587,27 +3600,45 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     return cached
                 }
                 
-                // First try the standard query
-                let message = await withConnection(async () => 
-                    collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        'key.id': validId
-                    })
-                )
+                // Negative cache: avoid repeated slow lookups for recent misses
+                const nfKey1 = `nf_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
+                const nfKey2 = `nf_${validatedInstanceId}_${hashForLogging(validId)}`
+                if (notFoundCache.get(nfKey1) || notFoundCache.get(nfKey2)) {
+                    return null
+                }
+                
+                // First try the standard query, with hint and time budget; try normalized JID first
+                let message: any = null
+                for (const tryJid of candidateJids) {
+                    message = await withConnection(async () => 
+                        collections.messages.findOne({
+                            instanceId: validatedInstanceId,
+                            jid: tryJid,
+                            'key.id': validId
+                        }, {
+                            // @ts-ignore - hint & maxTimeMS supported by driver
+                            hint: { instanceId: 1, jid: 1, 'key.id': 1 },
+                            maxTimeMS: 150
+                        } as any)
+                    )
+                    if (message) break
+                }
                 
                 // If not found, try alternative queries for poll messages and other edge cases
                 if (!message) {
                     
                     // Try with key.remoteJid instead of jid field (common for poll messages)
                     log(`[getMessage] Primary query failed, trying fallback with key.remoteJid for ${validJid}/${validId}`)
-                    message = await withConnection(async () =>
-                        collections.messages.findOne({
+                    message = await withConnection(async () => {
+                        const cursor = collections.messages.find({
                             instanceId: validatedInstanceId,
                             'key.remoteJid': validJid,
                             'key.id': validId
-                        })
-                    )
+                        }).limit(1)
+                        try { cursor.hint({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }) } catch {}
+                        // @ts-ignore maxTimeMS may not be typed on cursor
+                        return (await cursor.maxTimeMS?.(150)?.toArray?.() || await cursor.toArray())[0] || null
+                    })
                     
                     if (message) {
                         log(`[getMessage] Found message using key.remoteJid fallback for ${validJid}/${validId}`)
@@ -3633,7 +3664,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             // Hint not supported, continue without it
                         }
                         
-                        const results = await cursor.toArray()
+                        // @ts-ignore maxTimeMS may not be typed on cursor
+                        const results = await (cursor.maxTimeMS?.(200)?.toArray?.() || cursor.toArray())
                         return results[0] || null
                     })
                     const queryTime = Date.now() - queryStart
@@ -3641,7 +3673,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         logWarn(`[getMessage] Slow query detected: ${queryTime}ms for key.id lookup (${validId})`)
                     }
                     
-                    // Check if the JID mismatch is acceptable
+                    // Check if the JID mismatch is acceptable, and attempt read-repair when resolvable
                     if (message && message.key?.remoteJid !== validJid) {
                             const foundJid = message.key?.remoteJid || message.jid
                             
@@ -3690,6 +3722,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         } catch (updateError) {
                                             logError(`Failed to update messages with new LID mapping:`, updateError)
                                         }
+                                        
+                                        // Read-repair for the current message document
+                                        try {
+                                            await withConnection(async () =>
+                                                collections.messages.updateOne(
+                                                    {
+                                                        instanceId: validatedInstanceId,
+                                                        'key.id': validId
+                                                    },
+                                                    {
+                                                        $set: {
+                                                            jid: phoneJid,
+                                                            'key.remoteJid': phoneJid,
+                                                            'lidMapping.resolved': true,
+                                                            'lidMapping.resolvedAt': new Date()
+                                                        }
+                                                    }
+                                                )
+                                            )
+                                        } catch {}
                                     }
                                 }
                             }
@@ -3705,6 +3757,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (!message) {
                         // Only log basic info, avoid expensive debug queries
                         log(`Message not found - ID: ${validId}, JID: ${validJid}`)
+                        notFoundCache.set(nfKey1, true)
+                        notFoundCache.set(nfKey2, true)
                         return null
                     }
                 

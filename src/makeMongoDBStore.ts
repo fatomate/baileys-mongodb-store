@@ -51,6 +51,8 @@ let activeConnections: ActiveConnection[] = []
 
 // Cache for Binary conversions (TTL: 5 minutes, check period: 60 seconds)
 const binaryConversionCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+// Negative cache for not-found lookups
+const notFoundCache = new NodeCache({ stdTTL: 60, checkperiod: 30, useClones: false })
 
 // Queue configuration for concurrent operations
 const QUEUE_CONCURRENCY = 50 // Process up to 50 operations concurrently
@@ -2096,22 +2098,37 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     return cached
                 }
                 
-                // Primary query using jid
+                // Negative cache for not-found
+                const nfKey1 = `nf_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
+                const nfKey2 = `nf_${validatedInstanceId}_${hashForLogging(validId)}`
+                if (notFoundCache.get(nfKey1) || notFoundCache.get(nfKey2)) {
+                    return null
+                }
+                
+                // Primary query using jid with index hint & time budget
                 let message = await collections.messages.findOne({
                     instanceId: validatedInstanceId,
                     jid: validJid,
                     'key.id': validId
-                })
+                }, {
+                    // @ts-ignore
+                    hint: { instanceId: 1, jid: 1, 'key.id': 1 },
+                    maxTimeMS: 150
+                } as any)
                 
                 // Fallback query using key.remoteJid (for poll messages and edge cases)
                 if (!message) {
                     const fallbackStart = Date.now()
                     log(`[getMessage] Primary query failed for jid: ${validJid}, id: ${validId}. Trying fallback with key.remoteJid`)
-                    message = await collections.messages.findOne({
+                    const remoteCursor = collections.messages.find({
                         instanceId: validatedInstanceId,
                         'key.remoteJid': validJid,
                         'key.id': validId
-                    })
+                    }).limit(1)
+                    try { remoteCursor.hint({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }) } catch {}
+                    // @ts-ignore
+                    const arr = await (remoteCursor.maxTimeMS?.(150)?.toArray?.() || remoteCursor.toArray())
+                    message = arr[0] || null
                     
                     const fallbackTime = Date.now() - fallbackStart
                     if (message) {
@@ -2121,14 +2138,50 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                 }
                 
+                // Last-resort fallback: instanceId + key.id only with hint & budget
+                if (!message) {
+                    const idCursor = collections.messages.find({
+                        instanceId: validatedInstanceId,
+                        'key.id': validId
+                    }).limit(1)
+                    try { idCursor.hint({ instanceId: 1, 'key.id': 1 }) } catch {}
+                    // @ts-ignore
+                    const arr = await (idCursor.maxTimeMS?.(200)?.toArray?.() || idCursor.toArray())
+                    message = arr[0] || null
+                }
+
                 if (!message) {
                     const totalTime = Date.now() - startTime
                     if (totalTime > 100) {
                         logWarn(`[getMessage] Message not found after ${totalTime}ms - ID: ${validId}, JID: ${validJid}`)
                     }
+                    notFoundCache.set(nfKey1, true)
+                    notFoundCache.set(nfKey2, true)
                     return null
                 }
                 
+                // Read-repair for LID↔phone mismatch if resolvable
+                try {
+                    const foundJid = (message as any)?.key?.remoteJid || (message as any)?.jid
+                    if (foundJid && foundJid !== validJid) {
+                        // Only attempt repair for LID/phone pairing scenarios
+                        const isPair = (lidHandler && (await (async () => {
+                            try {
+                                // naive check using LidHandler helpers if available
+                                return lidHandler.isLidFormat(foundJid) || lidHandler.isLidFormat(validJid)
+                            } catch { return false }
+                        })()))
+                        if (isPair) {
+                            try {
+                                await collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, 'key.id': validId },
+                                    { $set: { jid: validJid, 'key.remoteJid': validJid } }
+                                )
+                            } catch {}
+                        }
+                    }
+                } catch {}
+
                 // Check access permissions
                 accessContext.validateAccess(message.instanceId, 'read')
                 
