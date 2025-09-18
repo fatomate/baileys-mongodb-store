@@ -546,7 +546,7 @@ export interface EnhancedMongoDBStore {
     loadMessages(jid: string, count: number, cursor: WAMessageCursor): Promise<proto.IWebMessageInfo[]>
     loadMessage(jid: string, id: string): Promise<proto.IWebMessageInfo | undefined>
     mostRecentMessage(jid: string): Promise<proto.IWebMessageInfo | undefined>
-    clearAll(options?: { preserve?: Array<'chats' | 'contacts' | 'messages' | 'presences'> }): Promise<void>
+    clearAll(): Promise<void>
     getPerformanceStats(): {
         messagesProcessed: number
         labelsProcessed: number
