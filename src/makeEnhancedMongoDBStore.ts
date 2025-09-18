@@ -1256,7 +1256,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
 
                     // Base update with $set (always present with updatedAt)
-                    const update = {
+                    const update: any = {
                         $set: setData,
                         $setOnInsert: {
                             instanceId,
@@ -2263,7 +2263,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
 
                         // Base update with $set (always present with updatedAt)
-                        const update = {
+                        const update: any = {
                             $set: setData,
                             $setOnInsert: {
                                 instanceId,
@@ -3595,7 +3595,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
 
                 // Base update with $set (always present with updatedAt)
-                const update = {
+                const update: any = {
                     $set: setData,
                     $setOnInsert: {
                         instanceId,
