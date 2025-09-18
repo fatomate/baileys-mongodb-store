@@ -3807,7 +3807,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                         log(`📍 [Contacts] Starting LID fetch for ${contacts.length} contacts`)
 
-                        const requestDelay = lidConfig.requestDelay || 1000 // Increased default delay for rate limiting
+                        const requestDelay = lidConfig.requestDelay || 500 // Increased default delay for rate limiting
                         const maxRetries = lidConfig.retryAttempts || 3
 
                         for (const contact of contacts) {
