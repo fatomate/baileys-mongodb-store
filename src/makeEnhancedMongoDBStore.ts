@@ -3807,8 +3807,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                         log(`📍 [Contacts] Starting LID fetch for ${contacts.length} contacts`)
 
-                        const requestDelay = lidConfig.requestDelay || 500
+                        const requestDelay = lidConfig.requestDelay || 1000 // Increased default delay for rate limiting
                         const maxRetries = lidConfig.retryAttempts || 3
+                        const recentWindowMs = 7 * 24 * 60 * 60 * 1000 // 7 days for recent messages check
 
                         for (const contact of contacts) {
                             // Only fetch LIDs for user JIDs (@s.whatsapp.net)
@@ -3822,6 +3823,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                             if (existingData?.lid) {
                                 log(`⏭️ [Contacts] Skipping LID for ${contact.id} (already has LID)`)
+                                continue
+                            }
+
+                            // 2. Add Mapping Check: Check if lidHandler has existing mapping
+                            if (lidHandler) {
+                                const existingPhone = await lidHandler.getPhoneNumberFromLid(contact.id)
+                                if (existingPhone) {
+                                    log(`⏭️ [Contacts] Skipping LID for ${contact.id} (existing mapping found)`)
+                                    continue
+                                }
+                            }
+
+                            // 4. Conditional Fetching: Check if contact has recent messages
+                            const hasRecentMessages = await withConnection(async () =>
+                                collections.messages.findOne({
+                                    instanceId,
+                                    jid: contact.id,
+                                    messageTimestamp: { $gte: Date.now() - recentWindowMs }
+                                })
+                            )
+
+                            if (hasRecentMessages) {
+                                log(`⏭️ [Contacts] Skipping LID for ${contact.id} (has recent messages, LID likely already discovered)`)
                                 continue
                             }
 
@@ -3859,6 +3883,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                 }
                                             )
                                         )
+
+                                        // 1. Integrate with lidHandler: Store the mapping after successful fetch
+                                        if (lidHandler) {
+                                            await lidHandler.storeLidMapping(contact.id, lid, contact.notify || contact.name)
+                                            log(`✅ [Contacts] Stored LID mapping for ${contact.id}`)
+                                        }
+
                                         log(`✅ [Contacts] Updated LID for ${contact.id}`)
                                         break
                                     }
