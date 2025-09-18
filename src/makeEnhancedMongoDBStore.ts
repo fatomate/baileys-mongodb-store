@@ -5240,8 +5240,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 // Clear all data if any event has isLatest=true and clearAllOnHistorySync is enabled
                                 if (hasLatest && config.clearAllOnHistorySync) {
-                                    log(`[${instanceId}] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)`)
-                                    await storeImpl.clearAll()
+                                log(`[${instanceId}] Clearing data before syncing latest history (isLatest=true, clearAllOnHistorySync=true) while preserving contacts`)
+                                await storeImpl.clearAll({ preserve: ['contacts'] })
                                 }
                                 
                                 // Merge all history data
@@ -5612,7 +5612,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return messages[0]
         },
 
-        async clearAll(): Promise<void> {
+        async clearAll(options?: { preserve?: Array<'chats' | 'contacts' | 'messages' | 'presences'> }): Promise<void> {
             // Check if clearAll is already in progress
             if (clearAllInProgress) {
                 log(`[${instanceId}] clearAll already in progress, skipping duplicate call`)
@@ -5685,18 +5685,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 })
                 
                 // Perform the actual deletion
-                log(`[${instanceId}] Deleting collections...`)
+                const preserveSet = new Set(options?.preserve || [])
+                const toDelete: Array<Promise<any>> = []
+
+                log(`[${instanceId}] Deleting collections${preserveSet.size ? ` (preserving: ${Array.from(preserveSet).join(', ')})` : ''}...`)
                 // Note: Labels, label associations, and group metadata are excluded from clearAll()
                 // They should persist across history syncs to maintain data integrity
-                await Promise.all([
-                    collections.chats.deleteMany({ instanceId }),
-                    collections.contacts.deleteMany({ instanceId }),
-                    collections.messages.deleteMany({ instanceId }),
-                    collections.presences.deleteMany({ instanceId })
-                    // Removed: collections.groupMetadata.deleteMany({ instanceId })
-                    // Removed: collections.labels.deleteMany({ instanceId })
-                    // Removed: collections.labelAssociations.deleteMany({ instanceId })
-                ])
+                if (!preserveSet.has('chats')) {
+                    toDelete.push(collections.chats.deleteMany({ instanceId }))
+                }
+                if (!preserveSet.has('contacts')) {
+                    toDelete.push(collections.contacts.deleteMany({ instanceId }))
+                }
+                if (!preserveSet.has('messages')) {
+                    toDelete.push(collections.messages.deleteMany({ instanceId }))
+                }
+                if (!preserveSet.has('presences')) {
+                    toDelete.push(collections.presences.deleteMany({ instanceId }))
+                }
+
+                await Promise.all(toDelete)
                 
                 const duration = Date.now() - startTime
                 log(`[CLEAR_ALL_END] Instance: ${instanceId}, Duration: ${duration}ms`)
