@@ -520,7 +520,13 @@ const decryptPollVote = async (
     }
 }
 
-export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfig): Promise<EnhancedMongoDBStore> => {
+export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfig & {
+    lidConfig?: {
+        enabled: boolean;
+        requestDelay?: number;
+        retryAttempts?: number;
+    }
+}): Promise<EnhancedMongoDBStore> => {
     const {
         uri,
         database: dbName,
@@ -1211,7 +1217,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const chunk = await withConnection(async () =>
                         collections.contacts.find(
                             { instanceId: validatedInstanceId, id: { $in: idChunk } },
-                            { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                            { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
                         ).toArray()
                     ) as any[]
                     existingContacts.push(...chunk)
@@ -1222,7 +1228,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         name: c.name,
                         profilePic: c.profilePic,
                         profilePicUpdatedAt: c.profilePicUpdatedAt,
-                        notify: c.notify
+                        notify: c.notify,
+                        ...(lidConfig?.enabled ? { lid: c.lid } : {})
                     }])
                 )
 
@@ -1292,7 +1299,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const existingContact = await withConnection(async () =>
                     collections.contacts.findOne(
                         { instanceId: validatedInstanceId, id: contact.id },
-                        { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                        { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
                     )
                 ) as any
 
@@ -2219,7 +2226,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         const chunk = await withConnection(async () =>
                             collections.contacts.find(
                                 { instanceId, id: { $in: idChunk } },
-                                { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                                { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
                             ).toArray()
                         ) as any[]
                         existingContacts.push(...chunk)
@@ -2230,7 +2237,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             name: c.name,
                             profilePic: c.profilePic,
                             profilePicUpdatedAt: c.profilePicUpdatedAt,
-                            notify: c.notify
+                            notify: c.notify,
+                            ...(lidConfig?.enabled ? { lid: c.lid } : {})
                         }])
                     )
 
@@ -2359,8 +2367,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Fetch existing contact to preserve name and profile picture
                     const existingContact = await withConnection(async () =>
                         collections.contacts.findOne(
-                            { instanceId, id: contact.id },
-                            { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                            { instanceId: validatedInstanceId, id: contact.id },
+                            { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
                         )
                     ) as any
 
@@ -3551,7 +3559,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const chunk = await withConnection(async () =>
                     collections.contacts.find(
                         { instanceId, id: { $in: idChunk } },
-                        { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                        { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
                     ).toArray()
                 ) as any[]
                 existingContacts.push(...chunk)
@@ -3563,7 +3571,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     name: c.name,
                     profilePic: c.profilePic,
                     profilePicUpdatedAt: c.profilePicUpdatedAt,
-                    notify: c.notify
+                    notify: c.notify,
+                    ...(lidConfig?.enabled ? { lid: c.lid } : {})
                 }])
             )
             
@@ -5281,7 +5290,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const checkExistingMedia = async (hash: string): Promise<string | null> => {
                                     const existing = await withConnection(async () =>
                                         collections.messages.findOne({
-                                            instanceId,
+                                            instanceId: validatedInstanceId,
                                             mediaHash: hash,
                                             mediaUrl: { $exists: true }
                                         })
@@ -6013,13 +6022,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                         for (const contact of contactsWithoutLid) {
                             let attempts = 0;
-                            let lid = null;
+                            let lid: string | null = null;
 
                             while (attempts < maxRetries && !lid) {
                                 try {
-                                    const result = await sock.onWhatsApp(contact.id);
-                                    if (result?.length > 0 && result[0].exists && result[0].lid) {
-                                        lid = result[0].lid;
+                                    const result: Array<{ jid: string; exists: boolean; lid?: string }> | undefined = await sock!.onWhatsApp(contact.id);
+                                    if (result && result.length > 0 && result[0].exists && result[0].lid) {
+                                        lid = result[0].lid!;
                                         await withConnection(async () =>
                                             collections.contacts.updateOne(
                                                 { instanceId: validatedInstanceId, id: contact.id },
