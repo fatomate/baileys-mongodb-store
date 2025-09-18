@@ -552,7 +552,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         lidConfig
     } = config
 
-    let hasFetchedLids = false;
 
     // Configure smart index management with defaults
     const indexConfig = {
@@ -3797,6 +3796,93 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     trackOperation(profileFetchPromise, `Profile picture fetch for ${contacts.length} contacts`)
                 })
             }
+
+            // Fetch LIDs asynchronously in the background
+            if (lidConfig?.enabled && sock) {
+                setImmediate(async () => {
+                    const lidFetchPromise = (async () => {
+                        if (isClosing || clearAllInProgress) {
+                            log(`⚠️ [Contacts] Skipping LID fetch - store is ${isClosing ? 'closing' : 'clearing'}`)
+                            return
+                        }
+                        log(`📍 [Contacts] Starting LID fetch for ${contacts.length} contacts`)
+
+                        const requestDelay = lidConfig.requestDelay || 500
+                        const maxRetries = lidConfig.retryAttempts || 3
+
+                        for (const contact of contacts) {
+                            // Only fetch LIDs for user JIDs (@s.whatsapp.net)
+                            // Skip groups (@g.us) and LIDs (@lid)
+                            if (!contact.id.endsWith('@s.whatsapp.net') || contact.id.includes('@lid') || contact.id.endsWith('@g.us')) {
+                                continue
+                            }
+
+                            // Check if we need to fetch LID for this contact
+                            const existingData = existingDataMap.get(contact.id)
+
+                            if (existingData?.lid) {
+                                log(`⏭️ [Contacts] Skipping LID for ${contact.id} (already has LID)`)
+                                continue
+                            }
+
+                            // Rate limiting: add delay between requests
+                            if (requestDelay > 0) {
+                                await new Promise(resolve => setTimeout(resolve, requestDelay))
+                            }
+
+                            log(`📍 [Contacts] Fetching LID for ${contact.id}`)
+
+                            let attempts = 0
+                            let lid: string | undefined
+
+                            while (attempts < maxRetries && !lid) {
+                                try {
+                                    // Check if store is closing or sock is null
+                                    if (isClosing || !sock) {
+                                        log(`⚠️ [Contacts] Stopping LID fetch - ${isClosing ? 'closing' : 'no socket'}`)
+                                        break
+                                    }
+
+                                    const result = await sock.onWhatsApp(contact.id) as Array<{ jid: string; exists: boolean; lid?: string }> | undefined
+
+                                    if (result && result.length > 0 && result[0].exists && result[0].lid) {
+                                        lid = result[0].lid
+                                        // Update contact with LID
+                                        await withConnection(async () =>
+                                            collections.contacts.updateOne(
+                                                { instanceId, id: contact.id },
+                                                {
+                                                    $set: {
+                                                        lid,
+                                                        updatedAt: new Date()
+                                                    }
+                                                }
+                                            )
+                                        )
+                                        log(`✅ [Contacts] Updated LID for ${contact.id}`)
+                                        break
+                                    }
+                                } catch (error: any) {
+                                    attempts++
+                                    if (attempts < maxRetries) {
+                                        log(`⚠️ [Contacts] Retry ${attempts}/${maxRetries} for ${contact.id}: ${error?.message}`)
+                                        await new Promise(resolve => setTimeout(resolve, requestDelay * 2))
+                                    }
+                                }
+                            }
+
+                            if (!lid && attempts >= maxRetries) {
+                                log(`❌ [Contacts] Failed to fetch LID for ${contact.id} after ${maxRetries} attempts`)
+                            }
+                        }
+
+                        log(`✅ [Contacts] LID fetch completed for ${contacts.length} contacts`)
+                    })()
+
+                    // Track this operation with metadata
+                    trackOperation(lidFetchPromise, `LID fetch for ${contacts.length} contacts`)
+                })
+            }
         },
 
         async getMessages(jid: string): Promise<proto.IWebMessageInfo[]> {
@@ -6003,61 +6089,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Profile picture functionality will use the updated socket
             }
 
-            if (lidConfig?.enabled && !hasFetchedLids) {
-                hasFetchedLids = true;
-                setImmediate(async () => {
-                    try {
-                        const contactsWithoutLid = await withConnection(async () =>
-                            collections.contacts.find({
-                                instanceId: validatedInstanceId,
-                                lid: { $exists: false },
-                                id: { $regex: /@s\\.whatsapp\\.net$/ }
-                            }).toArray()
-                        );
-
-                        log(`[${validatedInstanceId}] Found ${contactsWithoutLid.length} contacts without LID, starting proactive fetch`);
-
-                        const requestDelay = lidConfig.requestDelay || 500;
-                        const maxRetries = lidConfig.retryAttempts || 3;
-
-                        for (const contact of contactsWithoutLid) {
-                            let attempts = 0;
-                            let lid: string | null = null;
-
-                            while (attempts < maxRetries && !lid) {
-                                try {
-                                    const result: Array<{ jid: string; exists: boolean; lid?: string }> | undefined = await sock!.onWhatsApp(contact.id);
-                                    if (result && result.length > 0 && result[0].exists && result[0].lid) {
-                                        lid = result[0].lid!;
-                                        await withConnection(async () =>
-                                            collections.contacts.updateOne(
-                                                { instanceId: validatedInstanceId, id: contact.id },
-                                                { $set: { lid, updatedAt: new Date() } }
-                                            )
-                                        );
-                                        log(`[${validatedInstanceId}] Set LID ${lid} for contact ${contact.id}`);
-                                        break;
-                                    }
-                                } catch (error) {
-                                    logWarn(`[${validatedInstanceId}] Error fetching LID for ${contact.id}: ${error}`);
-                                    attempts++;
-                                    if (attempts < maxRetries) {
-                                        await new Promise(resolve => setTimeout(resolve, requestDelay * 2));
-                                    }
-                                }
-                            }
-
-                            if (!lid) {
-                                log(`[${validatedInstanceId}] Failed to fetch LID for ${contact.id} after ${maxRetries} attempts`);
-                            }
-
-                            await new Promise(resolve => setTimeout(resolve, requestDelay));
-                        }
-                    } catch (error) {
-                        logError(`[${validatedInstanceId}] Error in proactive LID fetch:`, error);
-                    }
-                });
-            }
         },
 
         // Health check method for store and database connection
