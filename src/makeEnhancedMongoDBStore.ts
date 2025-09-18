@@ -3535,6 +3535,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // IMPORTANT: Save contacts directly to ensure data persistence
             // This bypasses the broken SharedQueueManager that causes processor conflicts
             const bulkOps = contacts.map(contact => {
+                // Handle null name: fallback to notify or verifiedName, or skip if both are null
+                if (contact.name === null) {
+                    contact.name = contact.notify || contact.verifiedName || undefined;
+                }
+
                 const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
 
