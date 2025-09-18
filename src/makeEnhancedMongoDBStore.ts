@@ -1225,6 +1225,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                 // Bulk upsert without overriding user-saved notify
                 const bulkOps = contacts.map((contact: Contact) => {
+                    // Handle null name: fallback to notify or verifiedName, or skip if both are null
+                    if (contact.name === null) {
+                        contact.name = contact.notify || contact.verifiedName || undefined;
+                    }
+
                     const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                     const existing = existingDataMap.get(contact.id)
 
@@ -1248,15 +1253,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         updateOne: {
                             filter: { instanceId: validatedInstanceId, id: contact.id },
                             update: {
-                                $set: {
-                                    ...rest,
-                                    ...preservedData
-                                },
-                                $setOnInsert: {
-                                    instanceId: validatedInstanceId,
-                                    id: contact.id,
-                                    ...(notify !== undefined ? { notify } : {})
-                                }
+                                ...rest,
+                                ...preservedData
                             },
                             upsert: true
                         }
@@ -2217,7 +2215,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }])
                     )
 
-                    const bulkOps = contacts.map((contact: Contact) => {
+                    const bulkOps = contacts.map(contact => {
+                        // Handle null name: fallback to notify or verifiedName, or skip if both are null
+                        if (contact.name === null) {
+                            contact.name = contact.notify || contact.verifiedName || undefined;
+                        }
+
                         const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                         const existing = existingDataMap.get(contact.id)
 
@@ -2241,15 +2244,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             updateOne: {
                                 filter: { instanceId, id: contact.id },
                                 update: {
-                                    $set: {
-                                        ...rest,
-                                        ...preservedData
-                                    },
-                                    $setOnInsert: {
-                                        instanceId,
-                                        id: contact.id,
-                                        ...(notify !== undefined ? { notify } : {})
-                                    }
+                                    ...rest,
+                                    ...preservedData
                                 },
                                 upsert: true
                             }
@@ -3561,22 +3557,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                 return {
                     updateOne: {
-                        filter: { instanceId, id: contact.id },
+                        filter: { instanceId: validatedInstanceId, id: contact.id },
                         update: {
-                            $set: {
-                                ...rest,
-                                ...preservedData
-                            },
-                            $setOnInsert: {
-                                instanceId,
-                                id: contact.id,
-                                ...(notify !== undefined ? { notify } : {})
-                            }
+                            ...rest,
+                            ...preservedData
                         },
                         upsert: true
                     }
                 }
-            })
+            });
             
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
@@ -6462,7 +6451,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const checkExistingMedia = async (hash: string): Promise<string | null> => {
                     const existing = await withConnection(async () =>
                         collections.messages.findOne({
-                            instanceId,
+                            instanceId: validatedInstanceId,
                             mediaHash: hash,
                             mediaUrl: { $exists: true }
                         })
