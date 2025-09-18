@@ -1200,17 +1200,57 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             trackActivity()
             
             if (type === 'upsert' && contacts) {
+                // Fetch existing contacts to preserve names and profile pictures
+                const ids = contacts.map(c => c.id)
+                const existingContacts: any[] = []
+                for (let i = 0; i < ids.length; i += 5000) {
+                    const idChunk = ids.slice(i, i + 5000)
+                    const chunk = await withConnection(async () =>
+                        collections.contacts.find(
+                            { instanceId: validatedInstanceId, id: { $in: idChunk } },
+                            { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                        ).toArray()
+                    ) as any[]
+                    existingContacts.push(...chunk)
+                }
+
+                const existingDataMap = new Map(
+                    existingContacts.map(c => [c.id, {
+                        name: c.name,
+                        profilePic: c.profilePic,
+                        profilePicUpdatedAt: c.profilePicUpdatedAt,
+                        notify: c.notify
+                    }])
+                )
+
                 // Bulk upsert without overriding user-saved notify
                 const bulkOps = contacts.map((contact: Contact) => {
                     const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                    const existing = existingDataMap.get(contact.id)
+
+                    // Preserve existing data when new data is null/undefined/empty
+                    const preservedData: any = {
+                        updatedAt: new Date()
+                    }
+
+                    // Preserve existing name if new name is null/undefined/empty
+                    if (existing?.name && (!rest.name || rest.name.trim() === '')) {
+                        preservedData.name = existing.name
+                    }
+
+                    // Preserve existing profile picture data if it exists
+                    if (existing?.profilePic) {
+                        preservedData.profilePic = existing.profilePic
+                        preservedData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                    }
+
                     return {
                         updateOne: {
                             filter: { instanceId: validatedInstanceId, id: contact.id },
                             update: {
                                 $set: {
                                     ...rest,
-                                    // never set id/instanceId in $set; they are set on insert only
-                                    updatedAt: new Date()
+                                    ...preservedData
                                 },
                                 $setOnInsert: {
                                     instanceId: validatedInstanceId,
@@ -1222,23 +1262,46 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
                 })
-                
+
                 await withConnection(async () =>
                     collections.contacts.bulkWrite(bulkOps)
                 )
-                
+
                 return { success: true, count: contacts.length }
             } else if (type === 'update' && contact) {
-                // Single update without overriding user-saved notify
+                // Fetch existing contact to preserve name and profile picture
+                const existingContact = await withConnection(async () =>
+                    collections.contacts.findOne(
+                        { instanceId: validatedInstanceId, id: contact.id },
+                        { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                    )
+                ) as any
+
                 const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+
+                // Preserve existing data when new data is null/undefined/empty
+                const preservedData: any = {
+                    updatedAt: new Date()
+                }
+
+                // Preserve existing name if new name is null/undefined/empty
+                if (existingContact?.name && (!rest.name || rest.name.trim() === '')) {
+                    preservedData.name = existingContact.name
+                }
+
+                // Preserve existing profile picture data if it exists
+                if (existingContact?.profilePic) {
+                    preservedData.profilePic = existingContact.profilePic
+                    preservedData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
+                }
+
                 await withConnection(async () =>
                     collections.contacts.updateOne(
                         { instanceId: validatedInstanceId, id: contact.id },
                         {
                             $set: {
                                 ...rest,
-                                // never set id/instanceId in $set; they are set on insert only
-                                updatedAt: new Date()
+                                ...preservedData
                             },
                             $setOnInsert: {
                                 instanceId: validatedInstanceId,
@@ -1249,7 +1312,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         { upsert: true }
                     )
                 )
-                
+
                 return { success: true }
             }
             
@@ -2131,13 +2194,57 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 trackActivity() // Track request
                 
                 if (type === 'upsert' && contacts) {
+                    // Fetch existing contacts to preserve names and profile pictures
+                    const ids = contacts.map(c => c.id)
+                    const existingContacts: any[] = []
+                    for (let i = 0; i < ids.length; i += 5000) {
+                        const idChunk = ids.slice(i, i + 5000)
+                        const chunk = await withConnection(async () =>
+                            collections.contacts.find(
+                                { instanceId, id: { $in: idChunk } },
+                                { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                            ).toArray()
+                        ) as any[]
+                        existingContacts.push(...chunk)
+                    }
+
+                    const existingDataMap = new Map(
+                        existingContacts.map(c => [c.id, {
+                            name: c.name,
+                            profilePic: c.profilePic,
+                            profilePicUpdatedAt: c.profilePicUpdatedAt,
+                            notify: c.notify
+                        }])
+                    )
+
                     const bulkOps = contacts.map((contact: Contact) => {
                         const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                        const existing = existingDataMap.get(contact.id)
+
+                        // Preserve existing data when new data is null/undefined/empty
+                        const preservedData: any = {
+                            updatedAt: new Date()
+                        }
+
+                        // Preserve existing name if new name is null/undefined/empty
+                        if (existing?.name && (!rest.name || rest.name.trim() === '')) {
+                            preservedData.name = existing.name
+                        }
+
+                        // Preserve existing profile picture data if it exists
+                        if (existing?.profilePic) {
+                            preservedData.profilePic = existing.profilePic
+                            preservedData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                        }
+
                         return {
                             updateOne: {
                                 filter: { instanceId, id: contact.id },
                                 update: {
-                                    $set: { ...rest, updatedAt: new Date() },
+                                    $set: {
+                                        ...rest,
+                                        ...preservedData
+                                    },
                                     $setOnInsert: {
                                         instanceId,
                                         id: contact.id,
@@ -2215,12 +2322,40 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
+                    // Fetch existing contact to preserve name and profile picture
+                    const existingContact = await withConnection(async () =>
+                        collections.contacts.findOne(
+                            { instanceId, id: contact.id },
+                            { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                        )
+                    ) as any
+
                     const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+
+                    // Preserve existing data when new data is null/undefined/empty
+                    const preservedData: any = {
+                        updatedAt: new Date()
+                    }
+
+                    // Preserve existing name if new name is null/undefined/empty
+                    if (existingContact?.name && (!rest.name || rest.name.trim() === '')) {
+                        preservedData.name = existingContact.name
+                    }
+
+                    // Preserve existing profile picture data if it exists
+                    if (existingContact?.profilePic) {
+                        preservedData.profilePic = existingContact.profilePic
+                        preservedData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
+                    }
+
                     await withConnection(async () =>
                         collections.contacts.updateOne(
                             { instanceId, id: contact.id },
                             {
-                                $set: { ...rest, updatedAt: new Date() },
+                                $set: {
+                                    ...rest,
+                                    ...preservedData
+                                },
                                 $setOnInsert: {
                                     instanceId,
                                     id: contact.id,
@@ -3372,7 +3507,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             log(`📝 [Contacts] Saving ${contacts.length} contacts to database`)
             
-            // Fetch existing contacts to preserve profile picture data and existing notify (chunked + projected)
+            // Fetch existing contacts to preserve profile picture data, existing notify, and name (chunked + projected)
             const ids = contacts.map(c => c.id)
             const existingContacts: any[] = []
             const idChunkSize = 5000
@@ -3381,15 +3516,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const chunk = await withConnection(async () =>
                     collections.contacts.find(
                         { instanceId, id: { $in: idChunk } },
-                        { projection: { id: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
+                        { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1 } }
                     ).toArray()
                 ) as any[]
                 existingContacts.push(...chunk)
             }
-            
-            // Create a map of existing profile picture data
+
+            // Create a map of existing contact data to preserve
             const existingDataMap = new Map(
                 existingContacts.map(c => [c.id, {
+                    name: c.name,
                     profilePic: c.profilePic,
                     profilePicUpdatedAt: c.profilePicUpdatedAt,
                     notify: c.notify
@@ -3401,19 +3537,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             const bulkOps = contacts.map(contact => {
                 const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
-                // Preserve existing notify; only set notify on insert
+
+                // Preserve existing data when new data is null/undefined/empty
+                const preservedData: any = {
+                    updatedAt: new Date()
+                }
+
+                // Preserve existing name if new name is null/undefined/empty
+                if (existing?.name && (!rest.name || rest.name.trim() === '')) {
+                    preservedData.name = existing.name
+                }
+
+                // Preserve existing profile picture data if it exists
+                if (existing?.profilePic) {
+                    preservedData.profilePic = existing.profilePic
+                    preservedData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                }
+
                 return {
                     updateOne: {
                         filter: { instanceId, id: contact.id },
                         update: {
                             $set: {
                                 ...rest,
-                                updatedAt: new Date(),
-                                // Preserve existing profile picture data if it exists
-                                ...(existing?.profilePic && {
-                                    profilePic: existing.profilePic,
-                                    profilePicUpdatedAt: existing.profilePicUpdatedAt
-                                })
+                                ...preservedData
                             },
                             $setOnInsert: {
                                 instanceId,
