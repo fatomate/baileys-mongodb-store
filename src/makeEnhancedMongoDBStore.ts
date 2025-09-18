@@ -542,9 +542,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         connectionConfig,
         useSharedConnections = true,
         profilePictureConfig,
-        indexManagement
+        indexManagement,
+        lidConfig
     } = config
-    
+
+    let hasFetchedLids = false;
+
     // Configure smart index management with defaults
     const indexConfig = {
         skipExistingCollectionIndexes: indexManagement?.skipExistingCollectionIndexes ?? true,
@@ -2516,7 +2519,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     )
                 } else if (type === 'delete') {
                     await withConnection(async () =>
-                        collections.labels.deleteOne({ instanceId, id })
+                        collections.labels.deleteOne({
+                            instanceId,
+                            id
+                        })
                     )
                 }
                 
@@ -5986,6 +5992,62 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (profilePictureConfig?.enabled && socket) {
                 log(`[${instanceId}] Re-initializing profile picture retrieval with new socket`)
                 // Profile picture functionality will use the updated socket
+            }
+
+            if (lidConfig?.enabled && !hasFetchedLids) {
+                hasFetchedLids = true;
+                setImmediate(async () => {
+                    try {
+                        const contactsWithoutLid = await withConnection(async () =>
+                            collections.contacts.find({
+                                instanceId: validatedInstanceId,
+                                lid: { $exists: false },
+                                id: { $regex: /@s\\.whatsapp\\.net$/ }
+                            }).toArray()
+                        );
+
+                        log(`[${validatedInstanceId}] Found ${contactsWithoutLid.length} contacts without LID, starting proactive fetch`);
+
+                        const requestDelay = lidConfig.requestDelay || 500;
+                        const maxRetries = lidConfig.retryAttempts || 3;
+
+                        for (const contact of contactsWithoutLid) {
+                            let attempts = 0;
+                            let lid = null;
+
+                            while (attempts < maxRetries && !lid) {
+                                try {
+                                    const result = await sock.onWhatsApp(contact.id);
+                                    if (result?.length > 0 && result[0].exists && result[0].lid) {
+                                        lid = result[0].lid;
+                                        await withConnection(async () =>
+                                            collections.contacts.updateOne(
+                                                { instanceId: validatedInstanceId, id: contact.id },
+                                                { $set: { lid, updatedAt: new Date() } }
+                                            )
+                                        );
+                                        log(`[${validatedInstanceId}] Set LID ${lid} for contact ${contact.id}`);
+                                        break;
+                                    }
+                                } catch (error) {
+                                    logWarn(`[${validatedInstanceId}] Error fetching LID for ${contact.id}: ${error}`);
+                                    attempts++;
+                                    if (attempts < maxRetries) {
+                                        await new Promise(resolve => setTimeout(resolve, requestDelay * 2));
+                                    }
+                                }
+                            }
+
+                            if (!lid) {
+                                log(`[${validatedInstanceId}] Failed to fetch LID for ${contact.id} after ${maxRetries} attempts`);
+                            }
+
+                            await new Promise(resolve => setTimeout(resolve, requestDelay));
+                        }
+                    } catch (error) {
+                        logError(`[${validatedInstanceId}] Error in proactive LID fetch:`, error);
+                    }
+                });
             }
         },
 
