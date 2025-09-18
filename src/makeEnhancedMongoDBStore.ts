@@ -552,6 +552,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         lidConfig
     } = config
 
+    // Set default values for lidConfig
+    const defaultLidConfig = { enabled: true, requestDelay: 500, retryAttempts: 3 }
+    const finalLidConfig = { ...defaultLidConfig, ...lidConfig }
+
 
     // Configure smart index management with defaults
     const indexConfig = {
@@ -3798,7 +3802,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             // Fetch LIDs asynchronously in the background
-            if (lidConfig?.enabled && sock) {
+            if (finalLidConfig?.enabled && sock) {
                 setImmediate(async () => {
                     const lidFetchPromise = (async () => {
                         if (isClosing || clearAllInProgress) {
@@ -3807,8 +3811,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                         log(`📍 [Contacts] Starting LID fetch for ${contacts.length} contacts`)
 
-                        const requestDelay = lidConfig.requestDelay || 500 // Increased default delay for rate limiting
-                        const maxRetries = lidConfig.retryAttempts || 3
+                        const requestDelay = finalLidConfig.requestDelay || 500 // Increased default delay for rate limiting
+                        const maxRetries = finalLidConfig.retryAttempts || 3
 
                         for (const contact of contacts) {
                             // Only fetch LIDs for user JIDs (@s.whatsapp.net)
