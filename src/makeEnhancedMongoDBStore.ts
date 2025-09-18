@@ -1233,29 +1233,47 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                     const existing = existingDataMap.get(contact.id)
 
-                    // Preserve existing data when new data is null/undefined/empty
-                    const preservedData: any = {
+                    // Always include updatedAt
+                    const setData: any = {
+                        ...rest,
                         updatedAt: new Date()
                     }
 
                     // Preserve existing name if new name is null/undefined/empty
-                    if (existing?.name && (!rest.name || rest.name.trim() === '')) {
-                        preservedData.name = existing.name
+                    if (existing?.name && (!setData.name || setData.name.trim() === '')) {
+                        setData.name = existing.name
                     }
 
                     // Preserve existing profile picture data if it exists
                     if (existing?.profilePic) {
-                        preservedData.profilePic = existing.profilePic
-                        preservedData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                        setData.profilePic = existing.profilePic
+                        setData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                    }
+
+                    // Remove name from setData if it's null/undefined/empty after preservation
+                    if (setData.name == null || setData.name.trim() === '') {
+                        delete setData.name
+                    }
+
+                    // Base update with $set (always present with updatedAt)
+                    const update = {
+                        $set: setData,
+                        $setOnInsert: {
+                            instanceId,
+                            id: contact.id,
+                            ...(notify !== undefined ? { notify } : {})
+                        }
+                    }
+
+                    // Add $unset if needed to clean up existing null name
+                    if (existing && existing.name === null && !setData.name) {
+                        update.$unset = { name: 1 }
                     }
 
                     return {
                         updateOne: {
-                            filter: { instanceId: validatedInstanceId, id: contact.id },
-                            update: {
-                                ...rest,
-                                ...preservedData
-                            },
+                            filter: { instanceId, id: contact.id },
+                            update,
                             upsert: true
                         }
                     }
@@ -1277,32 +1295,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                 const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
 
-                // Preserve existing data when new data is null/undefined/empty
-                const preservedData: any = {
+                // Always include updatedAt
+                const setData: any = {
+                    ...rest,
                     updatedAt: new Date()
                 }
 
                 // Preserve existing name if new name is null/undefined/empty
-                if (existingContact?.name && (!rest.name || rest.name.trim() === '')) {
-                    preservedData.name = existingContact.name
+                if (existingContact?.name && (!setData.name || setData.name.trim() === '')) {
+                    setData.name = existingContact.name
                 }
 
                 // Preserve existing profile picture data if it exists
                 if (existingContact?.profilePic) {
-                    preservedData.profilePic = existingContact.profilePic
-                    preservedData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
+                    setData.profilePic = existingContact.profilePic
+                    setData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
                 }
 
                 await withConnection(async () =>
                     collections.contacts.updateOne(
                         { instanceId: validatedInstanceId, id: contact.id },
                         {
-                            $set: {
-                                ...rest,
-                                ...preservedData
-                            },
+                            $set: setData,
                             $setOnInsert: {
-                                instanceId: validatedInstanceId,
+                                instanceId,
                                 id: contact.id,
                                 ...(notify !== undefined ? { notify } : {})
                             }
@@ -2007,7 +2023,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     await withConnection(async () =>
                                         collections.messages.updateOne(
                                             { 
-                                                instanceId, 
+                                                instanceId: validatedInstanceId, 
                                                 jid, 
                                                 'key.id': message.key?.id 
                                             },
@@ -2224,33 +2240,52 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                         const existing = existingDataMap.get(contact.id)
 
-                        // Preserve existing data when new data is null/undefined/empty
-                        const preservedData: any = {
+                        // Always include updatedAt
+                        const setData: any = {
+                            ...rest,
                             updatedAt: new Date()
                         }
 
                         // Preserve existing name if new name is null/undefined/empty
-                        if (existing?.name && (!rest.name || rest.name.trim() === '')) {
-                            preservedData.name = existing.name
+                        if (existing?.name && (!setData.name || setData.name.trim() === '')) {
+                            setData.name = existing.name
                         }
 
                         // Preserve existing profile picture data if it exists
                         if (existing?.profilePic) {
-                            preservedData.profilePic = existing.profilePic
-                            preservedData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                            setData.profilePic = existing.profilePic
+                            setData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                        }
+
+                        // Remove name from setData if it's null/undefined/empty after preservation
+                        if (setData.name == null || setData.name.trim() === '') {
+                            delete setData.name
+                        }
+
+                        // Base update with $set (always present with updatedAt)
+                        const update = {
+                            $set: setData,
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
+                        }
+
+                        // Add $unset if needed to clean up existing null name
+                        if (existing && existing.name === null && !setData.name) {
+                            update.$unset = { name: 1 }
                         }
 
                         return {
                             updateOne: {
                                 filter: { instanceId, id: contact.id },
-                                update: {
-                                    ...rest,
-                                    ...preservedData
-                                },
+                                update,
                                 upsert: true
                             }
                         }
-                    })
+                    });
+
                     await withConnection(async () =>
                         collections.contacts.bulkWrite(bulkOps, { ordered: false })
                     )
@@ -2328,30 +2363,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                     const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
 
-                    // Preserve existing data when new data is null/undefined/empty
-                    const preservedData: any = {
+                    // Always include updatedAt
+                    const setData: any = {
+                        ...rest,
                         updatedAt: new Date()
                     }
 
                     // Preserve existing name if new name is null/undefined/empty
-                    if (existingContact?.name && (!rest.name || rest.name.trim() === '')) {
-                        preservedData.name = existingContact.name
+                    if (existingContact?.name && (!setData.name || setData.name.trim() === '')) {
+                        setData.name = existingContact.name
                     }
 
                     // Preserve existing profile picture data if it exists
                     if (existingContact?.profilePic) {
-                        preservedData.profilePic = existingContact.profilePic
-                        preservedData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
+                        setData.profilePic = existingContact.profilePic
+                        setData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
                     }
 
                     await withConnection(async () =>
                         collections.contacts.updateOne(
-                            { instanceId, id: contact.id },
+                            { instanceId: validatedInstanceId, id: contact.id },
                             {
-                                $set: {
-                                    ...rest,
-                                    ...preservedData
-                                },
+                                $set: setData,
                                 $setOnInsert: {
                                     instanceId,
                                     id: contact.id,
@@ -3539,29 +3572,47 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
 
-                // Preserve existing data when new data is null/undefined/empty
-                const preservedData: any = {
+                // Always include updatedAt
+                const setData: any = {
+                    ...rest,
                     updatedAt: new Date()
                 }
 
                 // Preserve existing name if new name is null/undefined/empty
-                if (existing?.name && (!rest.name || rest.name.trim() === '')) {
-                    preservedData.name = existing.name
+                if (existing?.name && (!setData.name || setData.name.trim() === '')) {
+                    setData.name = existing.name
                 }
 
                 // Preserve existing profile picture data if it exists
                 if (existing?.profilePic) {
-                    preservedData.profilePic = existing.profilePic
-                    preservedData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                    setData.profilePic = existing.profilePic
+                    setData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                }
+
+                // Remove name from setData if it's null/undefined/empty after preservation
+                if (setData.name == null || setData.name.trim() === '') {
+                    delete setData.name
+                }
+
+                // Base update with $set (always present with updatedAt)
+                const update = {
+                    $set: setData,
+                    $setOnInsert: {
+                        instanceId,
+                        id: contact.id,
+                        ...(notify !== undefined ? { notify } : {})
+                    }
+                }
+
+                // Add $unset if needed to clean up existing null name
+                if (existing && existing.name === null && !setData.name) {
+                    update.$unset = { name: 1 }
                 }
 
                 return {
                     updateOne: {
                         filter: { instanceId: validatedInstanceId, id: contact.id },
-                        update: {
-                            ...rest,
-                            ...preservedData
-                        },
+                        update,
                         upsert: true
                     }
                 }
@@ -3582,7 +3633,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             return {
                                 updateOne: {
                                     filter: u.filter,
-                                    update: { $set: u.update?.$set || {} },
+                                    update: {
+                                        $set: {
+                                            ...(u.update?.$set || {}),
+                                            updatedAt: new Date()  // Ensure atomic operator
+                                        }
+                                    },
                                     upsert: false
                                 }
                             }
