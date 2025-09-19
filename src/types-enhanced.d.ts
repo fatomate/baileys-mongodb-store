@@ -482,6 +482,13 @@ export interface EventMetrics {
     averageProcessingTime?: number
 }
 
+export interface LidResolutionMetrics {
+    operationType: string
+    totalResolved: number
+    totalErrors: number
+    lastProcessedAt?: Date
+}
+
 export interface EnhancedMongoDBStore {
     /**
      * Instance ID for this store
@@ -507,6 +514,16 @@ export interface EnhancedMongoDBStore {
      * Reset metrics for specific or all event types
      */
     resetEventMetrics(eventType?: string): void
+
+    /**
+     * Get LID resolution metrics for specific operation type or all operation types
+     */
+    getLidResolutionMetrics(operationType?: string): LidResolutionMetrics | LidResolutionMetrics[]
+
+    /**
+     * Reset LID resolution metrics for specific operation type or all operation types
+     */
+    resetLidResolutionMetrics(operationType?: string): void
     
     // All existing MongoDBStore methods...
     getChats(): Promise<Chat[]>

@@ -158,6 +158,16 @@ interface ProfilePictureJob {
 // Event metrics storage
 const eventMetricsMap = new Map<string, EventMetrics>()
 
+// LID Resolution Metrics
+interface LidResolutionMetrics {
+    operationType: string
+    totalResolved: number
+    totalErrors: number
+    lastProcessedAt?: Date
+}
+
+const lidResolutionMetricsMap = new Map<string, LidResolutionMetrics>()
+
 interface MongoCollections {
     chats: Collection<Chat & { instanceId: string; updatedAt: Date }>
     contacts: Collection<Contact & { instanceId: string; updatedAt: Date }>
@@ -3026,7 +3036,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Update event metrics
     const updateEventMetrics = (eventType: string, action: 'received' | 'stored' | 'skipped' | 'error') => {
         if (!enableMetrics) return
-        
+
         let metrics = eventMetricsMap.get(eventType)
         if (!metrics) {
             metrics = {
@@ -3038,7 +3048,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             eventMetricsMap.set(eventType, metrics)
         }
-        
+
         switch (action) {
             case 'received':
                 metrics.totalReceived++
@@ -3049,6 +3059,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 break
             case 'skipped':
                 metrics.totalSkipped++
+                break
+            case 'error':
+                metrics.totalErrors++
+                break
+        }
+    }
+
+    const updateLidResolutionMetrics = (operationType: string, action: 'resolved' | 'error') => {
+        if (!enableMetrics) return
+
+        let metrics = lidResolutionMetricsMap.get(operationType)
+        if (!metrics) {
+            metrics = {
+                operationType,
+                totalResolved: 0,
+                totalErrors: 0
+            }
+            lidResolutionMetricsMap.set(operationType, metrics)
+        }
+
+        switch (action) {
+            case 'resolved':
+                metrics.totalResolved++
+                metrics.lastProcessedAt = new Date()
                 break
             case 'error':
                 metrics.totalErrors++
@@ -3312,6 +3346,73 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let currentEventEmitter: BaileysEventEmitter | null = null
     const eventHandlers = new Map<string, (...args: any[]) => Promise<void>>()
     
+    // LID resolution helper function
+    const performProactiveLidResolutionForLabelAssociations = async (
+        lidMappings: Array<{ lid: string | undefined; id: string }>
+    ): Promise<number> => {
+        let totalLabelAssociationsUpdated = 0
+        const batchSize = 50
+
+        for (let i = 0; i < lidMappings.length; i += batchSize) {
+            const batch = lidMappings.slice(i, i + batchSize)
+            const batchPromises = batch.map(async (mapping: any) => {
+                const lid = mapping.lid
+                const phoneNumber = mapping.id
+
+                if (!lid || !lidHandler!.isLidFormat(lid) || lidHandler!.isLidFormat(phoneNumber)) {
+                    return 0 // Skip invalid mappings
+                }
+
+                try {
+                    // Update label associations where chatId equals the LID
+                    const updateResult = await withConnection(async () =>
+                        collections.labelAssociations.updateMany(
+                            {
+                                instanceId: validatedInstanceId,
+                                chatId: lid,
+                                type: 'label_jid' as any // Only update chat-based associations
+                            },
+                            {
+                                $set: {
+                                    chatId: phoneNumber,
+                                    'lidMapping.resolved': true,
+                                    'lidMapping.resolvedAt': new Date(),
+                                    'lidMapping.originalLid': lid,
+                                    updatedAt: new Date()
+                                }
+                            }
+                        )
+                    )
+
+                    if (updateResult.modifiedCount > 0) {
+                        log(`[${instanceId}] Updated ${updateResult.modifiedCount} label associations: ${lid} -> ${phoneNumber}`)
+                        if (enableMetrics) {
+                            updateLidResolutionMetrics('proactive-label-associations', 'resolved')
+                        }
+                    }
+
+                    return updateResult.modifiedCount
+                } catch (error) {
+                    logError(`[${instanceId}] Error updating label associations for LID ${lid}:`, error)
+                    if (enableMetrics) {
+                        updateLidResolutionMetrics('proactive-label-associations', 'error')
+                    }
+                    return 0
+                }
+            })
+
+            const batchResults = await Promise.all(batchPromises)
+            totalLabelAssociationsUpdated += batchResults.reduce((sum, count) => sum + count, 0)
+
+            // Small delay between batches to prevent overwhelming
+            if (i + batchSize < lidMappings.length) {
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+        }
+
+        return totalLabelAssociationsUpdated
+    }
+
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
         instanceId,
@@ -3344,6 +3445,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 eventMetricsMap.delete(eventType)
             } else {
                 eventMetricsMap.clear()
+            }
+        },
+
+        getLidResolutionMetrics(operationType?: string): LidResolutionMetrics | LidResolutionMetrics[] {
+            if (operationType) {
+                return lidResolutionMetricsMap.get(operationType) || {
+                    operationType,
+                    totalResolved: 0,
+                    totalErrors: 0
+                }
+            }
+            return Array.from(lidResolutionMetricsMap.values())
+        },
+
+        resetLidResolutionMetrics(operationType?: string): void {
+            if (operationType) {
+                lidResolutionMetricsMap.delete(operationType)
+            } else {
+                lidResolutionMetricsMap.clear()
             }
         },
 
@@ -4898,6 +5018,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async upsertLabelAssociation(association: LabelAssociation): Promise<void> {
+            // Real-time LID resolution for chatId
+            if (lidHandler && lidHandler.isLidFormat(association.chatId)) {
+                const originalLid = association.chatId
+                const resolvedChatId = await lidHandler.normalizeJid(association.chatId)
+                if (resolvedChatId && resolvedChatId !== association.chatId) {
+                    log(`[${instanceId}] Real-time LID resolution for label association: ${originalLid} -> ${resolvedChatId}`)
+                    association.chatId = resolvedChatId
+
+                    // Mark as having LID mapping for tracking
+                    ;(association as any).lidMapping = {
+                        resolved: true,
+                        resolvedAt: new Date(),
+                        originalLid: originalLid
+                    }
+
+                    // Update metrics
+                    if (enableMetrics) {
+                        updateLidResolutionMetrics('realtime-label-associations', 'resolved')
+                    }
+                }
+            }
+
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
                 try {
@@ -6946,7 +7088,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
 
-            log(`[${instanceId}] Proactive LID resolution completed: ${totalMessagesUpdated} historical messages updated`)
+            // Perform proactive LID resolution for label associations after messages are done
+            log(`[${instanceId}] Starting proactive LID resolution for label associations`)
+            const totalLabelAssociationsUpdated = await performProactiveLidResolutionForLabelAssociations(lidMappings as Array<{ lid: string | undefined; id: string }>)
+
+            log(`[${instanceId}] Proactive LID resolution completed: ${totalMessagesUpdated} historical messages and ${totalLabelAssociationsUpdated} label associations updated`)
         }
     }
 
