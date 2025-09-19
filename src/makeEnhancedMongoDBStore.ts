@@ -627,6 +627,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const connectionStateEmitter = new EventEmitter()
     // Fix EventEmitter memory leak warning by setting reasonable limit
     connectionStateEmitter.setMaxListeners(50)
+
+    // Track if proactive LID resolution has been done for this instance
+    let historyLidResolutionDone = false
     
     // Initialize health monitor
     const healthMonitor = new ConnectionHealthMonitor({
@@ -5942,6 +5945,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 await Promise.all(promises)
                                 log(`[${instanceId}] Successfully processed ${dataToProcess.length} accumulated history events`)
+
+                                // Proactively resolve LID jids in historical messages (only once per instance)
+                                if (hasLatest && lidHandler && !historyLidResolutionDone) {
+                                    try {
+                                        await storeImpl.performProactiveLidResolutionForHistory()
+                                        historyLidResolutionDone = true
+                                        log(`[${instanceId}] Completed proactive LID resolution for historical messages`)
+                                    } catch (error) {
+                                        logError(`[${instanceId}] Error during proactive LID resolution:`, error)
+                                    }
+                                }
                             } catch (error) {
                                 logError(`[${instanceId}] Error processing accumulated history:`, error)
                             }
@@ -6845,6 +6859,91 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Reset binding state
             isBound = false
+        },
+
+        /**
+         * Proactively resolve LID jids in historical messages to phone numbers
+         * This runs once per instance during initial history sync
+         */
+        async performProactiveLidResolutionForHistory(): Promise<void> {
+            if (!lidHandler) return
+
+            log(`[${instanceId}] Starting proactive LID resolution for historical messages`)
+
+            // Get all LID mappings from contacts collection
+            const lidMappings = await withConnection(async () =>
+                collections.contacts.find(
+                    {
+                        instanceId: validatedInstanceId,
+                        lid: { $exists: true, $ne: '' }
+                    },
+                    { projection: { lid: 1, id: 1 } }
+                ).toArray()
+            )
+
+            if (lidMappings.length === 0) {
+                log(`[${instanceId}] No LID mappings found, skipping proactive resolution`)
+                return
+            }
+
+            log(`[${instanceId}] Found ${lidMappings.length} LID mappings for proactive resolution`)
+
+            // Process mappings in batches to avoid overwhelming the database
+            const batchSize = 50
+            let totalMessagesUpdated = 0
+
+            for (let i = 0; i < lidMappings.length; i += batchSize) {
+                const batch = lidMappings.slice(i, i + batchSize)
+                const batchPromises = batch.map(async (mapping: any) => {
+                    const lid = mapping.lid
+                    const phoneNumber = mapping.id
+
+                    if (!lidHandler!.isLidFormat(lid) || lidHandler!.isLidFormat(phoneNumber)) {
+                        return 0 // Skip invalid mappings
+                    }
+
+                    try {
+                        // Update messages where jid equals the LID
+                        const updateResult = await withConnection(async () =>
+                            collections.messages.updateMany(
+                                {
+                                    instanceId: validatedInstanceId,
+                                    jid: lid
+                                },
+                                {
+                                    $set: {
+                                        jid: phoneNumber,
+                                        'key.remoteJid': phoneNumber,
+                                        'lidMapping.resolved': true,
+                                        'lidMapping.resolvedAt': new Date(),
+                                        'lidMapping.originalLid': lid,
+                                        updatedAt: new Date()
+                                    }
+                                }
+                            )
+                        )
+
+                        if (updateResult.modifiedCount > 0) {
+                            log(`[${instanceId}] Updated ${updateResult.modifiedCount} historical messages: ${lid} -> ${phoneNumber}`)
+                        }
+
+                        return updateResult.modifiedCount
+                    } catch (error) {
+                        logError(`[${instanceId}] Error updating messages for LID ${lid}:`, error)
+                        return 0
+                    }
+                })
+
+                const batchResults = await Promise.all(batchPromises)
+                totalMessagesUpdated += batchResults.reduce((sum, count) => sum + count, 0)
+
+                // Small delay between batches to prevent overwhelming
+                if (i + batchSize < lidMappings.length) {
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                }
+            }
+
+            log(`[${instanceId}] Proactive LID resolution completed: ${totalMessagesUpdated} historical messages updated`)
         }
     }
 

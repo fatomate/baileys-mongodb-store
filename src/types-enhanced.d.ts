@@ -618,6 +618,12 @@ export interface EnhancedMongoDBStore {
      * @param deleteData Whether to delete all data for the instance (default: false)
      */
     cleanup(deleteData?: boolean): Promise<void>
-    
+
+    /**
+     * Proactively resolve LID jids in historical messages to phone numbers
+     * This runs once per instance during initial history sync
+     */
+    performProactiveLidResolutionForHistory(): Promise<void>
+
     close(): Promise<void>
 }
