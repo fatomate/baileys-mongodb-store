@@ -453,8 +453,8 @@ export class LidHandler {
                     instanceId: this.instanceId,
                     lid: normalizedLid
                 }, {
-                    projection: { id: 1 },
-                    hint: 'contacts_lid_lookup'  // Force use of LID index to optimize performance
+                    projection: { id: 1 }
+                    // Removed hint to avoid errors when index doesn't exist
                 })
                 
                 if (contact?.id) {
@@ -469,8 +469,8 @@ export class LidHandler {
                 // Fallback: read from legacy lidMappings (no writes)
                 if (this.lidMappingsCollection) {
                     const legacy = await this.lidMappingsCollection.findOne(
-                        { instanceId: this.instanceId, lid: normalizedLid },
-                        { hint: 'lidMappings_primary' }  // Force use of primary LID index
+                        { instanceId: this.instanceId, lid: normalizedLid }
+                        // Removed hint to avoid errors when index doesn't exist
                     )
                     if (legacy?.phoneNumber) {
                         if (this.config.enableCache) {

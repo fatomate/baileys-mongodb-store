@@ -3116,15 +3116,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
-                { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
+                { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
                 { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
-                // Compound index to accelerate manual per-instance cleanup by updatedAt
+                // Ensure compound index exists for manual per-instance cleanup
                 { name: 'messages_instance_updatedAt', spec: { instanceId: 1, updatedAt: 1 }, options: {} },
                 { name: 'messages_media_dedup', spec: { instanceId: 1, mediaHash: 1 }, options: { sparse: true } },
                 { name: 'messages_remote_fallback', spec: { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }, options: {} },
                 { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
                 // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
-                { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} }
+                { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
+                // Index for LID resolution tracking
+                { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
             ],
             groupMetadata: [
                 { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -3143,7 +3145,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // No TTL - persists indefinitely
             ],
             labelAssociations: [
-                { name: 'label_assoc_primary', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true } }
+                { name: 'labelAssociations_primary', spec: { instanceId: 1, chatId: 1, messageId: 1, labelId: 1 }, options: { unique: true } },
+                { name: 'labelAssociations_chatId_labelId', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: {} },
+                { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} },
+                // Index for LID resolution tracking
+                { name: 'labelAssociations_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
                 // No TTL - persists indefinitely
             ],
             // Include LidHandler's collection in smart index management
@@ -6607,7 +6613,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
                         { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
                         // Ensure compound index exists for manual per-instance cleanup
-                        { name: 'messages_instance_updatedAt', spec: { instanceId: 1, updatedAt: 1 }, options: {} }
+                        { name: 'messages_instance_updatedAt', spec: { instanceId: 1, updatedAt: 1 }, options: {} },
+                        { name: 'messages_media_dedup', spec: { instanceId: 1, mediaHash: 1 }, options: { sparse: true } },
+                        { name: 'messages_remote_fallback', spec: { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }, options: {} },
+                        { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
+                        // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
+                        { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
+                        // Index for LID resolution tracking
+                        { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
                     ],
                     groupMetadata: [
                         { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -6626,7 +6639,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     labelAssociations: [
                         { name: 'labelAssociations_primary', spec: { instanceId: 1, chatId: 1, messageId: 1, labelId: 1 }, options: { unique: true } },
                         { name: 'labelAssociations_chatId_labelId', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: {} },
-                        { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} }
+                        { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} },
+                        // Index for LID resolution tracking
+                        { name: 'labelAssociations_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
+                    ],
+                    // Include LidHandler's collection in smart index management
+                    lidMappings: [
+                        { name: 'lidMappings_primary', spec: { instanceId: 1, lid: 1 }, options: { unique: true } },
+                        { name: 'lidMappings_phone_lookup', spec: { instanceId: 1, phoneNumber: 1 }, options: {} }
                     ]
                 }
                 
