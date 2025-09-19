@@ -1218,8 +1218,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Fetch existing contacts to preserve names and profile pictures
                 const ids = contacts.map(c => c.id)
                 const existingContacts: any[] = []
-                for (let i = 0; i < ids.length; i += 5000) {
-                    const idChunk = ids.slice(i, i + 5000)
+                for (let i = 0; i < ids.length; i += 1000) {  // Reduced from 5000 to optimize $in performance
+                    const idChunk = ids.slice(i, i + 1000)
                     const chunk = await withConnection(async () =>
                         collections.contacts.find(
                             { instanceId: validatedInstanceId, id: { $in: idChunk } },
@@ -2227,8 +2227,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Fetch existing contacts to preserve names and profile pictures
                     const ids = contacts.map(c => c.id)
                     const existingContacts: any[] = []
-                    for (let i = 0; i < ids.length; i += 5000) {
-                        const idChunk = ids.slice(i, i + 5000)
+                    for (let i = 0; i < ids.length; i += 1000) {  // Reduced from 5000 to optimize $in performance
+                        const idChunk = ids.slice(i, i + 1000)
                         const chunk = await withConnection(async () =>
                             collections.contacts.find(
                                 { instanceId, id: { $in: idChunk } },
@@ -3076,8 +3076,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             ],
             contacts: [
                 { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
-                // No TTL for contacts
+                { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } },
+                // NEW: Composite index for efficient $in queries with projection fields
+                { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} }
             ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
@@ -3559,7 +3560,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Fetch existing contacts to preserve profile picture data, existing notify, and name (chunked + projected)
             const ids = contacts.map(c => c.id)
             const existingContacts: any[] = []
-            const idChunkSize = 5000
+            const idChunkSize = 1000  // Reduced from 5000 to optimize $in performance
             for (let i = 0; i < ids.length; i += idChunkSize) {
                 const idChunk = ids.slice(i, i + idChunkSize)
                 const chunk = await withConnection(async () =>
@@ -6455,7 +6456,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     ],
                     contacts: [
                         { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } },
+                        // NEW: Composite index for efficient $in queries with projection fields
+                        { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} }
                     ],
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
