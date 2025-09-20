@@ -95,7 +95,7 @@ export interface ConnectionMetrics {
 export interface PoolSelectionResult {
     pool: ConnectionPool
     isNew: boolean
-    reason: 'existing' | 'created' | 'promoted' | 'demoted'
+    reason: 'existing' | 'created' | 'promoted' | 'demoted' | 'dedicated'
 }
 
 export interface InstanceRegistration {

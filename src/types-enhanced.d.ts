@@ -10,7 +10,7 @@ import type { MemoryConfig } from './utils/memory'
 import type { TTLConfig } from './utils/ttl'
 import type { MediaConfig } from './utils/media'
 import type { LidHandlerConfig } from './utils/lidHandler'
-import type { ConnectionConfig } from './types/connection'
+import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection'
 
 /**
  * Event types that can be stored in MongoDB
@@ -361,6 +361,12 @@ export interface EnhancedMongoDBStoreConfig {
      * Controls how connections are shared and managed
      */
     connectionConfig?: ConnectionConfig
+
+    /**
+     * Optional shared ConnectionManager configuration
+     * Allows tailoring pool sizes and global connection limits
+     */
+    connectionManager?: ConnectionManagerConfig
     
     /**
      * Whether to use shared connections via ConnectionManager

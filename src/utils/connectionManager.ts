@@ -306,15 +306,27 @@ export class ConnectionManager {
         config?: ConnectionConfig
     ): Promise<PoolSelectionResult> {
         const metrics = this.instanceMetrics.get(instanceId)!
-        const tier = config?.poolStrategy === 'dedicated' ? metrics.tier : metrics.tier
-        
+        const tier = metrics.tier
+
+        if (config?.poolStrategy === 'dedicated') {
+            if (this.getTotalConnections() + this.tierConfigs[tier].minPoolSize > this.config.maxTotalConnections) {
+                await this.closeIdlePools()
+
+                if (this.getTotalConnections() + this.tierConfigs[tier].minPoolSize > this.config.maxTotalConnections) {
+                    throw new Error(`Cannot allocate dedicated pool: would exceed maximum connections (${this.config.maxTotalConnections})`)
+                }
+            }
+            const pool = await this.createPool(uri, database, tier)
+            return { pool, isNew: true, reason: 'dedicated' }
+        }
+
         // Look for existing pool with capacity
         for (const [, pool] of this.pools) {
             if (pool.uri === uri && 
                 pool.database === database && 
                 pool.tier === tier &&
                 pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
-                
+
                 pool.lastUsedAt = new Date()
                 return { pool, isNew: false, reason: 'existing' }
             }
@@ -331,7 +343,7 @@ export class ConnectionManager {
                 this.log('warn', `Connection limit reached, using fallback pool for ${instanceId}`)
                 return { pool: fallbackPool, isNew: false, reason: 'existing' }
             }
-            
+
             throw new Error(`Cannot create new pool: would exceed maximum connections (${this.config.maxTotalConnections})`)
         }
         
@@ -536,8 +548,9 @@ export class ConnectionManager {
         
         for (const pool of this.pools.values()) {
             if (pool.uri !== uri || pool.database !== database) continue
-            
+
             const load = pool.instances.size / this.tierConfigs[pool.tier].maxInstancesPerPool
+            if (load >= 1) continue
             if (load < minLoad) {
                 minLoad = load
                 leastLoadedPool = pool

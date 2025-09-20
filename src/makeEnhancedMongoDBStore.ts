@@ -1,4 +1,4 @@
-import { MongoClient, Collection, Db } from 'mongodb'
+import { MongoClient, Collection, Db, ClientSession } from 'mongodb'
 import { proto, getAggregateVotesInPollMessage, updateMessageWithReceipt, updateMessageWithReaction } from 'baileys'
 import type { 
     BaileysEventEmitter, 
@@ -45,8 +45,8 @@ import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connec
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
 import { safeDropIndex, batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
 import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
-// @ts-ignore - Type is used in annotations
-import type { ConnectionConfig } from './types/connection'
+// @ts-ignore - Types are used in annotations only
+import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
 
@@ -556,6 +556,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         meId,
         lidHandler: lidHandlerConfig,
         connectionConfig,
+        connectionManager: connectionManagerOverrides,
         useSharedConnections = true,
         profilePictureConfig,
         indexManagement,
@@ -610,6 +611,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize memory monitor if configured
     const memoryMonitor = memory ? new MemoryMonitor(memory) : null
     const backpressureController = memory ? new BackpressureController(memory) : null
+
+    const waitForBackpressure = async (reason: string) => {
+        if (!backpressureController) {
+            return
+        }
+
+        while (backpressureController.shouldPause()) {
+            if (shouldLogOnce(`backpressure-${reason}`)) {
+                logWarn(`[${instanceId}] Memory backpressure engaged${reason ? ` during ${reason}` : ''}; pausing operations`) 
+            }
+            await new Promise(resolve => setTimeout(resolve, 200))
+        }
+    }
+
+    if (backpressureController) {
+        backpressureController.onPause(() => {
+            logWarn(`[${instanceId}] Memory pressure high, throttling new work`)
+        })
+
+        backpressureController.onResume(() => {
+            log(`[${instanceId}] Memory pressure normalized; resuming work`)
+        })
+    }
     
     // TTL monitor will be initialized after DB connection
     let ttlMonitor: TTLMonitor | null = null
@@ -638,6 +662,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Fix EventEmitter memory leak warning by setting reasonable limit
     connectionStateEmitter.setMaxListeners(50)
 
+    const dedicatedMaxPoolSize = connectionConfig?.maxPoolSize ?? 20
+    const dedicatedMinPoolSize = Math.min(connectionConfig?.minPoolSize ?? 4, dedicatedMaxPoolSize)
+    const connectionCheckInterval = connectionManagerOverrides?.monitoringInterval ?? 60000
+    let lastSuccessfulPing = 0
+
     // Track if proactive LID resolution has been done for this instance
     let historyLidResolutionDone = false
     
@@ -655,14 +684,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         }
     }
     
+    const sharedConnectionManagerConfig: ConnectionManagerConfig | undefined = useSharedConnections
+        ? {
+            ...connectionManagerOverrides,
+            maxTotalConnections: connectionManagerOverrides?.maxTotalConnections ?? 900,
+            logLevel: connectionManagerOverrides?.logLevel ?? (logLevel === 'all' ? 'info' : 'none'),
+            enableMetrics: connectionManagerOverrides?.enableMetrics ?? enableMetrics ?? false
+        }
+        : undefined
+
     // Check if we should use shared connections
     if (useSharedConnections) {
         try {
             // Use ConnectionManager for shared connections
-            connectionManager = getConnectionManager({
-                logLevel: logLevel as any,
-                enableMetrics: enableMetrics
-            })
+            connectionManager = getConnectionManager(sharedConnectionManagerConfig)
             
             const connection = await connectionManager.registerInstance({
                 instanceId: validatedInstanceId,
@@ -674,15 +709,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
-            
+            lastSuccessfulPing = Date.now()
+
             log(`Using shared connection for instance ${instanceId}`)
         } catch (error) {
             logWarn(`Failed to use shared connection for instance ${instanceId}, falling back to dedicated connection:`, error)
             
             // Fallback to dedicated connection on error
             client = new MongoClient(uri, {
-                maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                maxPoolSize: dedicatedMaxPoolSize,
+                minPoolSize: dedicatedMinPoolSize,
                 maxIdleTimeMS: 30000,
                 writeConcern: { w: 1, j: false }
             })
@@ -690,19 +726,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             db = client.db(dbName)
             isUsingSharedConnection = false
             connectionManager = null
+            lastSuccessfulPing = Date.now()
         }
     } else {
         // Use dedicated connection (original behavior)
         client = new MongoClient(uri, {
-            maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-            minPoolSize: connectionConfig?.minPoolSize ?? 10,
+            maxPoolSize: dedicatedMaxPoolSize,
+            minPoolSize: dedicatedMinPoolSize,
             maxIdleTimeMS: 30000,
             writeConcern: { w: 1, j: false }
         })
         await client.connect()
         db = client.db(dbName)
         mongoConnectionState = MongoConnectionState.CONNECTED
-        
+        lastSuccessfulPing = Date.now()
+
         // Start health monitoring
         healthMonitor.startMonitoring(db)
     }
@@ -752,14 +790,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const ensureConnection = async (): Promise<void> => {
         // Quick check if already connected
         if (mongoConnectionState === MongoConnectionState.CONNECTED && client) {
+            const now = Date.now()
+            if (now - lastSuccessfulPing < connectionCheckInterval) {
+                return
+            }
+
             try {
-                // Quick ping to verify connection is alive
                 await db.admin().ping()
+                lastSuccessfulPing = now
                 return
             } catch (error) {
                 log(`Connection check failed for instance ${validatedInstanceId}: ${error}`)
                 mongoConnectionState = MongoConnectionState.DISCONNECTED
-                    connectionStateEmitter.emit('disconnected', error)
+                connectionStateEmitter.emit('disconnected', error)
             }
         }
         
@@ -827,14 +870,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     mongoConnectionState = MongoConnectionState.CONNECTED
                     connectionStateEmitter.emit('connected')
                     healthMonitor.updateConnectionState('connected')
+                    lastSuccessfulPing = Date.now()
                     log(`Reconnected to MongoDB (shared) for instance ${validatedInstanceId}`)
                 } catch (error) {
                     // Fall back to dedicated connection if shared fails
                     logWarn(`Failed to reconnect with shared connection, falling back to dedicated:`, error)
                     
                     client = new MongoClient(uri, {
-                        maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                        minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                        maxPoolSize: dedicatedMaxPoolSize,
+                        minPoolSize: dedicatedMinPoolSize,
                         maxIdleTimeMS: 30000,
                         writeConcern: { w: 1, j: false }
                     })
@@ -864,6 +908,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     mongoConnectionState = MongoConnectionState.CONNECTED
                     connectionStateEmitter.emit('connected')
                     healthMonitor.updateConnectionState('connected')
+                    lastSuccessfulPing = Date.now()
                     log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
                 }
             } else {
@@ -877,8 +922,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 client = new MongoClient(uri, {
-                    maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                    minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                    maxPoolSize: dedicatedMaxPoolSize,
+                    minPoolSize: dedicatedMinPoolSize,
                     maxIdleTimeMS: 30000,
                     writeConcern: { w: 1, j: false }
                 })
@@ -897,6 +942,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 mongoConnectionState = MongoConnectionState.CONNECTED
                 connectionStateEmitter.emit('connected')
                 healthMonitor.updateConnectionState('connected')
+                lastSuccessfulPing = Date.now()
                 log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
             }
         } catch (error) {
@@ -965,6 +1011,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
+                await waitForBackpressure('db-operation')
                 return await operation()
             },
             options,
@@ -983,7 +1030,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const responseTime = Date.now() - startTime
         trackActivity(responseTime)
         healthMonitor.recordSuccess(responseTime)
-        
+        lastSuccessfulPing = Date.now()
+
         return result.result as T
     }
     
@@ -6578,26 +6626,60 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Perform the actual deletion
                 const preserveSet = new Set(options?.preserve || [])
-                const toDelete: Array<Promise<any>> = []
 
-                log(`[${instanceId}] Deleting collections${preserveSet.size ? ` (preserving: ${Array.from(preserveSet).join(', ')})` : ''}...`)
-                // Note: Labels, label associations, and group metadata are excluded from clearAll()
-                // They should persist across history syncs to maintain data integrity
-                if (!preserveSet.has('chats')) {
-                    toDelete.push(collections.chats.deleteMany({ instanceId }))
-                }
-                if (!preserveSet.has('contacts')) {
-                    toDelete.push(collections.contacts.deleteMany({ instanceId }))
-                }
-                if (!preserveSet.has('messages')) {
-                    toDelete.push(collections.messages.deleteMany({ instanceId }))
-                }
-                if (!preserveSet.has('presences')) {
-                    toDelete.push(collections.presences.deleteMany({ instanceId }))
+                const runDeletes = async (session?: ClientSession) => {
+                    const deletions: Array<Promise<any>> = []
+
+                    log(`[${instanceId}] Deleting collections${preserveSet.size ? ` (preserving: ${Array.from(preserveSet).join(', ')})` : ''}...`)
+                    if (!preserveSet.has('chats')) {
+                        deletions.push(collections.chats.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+                    if (!preserveSet.has('contacts')) {
+                        deletions.push(collections.contacts.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+                    if (!preserveSet.has('messages')) {
+                        deletions.push(collections.messages.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+                    if (!preserveSet.has('presences')) {
+                        deletions.push(collections.presences.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+
+                    if (deletions.length === 0) {
+                        log(`[${instanceId}] No collections selected for deletion during clearAll`)
+                        return
+                    }
+
+                    await Promise.all(deletions)
                 }
 
-                await Promise.all(toDelete)
-                
+                let ranTransaction = false
+                if (client && typeof client.startSession === 'function') {
+                    const session = client.startSession()
+                    try {
+                        await withConnection(async () => {
+                            await session.withTransaction(async () => {
+                                await runDeletes(session)
+                            }, {
+                                readPreference: 'primary',
+                                readConcern: { level: 'local' },
+                                writeConcern: { w: 'majority' }
+                            })
+                        })
+                        ranTransaction = true
+                        log(`[${instanceId}] clearAll completed within MongoDB transaction`)
+                    } catch (error) {
+                        logWarn(`[${instanceId}] Transactional clearAll failed, falling back to non-transactional deletes:`, error)
+                    } finally {
+                        await session.endSession()
+                    }
+                }
+
+                if (!ranTransaction) {
+                    await withConnection(async () => {
+                        await runDeletes()
+                    })
+                }
+
                 const duration = Date.now() - startTime
                 log(`[CLEAR_ALL_END] Instance: ${instanceId}, Duration: ${duration}ms`)
                 
@@ -6947,8 +7029,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     instanceId: validatedInstanceId,
                     connected: true, // If client exists, it's connected
                     connectionConfig: {
-                        maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                        minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                        maxPoolSize: dedicatedMaxPoolSize,
+                        minPoolSize: dedicatedMinPoolSize,
                         maxIdleTimeMS: 30000
                     }
                 }
