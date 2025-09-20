@@ -1020,8 +1020,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
-                await waitForBackpressure('db-operation')
-                return await operation()
+                const endPoolOperation = isUsingSharedConnection && connectionManager
+                    ? connectionManager.beginInstanceOperation(validatedInstanceId)
+                    : null
+                try {
+                    await waitForBackpressure('db-operation')
+                    return await operation()
+                } finally {
+                    if (endPoolOperation) {
+                        endPoolOperation()
+                    }
+                }
             },
             options,
             (attempt, error, delay) => {

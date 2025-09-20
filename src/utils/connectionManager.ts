@@ -54,6 +54,33 @@ export class ConnectionManager {
             return input
         }
     }
+
+    public beginInstanceOperation(instanceId: string): () => void {
+        const poolId = this.instancePools.get(instanceId)
+        if (!poolId) {
+            return () => {}
+        }
+
+        const pool = this.pools.get(poolId)
+        if (!pool) {
+            return () => {}
+        }
+
+        pool.activeOperations++
+        pool.lastUsedAt = new Date()
+
+        let released = false
+        return () => {
+            if (released) {
+                return
+            }
+            released = true
+            if (pool.activeOperations > 0) {
+                pool.activeOperations--
+            }
+            pool.lastUsedAt = new Date()
+        }
+    }
     
     private constructor(config?: ConnectionManagerConfig) {
         // Set default configuration
@@ -419,12 +446,12 @@ export class ConnectionManager {
         
         // Wait for active operations to complete (with timeout)
         const waitForOperations = async () => {
-            const maxWait = 5000 // 5 seconds
+            const maxWait = 15000 // 15 seconds grace
             const startTime = Date.now()
             
             while (pool.activeOperations > 0) {
                 if (Date.now() - startTime > maxWait) {
-                    this.log('warn', `Timeout waiting for operations to complete in pool ${poolId}, forcing close`)
+                    this.log('warn', `Timeout waiting for operations to complete in pool ${this.redactConnectionString(poolId)}, forcing close`)
                     break
                 }
                 await new Promise(resolve => setTimeout(resolve, 100))
@@ -441,7 +468,7 @@ export class ConnectionManager {
             await new Promise(resolve => setTimeout(resolve, 200))
             
         } catch (error) {
-            this.log('error', `Error closing pool ${poolId}: ${error}`)
+            this.log('error', `Error closing pool ${this.redactConnectionString(poolId)}: ${error}`)
         } finally {
             // Always remove from pools map
             this.pools.delete(poolId)
@@ -454,7 +481,7 @@ export class ConnectionManager {
             }
         }
         
-        this.log('info', `Pool ${poolId} closed successfully`)
+        this.log('info', `Pool ${this.redactConnectionString(poolId)} closed successfully`)
     }
     
     private async migrateInstancePool(instanceId: string, fromTier: ConnectionTier, toTier: ConnectionTier): Promise<void> {
