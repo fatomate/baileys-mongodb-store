@@ -36,6 +36,24 @@ export class ConnectionManager {
     
     // Logging
     private logLevel: ConnectionManagerConfig['logLevel'] = 'none'
+
+    private redactConnectionString(input: string): string {
+        if (!input) {
+            return input
+        }
+
+        try {
+            if (/mongodb(\+srv)?:\/\//i.test(input)) {
+                const sanitized = input.replace(/:\/\/([^:@]+):([^@]+)@/i, '://$1:***@')
+                const url = new URL(sanitized)
+                url.search = ''
+                return url.toString()
+            }
+            return input
+        } catch (error) {
+            return input
+        }
+    }
     
     private constructor(config?: ConnectionManagerConfig) {
         // Set default configuration
@@ -129,8 +147,8 @@ export class ConnectionManager {
         // Track instance-pool mapping
         this.instancePools.set(instanceId, poolSelection.pool.id)
         poolSelection.pool.instances.add(instanceId)
-        
-        this.log('info', `Instance ${instanceId} assigned to pool ${poolSelection.pool.id} (${poolSelection.pool.tier} tier)`)
+
+        this.log('info', `Instance ${instanceId} assigned to pool ${this.redactConnectionString(poolSelection.pool.id)} (${poolSelection.pool.tier} tier)`)
         
         return {
             db: poolSelection.pool.db,
@@ -356,7 +374,7 @@ export class ConnectionManager {
         const poolId = `${uri}:${database}:${tier}:${Date.now()}`
         const tierConfig = this.tierConfigs[tier]
         
-        this.log('info', `Creating new ${tier} pool: ${poolId}`)
+        this.log('info', `Creating new ${tier} pool: ${this.redactConnectionString(poolId)}`)
         
         const clientOptions: MongoClientOptions = {
             maxPoolSize: tierConfig.maxPoolSize,
@@ -391,7 +409,7 @@ export class ConnectionManager {
         const pool = this.pools.get(poolId)
         if (!pool) return
         
-        this.log('info', `Closing pool ${poolId}`)
+        this.log('info', `Closing pool ${this.redactConnectionString(poolId)}`)
         
         // Mark pool as closing
         pool.isClosing = true

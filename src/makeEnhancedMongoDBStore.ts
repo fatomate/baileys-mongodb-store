@@ -667,6 +667,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const connectionCheckInterval = connectionManagerOverrides?.monitoringInterval ?? 60000
     let lastSuccessfulPing = 0
 
+    const markConnectionStale = (reason: string, error?: unknown) => {
+        const err = error instanceof Error ? error : new Error(reason)
+        lastSuccessfulPing = 0
+        mongoConnectionState = MongoConnectionState.DISCONNECTED
+        connectionStateEmitter.emit('disconnected', err)
+        if (shouldLogOnce(`stale-connection-${reason}`)) {
+            logWarn(`[${instanceId}] Connection marked stale: ${reason}`)
+        }
+    }
+
     // Track if proactive LID resolution has been done for this instance
     let historyLidResolutionDone = false
     
@@ -801,8 +811,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 return
             } catch (error) {
                 log(`Connection check failed for instance ${validatedInstanceId}: ${error}`)
-                mongoConnectionState = MongoConnectionState.DISCONNECTED
-                connectionStateEmitter.emit('disconnected', error)
+                markConnectionStale('ping failure', error)
             }
         }
         
@@ -1016,11 +1025,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             },
             options,
             (attempt, error, delay) => {
+                if (error && (error.name === 'MongoNotConnectedError' || error.name === 'MongoExpiredSessionError' || /session has ended/i.test(error.message))) {
+                    markConnectionStale('retry detected closed session', error)
+                }
                 logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
             }
         )
-        
+
         if (!result.success) {
+            if (result.error && (result.error.name === 'MongoNotConnectedError' || result.error.name === 'MongoExpiredSessionError' || /session has ended/i.test(result.error.message))) {
+                markConnectionStale('retry budget exhausted', result.error)
+            }
             logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
             healthMonitor.recordFailure()
             throw result.error
@@ -6669,6 +6684,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         log(`[${instanceId}] clearAll completed within MongoDB transaction`)
                     } catch (error) {
                         logWarn(`[${instanceId}] Transactional clearAll failed, falling back to non-transactional deletes:`, error)
+                        if (error && (error instanceof Error) && (error.name === 'MongoExpiredSessionError' || /session has ended/i.test(error.message))) {
+                            markConnectionStale('transaction session terminated', error)
+                        }
                     } finally {
                         await session.endSession()
                     }
