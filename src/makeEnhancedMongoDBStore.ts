@@ -646,6 +646,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let db: Db
     let connectionManager: ConnectionManager | null = null
     let isUsingSharedConnection = false
+    let currentSharedPoolId: string | null = null
     let reconnectAttempts = 0
     
     // Connection state management
@@ -671,6 +672,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const err = error instanceof Error ? error : new Error(reason)
         lastSuccessfulPing = 0
         mongoConnectionState = MongoConnectionState.DISCONNECTED
+        if (isUsingSharedConnection) {
+            currentSharedPoolId = null
+        }
         connectionStateEmitter.emit('disconnected', err)
         if (shouldLogOnce(`stale-connection-${reason}`)) {
             logWarn(`[${instanceId}] Connection marked stale: ${reason}`)
@@ -719,6 +723,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
+            currentSharedPoolId = connection.poolId
+            mongoConnectionState = MongoConnectionState.CONNECTED
             lastSuccessfulPing = Date.now()
 
             log(`Using shared connection for instance ${instanceId}`)
@@ -736,6 +742,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             db = client.db(dbName)
             isUsingSharedConnection = false
             connectionManager = null
+            currentSharedPoolId = null
             lastSuccessfulPing = Date.now()
         }
     } else {
@@ -749,6 +756,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         await client.connect()
         db = client.db(dbName)
         mongoConnectionState = MongoConnectionState.CONNECTED
+        currentSharedPoolId = null
         lastSuccessfulPing = Date.now()
 
         // Start health monitoring
@@ -798,6 +806,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Ensure connection is active before operations with enhanced error handling
     const ensureConnection = async (): Promise<void> => {
+        if (isUsingSharedConnection && connectionManager && mongoConnectionState === MongoConnectionState.CONNECTED) {
+            const poolState = connectionManager.getInstancePoolState(validatedInstanceId)
+            if (poolState.pendingMigration && poolState.pendingMigration.toPoolId !== currentSharedPoolId) {
+                markConnectionStale('shared pool migration pending')
+            } else if (poolState.currentPoolId && currentSharedPoolId && poolState.currentPoolId !== currentSharedPoolId) {
+                markConnectionStale('shared pool mismatch')
+            }
+        }
+
         // Quick check if already connected
         if (mongoConnectionState === MongoConnectionState.CONNECTED && client) {
             const now = Date.now()
@@ -857,6 +874,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     client = connection.client
                     db = connection.db
                     isUsingSharedConnection = true
+                    currentSharedPoolId = connection.poolId
                     
                     // Refresh collections after reconnection
                     collections = getCollections()
@@ -895,6 +913,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     db = client.db(dbName)
                     isUsingSharedConnection = false
                     connectionManager = null
+                    currentSharedPoolId = null
                     
                     // Refresh collections after reconnection
                     collections = getCollections()
@@ -938,7 +957,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 })
                 await client.connect()
                 db = client.db(dbName)
-                
+                currentSharedPoolId = null
+
                 // Refresh collections after reconnection
                 collections = getCollections()
                 
@@ -1017,6 +1037,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         }
         
+        const isConnectionClosedError = (error: any): boolean => {
+            if (!error) {
+                return false
+            }
+            const message = typeof error.message === 'string' ? error.message : ''
+            return error.name === 'MongoNotConnectedError'
+                || error.name === 'MongoExpiredSessionError'
+                || error.name === 'MongoPoolClosedError'
+                || /session has ended/i.test(message)
+                || /closed connection pool/i.test(message)
+                || /client was closed/i.test(message)
+        }
+
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
@@ -1034,18 +1067,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             },
             options,
             (attempt, error, delay) => {
-                if (error && (error.name === 'MongoNotConnectedError' || error.name === 'MongoExpiredSessionError' || /session has ended/i.test(error.message))) {
+                if (isConnectionClosedError(error)) {
                     markConnectionStale('retry detected closed session', error)
                 }
                 const retryLogKey = `retry-${validatedInstanceId}-${error?.name || 'unknown'}`
                 if (shouldLogOnce(retryLogKey, 5)) {
-                    logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+                    const retryMessage = error?.message ?? 'Unknown error'
+                    logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${retryMessage}. Waiting ${delay}ms...`)
                 }
             }
         )
 
         if (!result.success) {
-            if (result.error && (result.error.name === 'MongoNotConnectedError' || result.error.name === 'MongoExpiredSessionError' || /session has ended/i.test(result.error.message))) {
+            if (isConnectionClosedError(result.error)) {
                 markConnectionStale('retry budget exhausted', result.error)
             }
             logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
@@ -7220,9 +7254,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Unregister from connection manager
                 await connectionManager.unregisterInstance(validatedInstanceId)
                 connectionManager = null
+                currentSharedPoolId = null
             } else if (client && !isUsingSharedConnection) {
                 // Close dedicated connection
                 await client.close()
+                currentSharedPoolId = null
             }
             
             // Reset connection state

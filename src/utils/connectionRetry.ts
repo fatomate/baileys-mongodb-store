@@ -28,6 +28,7 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
             'Client must be connected',
             'Topology is closed',
             'Connection pool closed',
+            'closed connection pool',
             'client was closed', // covers "Operation interrupted because client was closed"
             'ECONNREFUSED',
             'ETIMEDOUT',
@@ -48,7 +49,8 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
                error.name === 'MongoNetworkError' ||
                error.name === 'MongoNotConnectedError' ||
                error.name === 'MongoExpiredSessionError' ||
-               error.name === 'MongoClientClosedError'
+               error.name === 'MongoClientClosedError' ||
+               error.name === 'MongoPoolClosedError'
     }
 }
 
