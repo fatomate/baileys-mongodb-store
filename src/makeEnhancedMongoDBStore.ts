@@ -1037,7 +1037,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 if (error && (error.name === 'MongoNotConnectedError' || error.name === 'MongoExpiredSessionError' || /session has ended/i.test(error.message))) {
                     markConnectionStale('retry detected closed session', error)
                 }
-                logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+                const retryLogKey = `retry-${validatedInstanceId}-${error?.name || 'unknown'}`
+                if (shouldLogOnce(retryLogKey, 5)) {
+                    logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+                }
             }
         )
 
