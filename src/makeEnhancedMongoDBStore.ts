@@ -1125,25 +1125,49 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Handle REVOKE messages
                     if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
                         const revokedKey = message.message.protocolMessage.key
-                        const targetJid = revokedKey.remoteJid || jid
+                        const outerChatJid = message.key.remoteJid || jid
                         
-                        await withConnection(async () =>
+                        // Prefer outer chat JID and normalize via LID if available
+                        let targetJid = outerChatJid
+                        if (lidHandler && targetJid) {
+                            try {
+                                const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                if (normalized) targetJid = normalized
+                            } catch {}
+                        }
+                        
+                        const baseSet: any = {
+                            'message.protocolMessage': message.message?.protocolMessage,
+                            revoked: true,
+                            revokedAt: new Date(),
+                            revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid,
+                            messageStubType: 1
+                        }
+                        
+                        let updateResult = await withConnection(async () =>
                             collections.messages.updateOne(
-                                {
-                                    instanceId: validatedInstanceId,
-                                    jid: targetJid,
-                                    'key.id': revokedKey.id
-                                },
-                                {
-                                    $set: {
-                                        'message.protocolMessage': message.message?.protocolMessage,
-                                        revoked: true,
-                                        revokedAt: new Date(),
-                                        revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
-                                    }
-                                }
+                                { instanceId: validatedInstanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                { $set: baseSet }
                             )
                         )
+                        
+                        if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                            updateResult = await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                    { $set: baseSet }
+                                )
+                            )
+                        }
+                        
+                        if (updateResult.matchedCount === 0) {
+                            await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, 'key.id': revokedKey.id },
+                                    { $set: baseSet }
+                                )
+                            )
+                        }
                         return { success: true, type: 'revoke' }
                     }
                     
@@ -1871,28 +1895,50 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                         if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
                             const revokedKey = message.message.protocolMessage.key
-                            log(`🔄 [Bull Queue REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                            const outerChatJid = message.key.remoteJid || jid
+                            
+                            // Prefer outer chat JID and normalize via LID if available
+                            let targetJid = outerChatJid
+                            if (lidHandler && targetJid) {
+                                try {
+                                    const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                    if (normalized) targetJid = normalized
+                                } catch {}
+                            }
                             
                             try {
-                                // Update the revoked message to mark it as deleted/revoked
-                                const targetJid = revokedKey.remoteJid || jid
-                                const updateResult = await withConnection(async () =>
+                                const baseSet: any = {
+                                    'message.protocolMessage': message.message?.protocolMessage,
+                                    revoked: true,
+                                    revokedAt: new Date(),
+                                    revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid,
+                                    messageStubType: 1
+                                }
+                                
+                                let updateResult = await withConnection(async () =>
                                     collections.messages.updateOne(
-                                        {
-                                            instanceId,
-                                            jid: targetJid,
-                                            'key.id': revokedKey.id
-                                        },
-                                        {
-                                            $set: {
-                                                'message.protocolMessage': message.message?.protocolMessage,
-                                                revoked: true,
-                                                revokedAt: new Date(),
-                                                revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
-                                            }
-                                        }
+                                        { instanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
                                     )
                                 )
+                                
+                                if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
+                                
+                                if (updateResult.matchedCount === 0) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
                                 
                                 if (updateResult.matchedCount > 0) {
                                     log(`✅ [Bull Queue REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
@@ -4282,27 +4328,52 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                     if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && clonedMessage.message.protocolMessage.key) {
                         const revokedKey = clonedMessage.message.protocolMessage.key
-                        log(`🔄 [Direct REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                        const outerChatJid = clonedMessage.key.remoteJid || jid
+                        
+                        // Prefer outer chat JID; normalize if LID
+                        let targetJid = outerChatJid
+                        if (lidHandler && targetJid) {
+                            try {
+                                const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                if (normalized) targetJid = normalized
+                            } catch {}
+                        }
+                        
+                        log(`🔄 [Direct REVOKE] Processing revoke message for ${revokedKey.id} in chat ${targetJid}`)
                         
                         try {
-                            // Update the revoked message to mark it as deleted/revoked
-                            const updateResult = await withConnection(async () =>
+                            const baseSet: any = {
+                                'message.protocolMessage': clonedMessage.message.protocolMessage,
+                                revoked: true,
+                                revokedAt: new Date(),
+                                revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid,
+                                messageStubType: 1
+                            }
+                            
+                            let updateResult = await withConnection(async () =>
                                 collections.messages.updateOne(
-                                    {
-                                        instanceId: validatedInstanceId,
-                                        jid: revokedKey.remoteJid || jid,
-                                        'key.id': revokedKey.id
-                                    },
-                                    {
-                                        $set: {
-                                            'message.protocolMessage': clonedMessage.message.protocolMessage,
-                                            revoked: true,
-                                            revokedAt: new Date(),
-                                            revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid
-                                        }
-                                    }
+                                    { instanceId: validatedInstanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                    { $set: baseSet }
                                 )
                             )
+                            
+                            if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                                updateResult = await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        { instanceId: validatedInstanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
+                                    )
+                                )
+                            }
+                            
+                            if (updateResult.matchedCount === 0) {
+                                updateResult = await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        { instanceId: validatedInstanceId, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
+                                    )
+                                )
+                            }
                             
                             if (updateResult.matchedCount > 0) {
                                 log(`✅ [Direct REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
@@ -5295,28 +5366,55 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                         if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && msg.message.protocolMessage.key) {
                             const revokedKey = msg.message.protocolMessage.key
-                            log(`🔄 [REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                            const outerChatJid = msg.key.remoteJid || jid
+                            
+                            // Always prefer the outer chat JID; protocolMessage.key.remoteJid can be unreliable
+                            let targetJid = outerChatJid
+                            if (lidHandler && targetJid) {
+                                try {
+                                    const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                    if (normalized) targetJid = normalized
+                                } catch {}
+                            }
+                            
+                            log(`🔄 [REVOKE] Processing revoke message for ${revokedKey.id} in chat ${targetJid}`)
                             
                             try {
                                 // Update the revoked message to mark it as deleted/revoked
-                                const targetJid = revokedKey.remoteJid || jid
-                                const updateResult = await withConnection(async () =>
+                                const baseSet: any = {
+                                    'message.protocolMessage': msg.message?.protocolMessage,
+                                    revoked: true,
+                                    revokedAt: new Date(),
+                                    revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid,
+                                    messageStubType: 1 // REVOKE
+                                }
+                                
+                                let updateResult = await withConnection(async () =>
                                     collections.messages.updateOne(
-                                        {
-                                            instanceId,
-                                            jid: targetJid,
-                                            'key.id': revokedKey.id
-                                        },
-                                        {
-                                            $set: {
-                                                'message.protocolMessage': msg.message?.protocolMessage,
-                                                revoked: true,
-                                                revokedAt: new Date(),
-                                                revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid
-                                            }
-                                        }
+                                        { instanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
                                     )
                                 )
+                                
+                                // Fallback 1: try with outer (non-normalized) JID if different
+                                if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
+                                
+                                // Fallback 2: match by id only within the instance (jid may have changed due to normalization/history)
+                                if (updateResult.matchedCount === 0) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
                                 
                                 if (updateResult.matchedCount > 0) {
                                     log(`✅ [REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
