@@ -573,7 +573,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         skipExistingCollectionIndexes: indexManagement?.skipExistingCollectionIndexes ?? true,
         forceRecreateIndexes: indexManagement?.forceRecreateIndexes ?? false,
         enableIndexHealthLogging: indexManagement?.enableIndexHealthLogging ?? true,
-        indexCreationTimeout: indexManagement?.indexCreationTimeout ?? 30000
+        indexCreationTimeout: indexManagement?.indexCreationTimeout ?? null
+    }
+
+    const addIndexTimeout = <T extends IndexSpec>(index: T): T => {
+        if (!indexConfig.indexCreationTimeout || indexConfig.indexCreationTimeout <= 0) {
+            return index
+        }
+
+        const baseOptions = index.options ? { ...index.options } : {}
+
+        return {
+            ...index,
+            options: {
+                ...baseOptions,
+                maxTimeMS: indexConfig.indexCreationTimeout
+            }
+        } as T
     }
     
     // Socket can be set later using setSock() method
@@ -3361,10 +3377,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     // Force recreate: drop and recreate all indexes with timeout applied
-                    const timedIndexes = requiredIndexes.map(idx => ({
-                        ...idx,
-                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                    }))
+                    const timedIndexes = requiredIndexes.map(addIndexTimeout)
                     const batchResult = await withConnection(() => 
                         recreateIndexes(collection, timedIndexes)
                     )
@@ -3399,10 +3412,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                         
                         // Create missing indexes using batch operation with timeout applied
-                        const timedMissingIndexes = checkResult.missingIndexes.map(idx => ({
-                            ...idx,
-                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                        }))
+                        const timedMissingIndexes = checkResult.missingIndexes.map(addIndexTimeout)
                         const batchResult = await batchCreateIndexes(collection, timedMissingIndexes, withConnection)
                         
                         createResults.push({
@@ -3440,10 +3450,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     // Apply timeout to all indexes for legacy mode
-                    const timedIndexes = requiredIndexes.map(idx => ({
-                        ...idx,
-                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                    }))
+                    const timedIndexes = requiredIndexes.map(addIndexTimeout)
                     const batchResult = await batchCreateIndexes(collection, timedIndexes, withConnection)
                     
                     createResults.push({
@@ -6898,10 +6905,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         const collection = collections[collectionName as keyof typeof collections]
                         
                         // Apply timeout to indexes
-                        const timedIndexes = requiredIndexes.map(idx => ({
-                            ...idx,
-                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                        }))
+                        const timedIndexes = requiredIndexes.map(addIndexTimeout)
                         
                         const result = await recreateIndexes(collection, timedIndexes)
                         totalCreated += result.successful
