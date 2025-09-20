@@ -6738,54 +6738,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     await Promise.all(deletions)
                 }
 
-                let ranTransaction = false
-                const canUseTransactions = client && typeof client.startSession === 'function'
-                if (canUseTransactions) {
-                    const maxTxnAttempts = 3
-                    for (let attempt = 1; attempt <= maxTxnAttempts; attempt++) {
-                        try {
-                            await withConnection(async () => {
-                                if (!client) {
-                                    throw new Error('Mongo client unavailable for transaction')
-                                }
-                                const session = client.startSession()
-                                try {
-                                    await session.withTransaction(async () => {
-                                        await runDeletes(session)
-                                    }, {
-                                        readPreference: 'primary',
-                                        readConcern: { level: 'local' },
-                                        writeConcern: { w: 'majority' }
-                                    })
-                                } finally {
-                                    await session.endSession()
-                                }
-                            }, { maxAttempts: 1 })
-                            ranTransaction = true
-                            if (attempt > 1) {
-                                log(`[${instanceId}] clearAll transaction succeeded on retry attempt ${attempt}`)
-                            } else {
-                                log(`[${instanceId}] clearAll completed within MongoDB transaction`)
-                            }
-                            break
-                        } catch (error) {
-                            const transientTxnError = isTransientTransactionError(error)
-                            logWarn(`[${instanceId}] Transactional clearAll attempt ${attempt} failed${transientTxnError ? ' (transient)' : ''}:`, error)
-                            if (transientTxnError && attempt < maxTxnAttempts) {
-                                markConnectionStale('transaction transient failure', error)
-                                await new Promise(resolve => setTimeout(resolve, 200 * attempt))
-                                continue
-                            }
-                            break
-                        }
-                    }
-                }
-
-                if (!ranTransaction) {
-                    await withConnection(async () => {
-                        await runDeletes()
-                    })
-                }
+                await withConnection(async () => {
+                    await runDeletes()
+                })
 
                 const duration = Date.now() - startTime
                 log(`[CLEAR_ALL_END] Instance: ${instanceId}, Duration: ${duration}ms`)
