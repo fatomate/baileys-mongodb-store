@@ -697,6 +697,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             connectionManager.recordActivity(validatedInstanceId, responseTime)
         }
     }
+
+    const hasErrorLabel = (error: any, label: string): boolean => {
+        if (!error) {
+            return false
+        }
+        if (Array.isArray(error.errorLabels) && error.errorLabels.includes(label)) {
+            return true
+        }
+        if (error.errorLabelSet instanceof Set && error.errorLabelSet.has(label)) {
+            return true
+        }
+        return false
+    }
+
+    const isTransientTransactionError = (error: any): boolean => {
+        if (!error) {
+            return false
+        }
+        const message = typeof error.message === 'string' ? error.message : ''
+        return hasErrorLabel(error, 'TransientTransactionError')
+            || error.code === 251
+            || error.codeName === 'NoSuchTransaction'
+            || /no such transaction/i.test(message)
+    }
     
     const sharedConnectionManagerConfig: ConnectionManagerConfig | undefined = useSharedConnections
         ? {
@@ -1045,6 +1069,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return error.name === 'MongoNotConnectedError'
                 || error.name === 'MongoExpiredSessionError'
                 || error.name === 'MongoPoolClosedError'
+                || isTransientTransactionError(error)
                 || /session has ended/i.test(message)
                 || /closed connection pool/i.test(message)
                 || /client was closed/i.test(message)
@@ -6714,27 +6739,45 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
 
                 let ranTransaction = false
-                if (client && typeof client.startSession === 'function') {
-                    const session = client.startSession()
-                    try {
-                        await withConnection(async () => {
-                            await session.withTransaction(async () => {
-                                await runDeletes(session)
-                            }, {
-                                readPreference: 'primary',
-                                readConcern: { level: 'local' },
-                                writeConcern: { w: 'majority' }
-                            })
-                        })
-                        ranTransaction = true
-                        log(`[${instanceId}] clearAll completed within MongoDB transaction`)
-                    } catch (error) {
-                        logWarn(`[${instanceId}] Transactional clearAll failed, falling back to non-transactional deletes:`, error)
-                        if (error && (error instanceof Error) && (error.name === 'MongoExpiredSessionError' || /session has ended/i.test(error.message))) {
-                            markConnectionStale('transaction session terminated', error)
+                const canUseTransactions = client && typeof client.startSession === 'function'
+                if (canUseTransactions) {
+                    const maxTxnAttempts = 3
+                    for (let attempt = 1; attempt <= maxTxnAttempts; attempt++) {
+                        try {
+                            await withConnection(async () => {
+                                if (!client) {
+                                    throw new Error('Mongo client unavailable for transaction')
+                                }
+                                const session = client.startSession()
+                                try {
+                                    await session.withTransaction(async () => {
+                                        await runDeletes(session)
+                                    }, {
+                                        readPreference: 'primary',
+                                        readConcern: { level: 'local' },
+                                        writeConcern: { w: 'majority' }
+                                    })
+                                } finally {
+                                    await session.endSession()
+                                }
+                            }, { maxAttempts: 1 })
+                            ranTransaction = true
+                            if (attempt > 1) {
+                                log(`[${instanceId}] clearAll transaction succeeded on retry attempt ${attempt}`)
+                            } else {
+                                log(`[${instanceId}] clearAll completed within MongoDB transaction`)
+                            }
+                            break
+                        } catch (error) {
+                            const transientTxnError = isTransientTransactionError(error)
+                            logWarn(`[${instanceId}] Transactional clearAll attempt ${attempt} failed${transientTxnError ? ' (transient)' : ''}:`, error)
+                            if (transientTxnError && attempt < maxTxnAttempts) {
+                                markConnectionStale('transaction transient failure', error)
+                                await new Promise(resolve => setTimeout(resolve, 200 * attempt))
+                                continue
+                            }
+                            break
                         }
-                    } finally {
-                        await session.endSession()
                     }
                 }
 
