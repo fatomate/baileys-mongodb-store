@@ -535,6 +535,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         enabled: boolean;
         requestDelay?: number;
         retryAttempts?: number;
+        maxConcurrentLookups?: number;
+        negativeCacheTTL?: number;
     }
 }): Promise<EnhancedMongoDBStore> => {
     const {
@@ -564,7 +566,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     } = config
 
     // Set default values for lidConfig
-    const defaultLidConfig = { enabled: true, requestDelay: 500, retryAttempts: 3 }
+    const defaultLidConfig = { enabled: true, requestDelay: 500, retryAttempts: 3, maxConcurrentLookups: 10, negativeCacheTTL: 60 }
     const finalLidConfig = { ...defaultLidConfig, ...lidConfig }
 
 
@@ -1032,6 +1034,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // Ensure LidHandler uses store's connection lifecycle and skip index creation by default
         lidHandler = new LidHandler(validatedInstanceId, {
             skipIndexCreation: true,
+            maxConcurrentLookups: lidHandlerConfig.maxConcurrentLookups ?? finalLidConfig.maxConcurrentLookups,
+            negativeCacheTTL: lidHandlerConfig.negativeCacheTTL ?? finalLidConfig.negativeCacheTTL,
             ...lidHandlerConfig,
             ensureConnection: ensureConnection
         })

@@ -32,9 +32,19 @@ export interface LidHandlerConfig {
      * Default: false
      */
     autoFillFromLegacy?: boolean
+    /**
+     * Maximum number of concurrent normalization/lookup operations that may hit MongoDB.
+     * Default: 10 (disable limiting with 0 or negative numbers).
+     */
+    maxConcurrentLookups?: number
+    /**
+     * TTL (in seconds) for negative cache entries (misses). Default derived from cacheTTL.
+     */
+    negativeCacheTTL?: number
 }
 
 export class LidHandler {
+    private static readonly NEGATIVE_CACHE_SENTINEL = '__MISS__'
     private lidMappingsCollection: Collection<LidMapping> | null = null // legacy read-only fallback
     private contactsCollection: Collection<any> | null = null
     private messagesCollection: Collection<any> | null = null
@@ -44,6 +54,12 @@ export class LidHandler {
     private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean; autoFillFromLegacy: boolean }
     private instanceId: string
     private isInitialized: boolean = false
+    private pendingLidLookups: Map<string, Promise<string | null>> = new Map()
+    private pendingPhoneLookups: Map<string, Promise<string | null>> = new Map()
+    private negativeCacheTTL: number
+    private maxConcurrentLookups: number
+    private activeLookups = 0
+    private lookupQueue: Array<() => void> = []
 
     constructor(instanceId: string, config?: LidHandlerConfig) {
         this.instanceId = instanceId
@@ -54,7 +70,14 @@ export class LidHandler {
             autoFillFromLegacy: config?.autoFillFromLegacy ?? true
         }
         this.ensureConnectionCb = config?.ensureConnection
-        
+
+        const derivedNegativeTTL = Math.max(30, Math.min(120, Math.floor((this.config.cacheTTL || 60) / 6)))
+        this.negativeCacheTTL = config?.negativeCacheTTL ?? derivedNegativeTTL
+        if (!Number.isFinite(this.negativeCacheTTL) || this.negativeCacheTTL <= 0) {
+            this.negativeCacheTTL = 60
+        }
+        this.maxConcurrentLookups = config?.maxConcurrentLookups ?? 10
+
         // Initialize cache with configured TTL
         this.cache = new NodeCache({ 
             stdTTL: this.config.cacheTTL,
@@ -138,6 +161,31 @@ export class LidHandler {
             // For other errors, log and re-throw
             console.error(`[LidHandler] ${operationName} failed:`, error)
             throw error
+        }
+    }
+
+    private async runWithLimiter<T>(operation: () => Promise<T>): Promise<T> {
+        if (this.maxConcurrentLookups <= 0) {
+            return operation()
+        }
+
+        if (this.activeLookups >= this.maxConcurrentLookups) {
+            await new Promise<void>((resolve) => this.lookupQueue.push(resolve))
+        }
+
+        this.activeLookups++
+        try {
+            return await operation()
+        } finally {
+            this.activeLookups--
+            const next = this.lookupQueue.shift()
+            if (next) {
+                try {
+                    next()
+                } catch (_err) {
+                    // no-op; releasing the queue should not throw
+                }
+            }
         }
     }
 
@@ -415,12 +463,36 @@ export class LidHandler {
                     throw e
                 }
             }
-            
+
             // Update cache if enabled (use normalized JIDs for cache keys)
             if (this.config.enableCache) {
                 // Cache both directions
                 this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, normalizedPhone)
                 this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
+            }
+
+            if (this.lidMappingsCollection) {
+                try {
+                    await this.lidMappingsCollection.updateOne(
+                        { instanceId: this.instanceId, lid: normalizedLid },
+                        {
+                            $set: {
+                                phoneNumber: normalizedPhone,
+                                updatedAt: now,
+                                lastSeen: now,
+                                ...(cleanedPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
+                            },
+                            $setOnInsert: {
+                                instanceId: this.instanceId,
+                                lid: normalizedLid,
+                                firstSeen: now
+                            }
+                        },
+                        { upsert: true }
+                    )
+                } catch (mappingError) {
+                    console.debug('[LidHandler] Failed to upsert lidMappings entry:', (mappingError as any)?.message)
+                }
             }
             
             console.log(`[LidHandler] Stored mapping in contacts: ${normalizedLid} -> ${normalizedPhone}`)
@@ -435,65 +507,126 @@ export class LidHandler {
     async getPhoneNumberFromLid(lid: string): Promise<string | null> {
         const normalizedLid = normalizeJidForStorage(lid)
         if (!this.isLidFormat(normalizedLid)) return lid
-        
-        // Check cache first (use normalized JID for cache key)
+
+        const cacheKey = `lid:${this.instanceId}:${normalizedLid}`
         if (this.config.enableCache) {
-            const cached = this.cache.get<string>(`lid:${this.instanceId}:${normalizedLid}`)
-            if (cached) return cached
+            const cached = this.cache.get<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL>(cacheKey)
+            if (cached !== undefined) {
+                return cached === LidHandler.NEGATIVE_CACHE_SENTINEL ? null : cached
+            }
         }
-        
-        // Query database with connection check
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.contactsCollection) {
-                    return null
-                }
-                
-                const contact = await this.contactsCollection.findOne({
-                    instanceId: this.instanceId,
-                    lid: normalizedLid
-                }, {
-                    projection: { id: 1 }
-                    // Removed hint to avoid errors when index doesn't exist
-                })
-                
-                if (contact?.id) {
-                    // Update cache
-                    if (this.config.enableCache) {
-                        this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, contact.id)
+
+        if (this.pendingLidLookups.has(normalizedLid)) {
+            return this.pendingLidLookups.get(normalizedLid)!
+        }
+
+        const lookupPromise = this.runWithLimiter(async () => {
+            const result = await this.withConnectionCheck(
+                async () => {
+                    if (!this.contactsCollection && !this.lidMappingsCollection) {
+                        return null
                     }
-                    
-                    return contact.id
-                }
-                
-                // Fallback: read from legacy lidMappings (no writes)
-                if (this.lidMappingsCollection) {
-                    const legacy = await this.lidMappingsCollection.findOne(
-                        { instanceId: this.instanceId, lid: normalizedLid }
-                        // Removed hint to avoid errors when index doesn't exist
-                    )
-                    if (legacy?.phoneNumber) {
-                        if (this.config.enableCache) {
-                            this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, legacy.phoneNumber)
+
+                    let phoneNumber: string | null = null
+                    let foundInContacts = false
+
+                    if (this.lidMappingsCollection) {
+                        try {
+                            const mapping = await this.lidMappingsCollection.findOne(
+                                { instanceId: this.instanceId, lid: normalizedLid },
+                                { projection: { phoneNumber: 1 } }
+                            )
+                            if (mapping?.phoneNumber) {
+                                phoneNumber = normalizeJidForStorage(mapping.phoneNumber)
+                                if (phoneNumber && this.config.autoFillFromLegacy) {
+                                    try {
+                                        await this.storeLidMapping(normalizedLid, phoneNumber)
+                                    } catch (fillError) {
+                                        console.debug('[LidHandler] Auto-fill from legacy mapping failed:', (fillError as any)?.message)
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                            console.debug('[LidHandler] Failed to read lidMappings entry:', (err as any)?.message)
                         }
-                        // Optional auto-fill into contacts to migrate mapping forward
-                        if (this.config.autoFillFromLegacy) {
-                            try {
-                                await this.storeLidMapping(normalizedLid, legacy.phoneNumber)
-                            } catch (e) {
-                                // Best-effort only
-                                console.debug('[LidHandler] Auto-fill from legacy failed:', (e as any)?.message)
+                    }
+
+                    if (!phoneNumber && this.contactsCollection) {
+                        const query = { instanceId: this.instanceId, lid: normalizedLid }
+                        try {
+                            const contact = await this.contactsCollection.findOne(
+                                query,
+                                {
+                                    projection: { id: 1 },
+                                    hint: { instanceId: 1, lid: 1 }
+                                }
+                            )
+                            if (contact?.id) {
+                                phoneNumber = normalizeJidForStorage(contact.id)
+                                foundInContacts = true
+                            }
+                        } catch (hintError: any) {
+                            if (hintError?.codeName === 'IndexNotFound' || /bad hint/i.test(hintError?.message || '')) {
+                                const contact = await this.contactsCollection.findOne(query, { projection: { id: 1 } })
+                                if (contact?.id) {
+                                    phoneNumber = normalizeJidForStorage(contact.id)
+                                    foundInContacts = true
+                                }
+                            } else {
+                                throw hintError
                             }
                         }
-                        return legacy.phoneNumber
                     }
+
+                    if (phoneNumber && this.lidMappingsCollection && foundInContacts) {
+                        const now = new Date()
+                        try {
+                            await this.lidMappingsCollection.updateOne(
+                                { instanceId: this.instanceId, lid: normalizedLid },
+                                {
+                                    $set: {
+                                        phoneNumber,
+                                        updatedAt: now,
+                                        lastSeen: now
+                                    },
+                                    $setOnInsert: {
+                                        instanceId: this.instanceId,
+                                        lid: normalizedLid,
+                                        firstSeen: now
+                                    }
+                                },
+                                { upsert: true }
+                            )
+                        } catch (err) {
+                            console.debug('[LidHandler] Failed to backfill lidMappings from contacts:', (err as any)?.message)
+                        }
+                    }
+
+                    return phoneNumber
+                },
+                null,
+                'getPhoneNumberFromLid'
+            )
+
+            return result
+        })
+
+        this.pendingLidLookups.set(normalizedLid, lookupPromise)
+
+        try {
+            const result = await lookupPromise
+            if (this.config.enableCache) {
+                if (result) {
+                    this.cache.set(cacheKey, result)
+                    this.cache.set(`phone:${this.instanceId}:${result}`, normalizedLid)
+                } else {
+                    this.cache.set(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
                 }
-                
-                return null
-            },
-            null,
-            'getPhoneNumberFromLid'
-        )
+            }
+            return result
+        } finally {
+            this.pendingLidLookups.delete(normalizedLid)
+        }
     }
 
     /**
@@ -503,55 +636,113 @@ export class LidHandler {
         const normalizedPhone = normalizeJidForStorage(phoneNumber)
         if (this.isLidFormat(normalizedPhone)) return normalizedPhone
         
-        // Check cache first
+        const cacheKey = `phone:${this.instanceId}:${normalizedPhone}`
         if (this.config.enableCache) {
-            const cached = this.cache.get<string>(`phone:${this.instanceId}:${normalizedPhone}`)
-            if (cached) return cached
+            const cached = this.cache.get<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL>(cacheKey)
+            if (cached !== undefined) {
+                return cached === LidHandler.NEGATIVE_CACHE_SENTINEL ? null : cached
+            }
         }
-        
-        // Query database with connection check
-        return await this.withConnectionCheck(
-            async () => {
-                if (!this.contactsCollection) {
-                    return null
-                }
-                
-                const contact = await this.contactsCollection.findOne({
-                    instanceId: this.instanceId,
-                    id: normalizedPhone
-                }, { projection: { lid: 1 } })
-                
-                if (contact?.lid) {
-                    if (this.config.enableCache) {
-                        this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, contact.lid)
+
+        if (this.pendingPhoneLookups.has(normalizedPhone)) {
+            return this.pendingPhoneLookups.get(normalizedPhone)!
+        }
+
+        const lookupPromise = this.runWithLimiter(async () => {
+            const result = await this.withConnectionCheck(
+                async () => {
+                    if (!this.contactsCollection && !this.lidMappingsCollection) {
+                        return null
                     }
-                    return contact.lid
-                }
-                
-                // Fallback: read from legacy lidMappings (no writes)
-                if (this.lidMappingsCollection) {
-                    const legacy = await this.lidMappingsCollection.findOne({ instanceId: this.instanceId, phoneNumber: normalizedPhone })
-                    if (legacy?.lid) {
-                        if (this.config.enableCache) {
-                            this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, legacy.lid)
-                        }
-                        // Optional auto-fill into contacts to migrate mapping forward
-                        if (this.config.autoFillFromLegacy) {
-                            try {
-                                await this.storeLidMapping(legacy.lid, normalizedPhone)
-                            } catch (e) {
-                                console.debug('[LidHandler] Auto-fill from legacy failed:', (e as any)?.message)
+
+                    let lid: string | null = null
+                    let foundInContacts = false
+
+                    if (this.lidMappingsCollection) {
+                        try {
+                            const mapping = await this.lidMappingsCollection.findOne(
+                                { instanceId: this.instanceId, phoneNumber: normalizedPhone },
+                                { projection: { lid: 1 } }
+                            )
+                            if (mapping?.lid) {
+                                lid = normalizeJidForStorage(mapping.lid)
+                                if (lid && this.config.autoFillFromLegacy) {
+                                    try {
+                                        await this.storeLidMapping(lid, normalizedPhone)
+                                    } catch (fillError) {
+                                        console.debug('[LidHandler] Auto-fill from legacy mapping (reverse) failed:', (fillError as any)?.message)
+                                    }
+                                }
                             }
+                        } catch (err) {
+                            console.debug('[LidHandler] Failed to read lidMappings by phone:', (err as any)?.message)
                         }
-                        return legacy.lid
                     }
+
+                    if (!lid && this.contactsCollection) {
+                        try {
+                            const contact = await this.contactsCollection.findOne(
+                                { instanceId: this.instanceId, id: normalizedPhone },
+                                { projection: { lid: 1 } }
+                            )
+                            if (contact?.lid && this.isLidFormat(contact.lid)) {
+                                lid = normalizeJidForStorage(contact.lid)
+                                foundInContacts = true
+                            }
+                        } catch (err) {
+                            console.debug('[LidHandler] Failed to read contacts by phone:', (err as any)?.message)
+                        }
+                    }
+
+                    if (lid && this.lidMappingsCollection && foundInContacts) {
+                        const now = new Date()
+                        try {
+                            await this.lidMappingsCollection.updateOne(
+                                { instanceId: this.instanceId, lid },
+                                {
+                                    $set: {
+                                        phoneNumber: normalizedPhone,
+                                        updatedAt: now,
+                                        lastSeen: now
+                                    },
+                                    $setOnInsert: {
+                                        instanceId: this.instanceId,
+                                        lid,
+                                        firstSeen: now
+                                    }
+                                },
+                                { upsert: true }
+                            )
+                        } catch (err) {
+                            console.debug('[LidHandler] Failed to backfill lidMappings from contacts (reverse):', (err as any)?.message)
+                        }
+                    }
+
+                    return lid
+                },
+                null,
+                'getLidFromPhoneNumber'
+            )
+
+            return result
+        })
+
+        this.pendingPhoneLookups.set(normalizedPhone, lookupPromise)
+
+        try {
+            const result = await lookupPromise
+            if (this.config.enableCache) {
+                if (result) {
+                    this.cache.set(cacheKey, result)
+                    this.cache.set(`lid:${this.instanceId}:${result}`, normalizedPhone)
+                } else {
+                    this.cache.set(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
                 }
-                
-                return null
-            },
-            null,
-            'getLidFromPhoneNumber'
-        )
+            }
+            return result
+        } finally {
+            this.pendingPhoneLookups.delete(normalizedPhone)
+        }
     }
 
     /**
