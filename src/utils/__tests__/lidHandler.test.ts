@@ -108,7 +108,6 @@ describe('LidHandler', () => {
             expect(mapping).toBeTruthy()
             expect(mapping?.phoneNumber).toBe(phoneNumber)
             expect(mapping?.firstSeen).toBeInstanceOf(Date)
-            expect(mapping?.lastSeen).toBeInstanceOf(Date)
         })
 
         it('should not store invalid mappings', async () => {
@@ -119,33 +118,6 @@ describe('LidHandler', () => {
             expect(count).toBe(0)
         })
 
-        it('should update lastSeen on duplicate mapping', async () => {
-            const lid = '114194640801953@lid'
-            const phoneNumber = '60196953307@s.whatsapp.net'
-
-            // Store first time
-            await lidHandler.storeLidMapping(lid, phoneNumber)
-            
-            // Get original timestamp
-            const original = await db.collection('test_lidMappings').findOne({
-                instanceId: 'test-instance',
-                lid
-            })
-            const originalLastSeen = original?.lastSeen
-
-            // Wait a bit and store again
-            await new Promise(resolve => setTimeout(resolve, 10))
-            await lidHandler.storeLidMapping(lid, phoneNumber)
-
-            // Check if lastSeen was updated
-            const updated = await db.collection('test_lidMappings').findOne({
-                instanceId: 'test-instance',
-                lid
-            })
-
-            expect(updated?.lastSeen.getTime()).toBeGreaterThan(originalLastSeen.getTime())
-            expect(updated?.firstSeen.getTime()).toBe(original?.firstSeen.getTime())
-        })
     })
 
     describe('getPhoneNumberFromLid', () => {
@@ -464,37 +436,5 @@ describe('LidHandler', () => {
             expect(mappings.map(m => m.lid).sort()).toEqual(['111@lid', '222@lid', '333@lid'])
         })
     })
-
-    describe('cleanupOldMappings', () => {
-        it('should delete old mappings', async () => {
-            const lid1 = '111@lid'
-            const lid2 = '222@lid'
-            
-            // Insert old mapping (90+ days old)
-            const oldDate = new Date()
-            oldDate.setDate(oldDate.getDate() - 100)
-            
-            await db.collection('test_lidMappings').insertOne({
-                instanceId: 'test-instance',
-                lid: lid1,
-                phoneNumber: '601111@s.whatsapp.net',
-                firstSeen: oldDate,
-                lastSeen: oldDate,
-                updatedAt: oldDate
-            })
-
-            // Insert recent mapping
-            await lidHandler.storeLidMapping(lid2, '602222@s.whatsapp.net')
-
-            // Cleanup old mappings
-            const deletedCount = await lidHandler.cleanupOldMappings(90)
-            
-            expect(deletedCount).toBe(1)
-
-            // Verify only recent mapping remains
-            const remaining = await lidHandler.getAllMappings()
-            expect(remaining).toHaveLength(1)
-            expect(remaining[0].lid).toBe(lid2)
-        })
-    })
 })
+

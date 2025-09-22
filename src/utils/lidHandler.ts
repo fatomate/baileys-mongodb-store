@@ -15,10 +15,7 @@ export interface LidMapping {
     lid: string
     phoneNumber: string
     firstSeen: Date
-    lastSeen: Date
     updatedAt: Date
-    pushName?: string
-    pushNameUpdatedAt?: Date
 }
 
 export interface LidHandlerConfig {
@@ -473,23 +470,32 @@ export class LidHandler {
 
             if (this.lidMappingsCollection) {
                 try {
-                    await this.lidMappingsCollection.updateOne(
+                    const result = await this.lidMappingsCollection.updateOne(
                         { instanceId: this.instanceId, lid: normalizedLid },
                         {
-                            $set: {
-                                phoneNumber: normalizedPhone,
-                                updatedAt: now,
-                                lastSeen: now,
-                                ...(cleanedPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
-                            },
                             $setOnInsert: {
                                 instanceId: this.instanceId,
                                 lid: normalizedLid,
-                                firstSeen: now
+                                phoneNumber: normalizedPhone,
+                                firstSeen: now,
+                                updatedAt: now
                             }
                         },
                         { upsert: true }
                     )
+
+                    if (result.matchedCount > 0 && result.upsertedCount === 0 && process.env.DEBUG_LID === 'true') {
+                        const existing = await this.lidMappingsCollection.findOne(
+                            { instanceId: this.instanceId, lid: normalizedLid },
+                            { projection: { phoneNumber: 1 } }
+                        )
+                        if (existing && existing.phoneNumber !== normalizedPhone) {
+                            console.debug(
+                                `[LidHandler] Existing mapping for ${normalizedLid} uses ${existing.phoneNumber}; ` +
+                                `ignoring new phone ${normalizedPhone}`
+                            )
+                        }
+                    }
                 } catch (mappingError) {
                     console.debug('[LidHandler] Failed to upsert lidMappings entry:', (mappingError as any)?.message)
                 }
@@ -581,22 +587,32 @@ export class LidHandler {
                     if (phoneNumber && this.lidMappingsCollection && foundInContacts) {
                         const now = new Date()
                         try {
-                            await this.lidMappingsCollection.updateOne(
+                            const result = await this.lidMappingsCollection.updateOne(
                                 { instanceId: this.instanceId, lid: normalizedLid },
                                 {
-                                    $set: {
-                                        phoneNumber,
-                                        updatedAt: now,
-                                        lastSeen: now
-                                    },
                                     $setOnInsert: {
                                         instanceId: this.instanceId,
                                         lid: normalizedLid,
-                                        firstSeen: now
+                                        phoneNumber,
+                                        firstSeen: now,
+                                        updatedAt: now
                                     }
                                 },
                                 { upsert: true }
                             )
+
+                            if (result.matchedCount > 0 && result.upsertedCount === 0 && process.env.DEBUG_LID === 'true') {
+                                const existing = await this.lidMappingsCollection.findOne(
+                                    { instanceId: this.instanceId, lid: normalizedLid },
+                                    { projection: { phoneNumber: 1 } }
+                                )
+                                if (existing && existing.phoneNumber !== phoneNumber) {
+                                    console.debug(
+                                        `[LidHandler] Skipping lidMappings update for ${normalizedLid}; ` +
+                                        `existing phone ${existing.phoneNumber}, candidate ${phoneNumber}`
+                                    )
+                                }
+                            }
                         } catch (err) {
                             console.debug('[LidHandler] Failed to backfill lidMappings from contacts:', (err as any)?.message)
                         }
@@ -697,22 +713,32 @@ export class LidHandler {
                     if (lid && this.lidMappingsCollection && foundInContacts) {
                         const now = new Date()
                         try {
-                            await this.lidMappingsCollection.updateOne(
+                            const result = await this.lidMappingsCollection.updateOne(
                                 { instanceId: this.instanceId, lid },
                                 {
-                                    $set: {
-                                        phoneNumber: normalizedPhone,
-                                        updatedAt: now,
-                                        lastSeen: now
-                                    },
                                     $setOnInsert: {
                                         instanceId: this.instanceId,
                                         lid,
-                                        firstSeen: now
+                                        phoneNumber: normalizedPhone,
+                                        firstSeen: now,
+                                        updatedAt: now
                                     }
                                 },
                                 { upsert: true }
                             )
+
+                            if (result.matchedCount > 0 && result.upsertedCount === 0 && process.env.DEBUG_LID === 'true') {
+                                const existing = await this.lidMappingsCollection.findOne(
+                                    { instanceId: this.instanceId, lid },
+                                    { projection: { phoneNumber: 1 } }
+                                )
+                                if (existing && existing.phoneNumber !== normalizedPhone) {
+                                    console.debug(
+                                        `[LidHandler] Skipping lidMappings update for ${lid}; ` +
+                                        `existing phone ${existing.phoneNumber}, candidate ${normalizedPhone}`
+                                    )
+                                }
+                            }
                         } catch (err) {
                             console.debug('[LidHandler] Failed to backfill lidMappings from contacts (reverse):', (err as any)?.message)
                         }
@@ -1051,7 +1077,7 @@ export class LidHandler {
     /**
      * Get all mappings for this instance (for debugging/export)
      */
-    async getAllMappings(): Promise<LidMapping[]> {
+    async getAllMappings(): Promise<Array<LidMapping & { pushName?: string; pushNameUpdatedAt?: Date }>> {
         return await this.withConnectionCheck(
             async () => {
                 if (!this.contactsCollection) {
@@ -1068,7 +1094,6 @@ export class LidHandler {
                     lid: d.lid,
                     phoneNumber: d.id,
                     firstSeen: d.lidFirstSeen || d.updatedAt || new Date(),
-                    lastSeen: d.updatedAt || new Date(),
                     updatedAt: d.updatedAt || new Date(),
                     pushName: d.pushName,
                     pushNameUpdatedAt: d.pushNameUpdatedAt

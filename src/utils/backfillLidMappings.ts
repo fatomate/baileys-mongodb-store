@@ -106,8 +106,13 @@ export async function backfillLidMappings(db: Db, options: BackfillOptions): Pro
       updateOne: {
         filter: { instanceId, lid },
         update: {
-          $set: { phoneNumber, lastSeen: now, updatedAt: now },
-          $setOnInsert: { instanceId, lid, firstSeen: now },
+          $setOnInsert: {
+            instanceId,
+            lid,
+            phoneNumber,
+            firstSeen: now,
+            updatedAt: now,
+          },
         },
         upsert: true,
       },
@@ -117,7 +122,7 @@ export async function backfillLidMappings(db: Db, options: BackfillOptions): Pro
     if (ops.length >= batchSize) {
       try {
         const res = await lidCol.bulkWrite(ops, { ordered: false })
-        result.upsertsSucceeded += res.upsertedCount + (res.modifiedCount || 0)
+        result.upsertsSucceeded += res.upsertedCount
       } catch (e) {
         result.upsertsFailed += ops.length
       }
@@ -131,7 +136,7 @@ export async function backfillLidMappings(db: Db, options: BackfillOptions): Pro
   if (!dryRun && ops.length > 0) {
     try {
       const res = await lidCol.bulkWrite(ops, { ordered: false })
-      result.upsertsSucceeded += res.upsertedCount + (res.modifiedCount || 0)
+      result.upsertsSucceeded += res.upsertedCount
     } catch (e) {
       result.upsertsFailed += ops.length
     }
@@ -139,4 +144,3 @@ export async function backfillLidMappings(db: Db, options: BackfillOptions): Pro
 
   return result
 }
-
