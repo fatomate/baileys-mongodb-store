@@ -537,6 +537,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         retryAttempts?: number;
         maxConcurrentLookups?: number;
         negativeCacheTTL?: number;
+        lookupsEnabled?: boolean;
+        preferReverseLookupFirst?: boolean;
+        contactsQueryMaxTimeMS?: number;
+        dynamicNegativeBackoff?: boolean;
+        minNegativeCacheTTL?: number;
+        maxNegativeCacheTTL?: number;
+        proactiveHistoryResolution?: boolean;
     }
 }): Promise<EnhancedMongoDBStore> => {
     const {
@@ -565,8 +572,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         lidConfig
     } = config
 
-    // Set default values for lidConfig
-    const defaultLidConfig = { enabled: true, requestDelay: 500, retryAttempts: 3, maxConcurrentLookups: 10, negativeCacheTTL: 60 }
+    // Set default values for lidConfig (safer CPU-friendly defaults)
+    const defaultLidConfig = {
+        enabled: true,
+        requestDelay: 500,
+        retryAttempts: 3,
+        maxConcurrentLookups: 10,
+        negativeCacheTTL: 300,
+        lookupsEnabled: true,
+        preferReverseLookupFirst: true,
+        contactsQueryMaxTimeMS: 500,
+        dynamicNegativeBackoff: true,
+        minNegativeCacheTTL: 300,
+        maxNegativeCacheTTL: 3600,
+        proactiveHistoryResolution: false
+    }
     const finalLidConfig = { ...defaultLidConfig, ...lidConfig }
 
 
@@ -658,6 +678,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // LID handler will be initialized after DB connection
     let lidHandler: LidHandler | null = null
+
+    // Redis connections
+    let redisConnection: Redis | null = null
+    let lidRedisClient: Redis | null = null
 
     // MongoDB connection
     let client: MongoClient
@@ -1031,11 +1055,47 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Initialize LID handler after ensureConnection is available
     if (lidHandlerConfig) {
+        // Prepare Redis for LID cache: reuse bull Redis if present, else create a light client from config
+        let redisForCache: Redis | null = null
+        if (redisConnection) {
+            redisForCache = redisConnection
+        } else if (redis?.connection) {
+            try {
+                if (typeof redis.connection === 'string') {
+                    redisForCache = new Redis(redis.connection, {
+                        maxRetriesPerRequest: null,
+                        enableReadyCheck: true,
+                        lazyConnect: false
+                    })
+                } else {
+                    redisForCache = new Redis({
+                        ...redis.connection,
+                        maxRetriesPerRequest: null,
+                        enableReadyCheck: true,
+                        lazyConnect: false
+                    })
+                }
+                await redisForCache.ping().catch(() => {})
+                lidRedisClient = redisForCache
+            } catch (_err) {
+                redisForCache = null
+                lidRedisClient = null
+            }
+        }
         // Ensure LidHandler uses store's connection lifecycle and skip index creation by default
         lidHandler = new LidHandler(validatedInstanceId, {
             skipIndexCreation: true,
             maxConcurrentLookups: lidHandlerConfig.maxConcurrentLookups ?? finalLidConfig.maxConcurrentLookups,
             negativeCacheTTL: lidHandlerConfig.negativeCacheTTL ?? finalLidConfig.negativeCacheTTL,
+            lookupsEnabled: lidHandlerConfig.lookupsEnabled ?? finalLidConfig.lookupsEnabled,
+            preferReverseLookupFirst: lidHandlerConfig.preferReverseLookupFirst ?? finalLidConfig.preferReverseLookupFirst,
+            contactsQueryMaxTimeMS: lidHandlerConfig.contactsQueryMaxTimeMS ?? finalLidConfig.contactsQueryMaxTimeMS,
+            dynamicNegativeBackoff: lidHandlerConfig.dynamicNegativeBackoff ?? finalLidConfig.dynamicNegativeBackoff,
+            minNegativeCacheTTL: lidHandlerConfig.minNegativeCacheTTL ?? finalLidConfig.minNegativeCacheTTL,
+            maxNegativeCacheTTL: lidHandlerConfig.maxNegativeCacheTTL ?? finalLidConfig.maxNegativeCacheTTL,
+            cacheTTLSeconds: (lidHandlerConfig as any).cacheTTLSeconds ?? (finalLidConfig as any).cacheTTLSeconds ?? (3 * 24 * 60 * 60),
+            // Prefer reusing existing Redis connection; fallback to lightweight cache client
+            redisClient: (redisConnection as any) || (lidRedisClient as any) || undefined,
             ...lidHandlerConfig,
             ensureConnection: ensureConnection
         })
@@ -1148,7 +1208,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let bullInitialized = false
     const queues: Map<QueueType, Queue<any>> = new Map()
     const workers: Map<QueueType, Worker<any>> = new Map()
-    let redisConnection: Redis | null = null
     let sharedQueueManager: SharedQueueManager | null = null
     const useSharedQueues = redis?.useSharedQueues !== false // Default to true if Redis is provided
     
@@ -3312,7 +3371,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
                 { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } },
                 // NEW: Composite index for efficient $in queries with projection fields
-                { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} }
+                { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} },
+                // NEW: Covering index for lid->id lookups to avoid document fetch
+                { name: 'contacts_lid_id_cover', spec: { instanceId: 1, lid: 1, id: 1 }, options: { partialFilterExpression: { lid: { $type: 'string' } } } }
             ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
@@ -6339,7 +6400,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 log(`[${instanceId}] Successfully processed ${dataToProcess.length} accumulated history events`)
 
                                 // Proactively resolve LID jids in historical messages (only once per instance)
-                                if (hasLatest && lidHandler && !historyLidResolutionDone) {
+                                if (hasLatest && lidHandler && !historyLidResolutionDone && (finalLidConfig.proactiveHistoryResolution === true)) {
                                     try {
                                         await storeImpl.performProactiveLidResolutionForHistory()
                                         historyLidResolutionDone = true
@@ -6859,7 +6920,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
                         { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } },
                         // NEW: Composite index for efficient $in queries with projection fields
-                        { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} }
+                        { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} },
+                        // NEW: Covering index for lid->id lookups to avoid document fetch
+                        { name: 'contacts_lid_id_cover', spec: { instanceId: 1, lid: 1, id: 1 }, options: { partialFilterExpression: { lid: { $type: 'string' } } } }
                     ],
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
@@ -7231,6 +7294,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     // Disconnect Redis
                     if (redisConnection) redisConnection.disconnect()
+                    if (lidRedisClient && lidRedisClient !== redisConnection) {
+                        try { lidRedisClient.disconnect() } catch {}
+                    }
                 } catch (error) {
                     logError('Error closing Bull queues:', error)
                 }
@@ -7361,8 +7427,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             // Perform proactive LID resolution for label associations after messages are done
-            log(`[${instanceId}] Starting proactive LID resolution for label associations`)
-            const totalLabelAssociationsUpdated = await performProactiveLidResolutionForLabelAssociations(lidMappings as Array<{ lid: string | undefined; id: string }>)
+            let totalLabelAssociationsUpdated = 0
+            if (finalLidConfig.proactiveHistoryResolution === true) {
+                log(`[${instanceId}] Starting proactive LID resolution for label associations`)
+                totalLabelAssociationsUpdated = await performProactiveLidResolutionForLabelAssociations(lidMappings as Array<{ lid: string | undefined; id: string }>)
+            } else {
+                log(`[${instanceId}] Skipping proactive LID resolution for label associations (disabled)`)
+            }
 
             log(`[${instanceId}] Proactive LID resolution completed: ${totalMessagesUpdated} historical messages and ${totalLabelAssociationsUpdated} label associations updated`)
         }

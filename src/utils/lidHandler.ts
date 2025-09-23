@@ -1,4 +1,5 @@
 import { Collection, Db } from 'mongodb'
+import Redis from 'ioredis'
 import NodeCache from 'node-cache'
 import { proto } from 'baileys'
 import { 
@@ -24,6 +25,11 @@ export interface LidHandlerConfig {
     skipIndexCreation?: boolean // Skip creating indexes here (default: true; smart manager handles it)
     ensureConnection?: () => Promise<void> // Optional callback to ensure connection before operations
     /**
+     * When false, DB lookups into contacts are disabled; only legacy lidMappings and
+     * reverse lookups from messages will be attempted. Default: true
+     */
+    lookupsEnabled?: boolean
+    /**
      * When true, a successful legacy read from lidMappings triggers a best-effort
      * auto-fill into contacts to migrate the mapping forward (no pushName).
      * Default: false
@@ -38,6 +44,31 @@ export interface LidHandlerConfig {
      * TTL (in seconds) for negative cache entries (misses). Default derived from cacheTTL.
      */
     negativeCacheTTL?: number
+    /** Optional Redis client for persistent caching */
+    redisClient?: Redis
+    /** Cache TTL in seconds for positive mappings in Redis (default: 3 days) */
+    cacheTTLSeconds?: number
+    /**
+     * Prefer attempting a quick reverse lookup in messages before querying contacts.
+     * Default: true
+     */
+    preferReverseLookupFirst?: boolean
+    /**
+     * Maximum time (ms) to spend on a single DB lookup; query is aborted after this.
+     * Default: 500ms
+     */
+    contactsQueryMaxTimeMS?: number
+    /**
+     * When true, increase negative cache TTL exponentially per-lid on repeated misses.
+     * Default: true
+     */
+    dynamicNegativeBackoff?: boolean
+    /**
+     * Lower and upper bounds for negative cache TTL (when backoff enabled).
+     * Defaults: min 300s (5m), max 3600s (1h)
+     */
+    minNegativeCacheTTL?: number
+    maxNegativeCacheTTL?: number
 }
 
 export class LidHandler {
@@ -48,7 +79,7 @@ export class LidHandler {
     private db: Db | null = null
     private cache: NodeCache
     private ensureConnectionCb?: () => Promise<void>
-    private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean; autoFillFromLegacy: boolean }
+    private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean; autoFillFromLegacy: boolean; lookupsEnabled: boolean; preferReverseLookupFirst: boolean; contactsQueryMaxTimeMS: number; dynamicNegativeBackoff: boolean; minNegativeCacheTTL: number; maxNegativeCacheTTL: number; cacheTTLSeconds: number }
     private instanceId: string
     private isInitialized: boolean = false
     private pendingLidLookups: Map<string, Promise<string | null>> = new Map()
@@ -57,6 +88,8 @@ export class LidHandler {
     private maxConcurrentLookups: number
     private activeLookups = 0
     private lookupQueue: Array<() => void> = []
+    private missBackoffCounts: Map<string, number> = new Map()
+    private redis: Redis | null = null
 
     constructor(instanceId: string, config?: LidHandlerConfig) {
         this.instanceId = instanceId
@@ -64,14 +97,22 @@ export class LidHandler {
             cacheTTL: config?.cacheTTL ?? 3600,
             enableCache: config?.enableCache ?? true,
             skipIndexCreation: config?.skipIndexCreation ?? true,
-            autoFillFromLegacy: config?.autoFillFromLegacy ?? true
+            autoFillFromLegacy: config?.autoFillFromLegacy ?? true,
+            lookupsEnabled: config?.lookupsEnabled ?? true,
+            preferReverseLookupFirst: config?.preferReverseLookupFirst ?? true,
+            contactsQueryMaxTimeMS: config?.contactsQueryMaxTimeMS ?? 500,
+            dynamicNegativeBackoff: config?.dynamicNegativeBackoff ?? true,
+            minNegativeCacheTTL: config?.minNegativeCacheTTL ?? 300,
+            maxNegativeCacheTTL: config?.maxNegativeCacheTTL ?? 3600,
+            cacheTTLSeconds: config?.cacheTTLSeconds ?? (3 * 24 * 60 * 60)
         }
         this.ensureConnectionCb = config?.ensureConnection
+        this.redis = config?.redisClient ?? null
 
-        const derivedNegativeTTL = Math.max(30, Math.min(120, Math.floor((this.config.cacheTTL || 60) / 6)))
+        const derivedNegativeTTL = Math.max(60, Math.min(300, Math.floor((this.config.cacheTTL || 600) / 6)))
         this.negativeCacheTTL = config?.negativeCacheTTL ?? derivedNegativeTTL
         if (!Number.isFinite(this.negativeCacheTTL) || this.negativeCacheTTL <= 0) {
-            this.negativeCacheTTL = 60
+            this.negativeCacheTTL = 300
         }
         this.maxConcurrentLookups = config?.maxConcurrentLookups ?? 10
 
@@ -81,6 +122,54 @@ export class LidHandler {
             checkperiod: Math.floor(this.config.cacheTTL / 10),
             useClones: false
         })
+    }
+
+    private getRedisKey(type: 'lid' | 'phone', value: string): string {
+        return `${type}:${this.instanceId}:${value}`
+    }
+
+    private async cacheGet(key: string): Promise<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL | undefined> {
+        if (this.redis) {
+            try {
+                const val = await this.redis.get(key)
+                if (val === null) return undefined
+                return val
+            } catch (err) {
+                console.debug('[LidHandler] Redis get failed:', (err as any)?.message)
+            }
+        }
+        return this.cache.get<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL>(key)
+    }
+
+    private async cacheSet(key: string, value: string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL, ttlSeconds?: number): Promise<void> {
+        if (this.redis) {
+            try {
+                if (ttlSeconds && Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+                    await this.redis.set(key, value as string, 'EX', Math.floor(ttlSeconds))
+                } else {
+                    await this.redis.set(key, value as string)
+                }
+                return
+            } catch (err) {
+                console.debug('[LidHandler] Redis set failed:', (err as any)?.message)
+            }
+        }
+        const ttl = ttlSeconds && ttlSeconds > 0 ? ttlSeconds : this.config.cacheTTL
+        this.cache.set(key, value as any, ttl)
+    }
+
+    private async cacheDel(keys: string[]): Promise<void> {
+        if (this.redis) {
+            try {
+                if (keys.length > 0) {
+                    await this.redis.del(...keys)
+                }
+            } catch (err) {
+                console.debug('[LidHandler] Redis del failed:', (err as any)?.message)
+            }
+        } else {
+            keys.forEach(k => this.cache.del(k))
+        }
     }
 
     /**
@@ -514,9 +603,9 @@ export class LidHandler {
         const normalizedLid = normalizeJidForStorage(lid)
         if (!this.isLidFormat(normalizedLid)) return lid
 
-        const cacheKey = `lid:${this.instanceId}:${normalizedLid}`
+        const cacheKey = this.getRedisKey('lid', normalizedLid)
         if (this.config.enableCache) {
-            const cached = this.cache.get<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL>(cacheKey)
+            const cached = await this.cacheGet(cacheKey)
             if (cached !== undefined) {
                 return cached === LidHandler.NEGATIVE_CACHE_SENTINEL ? null : cached
             }
@@ -535,6 +624,18 @@ export class LidHandler {
 
                     let phoneNumber: string | null = null
                     let foundInContacts = false
+
+                    // 0) Quick reverse lookup from messages first (optional, fast path)
+                    if (this.config.preferReverseLookupFirst) {
+                        try {
+                            const reverse = await this.reversePhoneLookupFromMessages(normalizedLid)
+                            if (reverse) {
+                                phoneNumber = normalizeJidForStorage(reverse)
+                            }
+                        } catch (_err) {
+                            // Ignore errors during reverse lookup fallback
+                        }
+                    }
 
                     if (this.lidMappingsCollection) {
                         try {
@@ -557,29 +658,26 @@ export class LidHandler {
                         }
                     }
 
-                    if (!phoneNumber && this.contactsCollection) {
+                    if (!phoneNumber && this.contactsCollection && this.config.lookupsEnabled) {
                         const query = { instanceId: this.instanceId, lid: normalizedLid }
                         try {
                             const contact = await this.contactsCollection.findOne(
                                 query,
                                 {
                                     projection: { id: 1 },
-                                    hint: { instanceId: 1, lid: 1 }
-                                }
+                                    maxTimeMS: this.config.contactsQueryMaxTimeMS
+                                } as any
                             )
                             if (contact?.id) {
                                 phoneNumber = normalizeJidForStorage(contact.id)
                                 foundInContacts = true
                             }
-                        } catch (hintError: any) {
-                            if (hintError?.codeName === 'IndexNotFound' || /bad hint/i.test(hintError?.message || '')) {
-                                const contact = await this.contactsCollection.findOne(query, { projection: { id: 1 } })
-                                if (contact?.id) {
-                                    phoneNumber = normalizeJidForStorage(contact.id)
-                                    foundInContacts = true
-                                }
+                        } catch (err: any) {
+                            // On timeout or transient errors, skip and fall back to null
+                            if (err?.code === 50 || /exceeded time limit|operation exceeded time limit/i.test(err?.message || '')) {
+                                console.debug('[LidHandler] Contacts lookup timed out, skipping')
                             } else {
-                                throw hintError
+                                console.debug('[LidHandler] Contacts lookup failed:', err?.message)
                             }
                         }
                     }
@@ -633,10 +731,21 @@ export class LidHandler {
             const result = await lookupPromise
             if (this.config.enableCache) {
                 if (result) {
-                    this.cache.set(cacheKey, result)
-                    this.cache.set(`phone:${this.instanceId}:${result}`, normalizedLid)
+                    await this.cacheSet(cacheKey, result, this.config.cacheTTLSeconds)
+                    await this.cacheSet(this.getRedisKey('phone', result), normalizedLid, this.config.cacheTTLSeconds)
+                    // reset backoff on success
+                    this.missBackoffCounts.delete(normalizedLid)
                 } else {
-                    this.cache.set(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
+                    // Compute dynamic backoff TTL for this lid
+                    let ttl = this.negativeCacheTTL
+                    if (this.config.dynamicNegativeBackoff) {
+                        const misses = (this.missBackoffCounts.get(normalizedLid) || 0) + 1
+                        this.missBackoffCounts.set(normalizedLid, misses)
+                        const base = Math.max(this.config.minNegativeCacheTTL, this.negativeCacheTTL)
+                        const candidate = base * Math.pow(2, Math.max(0, misses - 1))
+                        ttl = Math.min(this.config.maxNegativeCacheTTL, candidate)
+                    }
+                    await this.cacheSet(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, ttl)
                 }
             }
             return result
@@ -652,9 +761,9 @@ export class LidHandler {
         const normalizedPhone = normalizeJidForStorage(phoneNumber)
         if (this.isLidFormat(normalizedPhone)) return normalizedPhone
         
-        const cacheKey = `phone:${this.instanceId}:${normalizedPhone}`
+        const cacheKey = this.getRedisKey('phone', normalizedPhone)
         if (this.config.enableCache) {
-            const cached = this.cache.get<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL>(cacheKey)
+            const cached = await this.cacheGet(cacheKey)
             if (cached !== undefined) {
                 return cached === LidHandler.NEGATIVE_CACHE_SENTINEL ? null : cached
             }
@@ -699,7 +808,7 @@ export class LidHandler {
                         try {
                             const contact = await this.contactsCollection.findOne(
                                 { instanceId: this.instanceId, id: normalizedPhone },
-                                { projection: { lid: 1 } }
+                                { projection: { lid: 1 }, maxTimeMS: this.config.contactsQueryMaxTimeMS } as any
                             )
                             if (contact?.lid && this.isLidFormat(contact.lid)) {
                                 lid = normalizeJidForStorage(contact.lid)
@@ -759,10 +868,10 @@ export class LidHandler {
             const result = await lookupPromise
             if (this.config.enableCache) {
                 if (result) {
-                    this.cache.set(cacheKey, result)
-                    this.cache.set(`lid:${this.instanceId}:${result}`, normalizedPhone)
+                    await this.cacheSet(cacheKey, result, this.config.cacheTTLSeconds)
+                    await this.cacheSet(this.getRedisKey('lid', result), normalizedPhone, this.config.cacheTTLSeconds)
                 } else {
-                    this.cache.set(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
+                    await this.cacheSet(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
                 }
             }
             return result
@@ -836,7 +945,7 @@ export class LidHandler {
                         { 'key.senderLid': normalizedLid },
                         { 'key.senderLid': lid } // Try original format too
                     ]
-                })
+                }, { maxTimeMS: this.config.contactsQueryMaxTimeMS } as any)
                 
                 if (receivedMessage) {
                     // Extract phone number from senderPn or remoteJid
@@ -920,8 +1029,9 @@ export class LidHandler {
                         }
                     ]
                 }, {
-                    projection: { 'key.senderPn': 1 } // Only fetch the field we need
-                })
+                    projection: { 'key.senderPn': 1 }, // Only fetch the field we need
+                    maxTimeMS: this.config.contactsQueryMaxTimeMS
+                } as any)
                 
                 if (message?.key?.senderPn && !this.isLidFormat(message.key.senderPn)) {
                     console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${message.key.senderPn}`)
@@ -1064,7 +1174,32 @@ export class LidHandler {
      * Clear cache for this instance
      */
     clearCache(): void {
-        if (this.config.enableCache) {
+        if (!this.config.enableCache) return
+        if (this.redis) {
+            const patterns = [
+                `lid:${this.instanceId}:*`,
+                `phone:${this.instanceId}:*`
+            ]
+            const run = async () => {
+                for (const pattern of patterns) {
+                    let cursor = '0'
+                    do {
+                        try {
+                            const res = await this.redis!.scan(cursor, 'MATCH', pattern, 'COUNT', 100)
+                            cursor = res[0]
+                            const keys = res[1]
+                            if (keys && keys.length) {
+                                await this.cacheDel(keys)
+                            }
+                        } catch (err) {
+                            console.debug('[LidHandler] Redis scan failed:', (err as any)?.message)
+                            break
+                        }
+                    } while (cursor !== '0')
+                }
+            }
+            run().catch(() => {})
+        } else {
             const keys = this.cache.keys()
             keys.forEach(key => {
                 if (key.includes(`:${this.instanceId}:`)) {

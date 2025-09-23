@@ -50,6 +50,19 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - Schema on contacts: `lid`, `lidFirstSeen`, `updatedAt`, optional `pushName`, `pushNameUpdatedAt`.
 - Removed: `lidLastSeen`, `lidMappingUpdatedAt`.
 
+### Performance controls (v2.1)
+
+- New LidHandler options (via `lidConfig` in `makeEnhancedMongoDBStore`):
+  - `lookupsEnabled` (default: true): disable to avoid any contacts lookups, relying only on cached or legacy data.
+  - `preferReverseLookupFirst` (default: true): try messages-based discovery before contacts query.
+  - `contactsQueryMaxTimeMS` (default: 500): per-lookup MongoDB time limit.
+  - `negativeCacheTTL` (default: 300s): base TTL for misses.
+  - `dynamicNegativeBackoff` (default: true), with `minNegativeCacheTTL` (300s) and `maxNegativeCacheTTL` (3600s): exponential backoff for repeated misses to reduce repeated scans.
+  - `proactiveHistoryResolution` (default: false): runs one-off migration that rewrites historical messages from LID to phone; leave off to minimize load.
+
+Indexes:
+- Added `contacts_lid_id_cover` covering index `{ instanceId: 1, lid: 1, id: 1 }` (partial) so lid→id lookups are index-only.
+
 ## Installation
 
 Add to your `package.json`:
