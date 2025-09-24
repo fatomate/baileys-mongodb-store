@@ -529,7 +529,6 @@ const decryptPollVote = async (
         return null
     }
 }
-
 export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfig & {
     lidConfig?: {
         enabled: boolean;
@@ -1311,7 +1310,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return false
         }
     }
-    
     // Register processors for shared queue manager
     const registerSharedQueueProcessors = async () => {
         if (!sharedQueueManager) return
@@ -1952,7 +1950,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         log(`✅ Registered all shared queue processors for instance ${instanceId}`)
     }
-    
     // Initialize Bull queues if Redis config provided
     const initializeBullQueues = async () => {
         if (!redis) return
@@ -2733,7 +2730,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 return { success: true }
             })
-            
             createQueueAndWorker<GroupMetadataJob>(QueueType.GROUP_METADATA, async (job) => {
                 const { type, jid, metadata, update } = job.data
                 
@@ -3348,7 +3344,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 break
         }
     }
-    
     // Smart index creation with collection existence checking and custom TTL
     const createIndexes = async () => {
         // Migration: Drop obsolete TTL indexes from collections that should persist indefinitely
@@ -3670,7 +3665,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         return totalLabelAssociationsUpdated
     }
-
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
         instanceId,
@@ -5530,7 +5524,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`[Direct] ✅ Label association deleted - type: ${association.type}`)
             }
         },
-
         // bind method continues with event handling...
         bind(ev: BaileysEventEmitter): void {
             // Check if already bound to prevent duplicate bindings
@@ -5859,22 +5852,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     }, '🔍 DEBUG: Media download detection')
                                 }
                                 
+                                // Prefer background queue when available
+                                const mediaInfo = extractMediaInfo(msg)
+                                if (mediaInfo && sharedQueueManager && useSharedQueues) {
+                                    try {
+                                        await sharedQueueManager.addJob(
+                                            JobType.MEDIA_DOWNLOAD,
+                                            { message: msg, mediaInfo, jid },
+                                            validatedInstanceId,
+                                            5
+                                        )
+                                        log(`📥 Media download queued for message ${msg.key?.id}`)
+                                        // Do not also attempt inline; queue will update DB when done
+                                    } catch (e) {
+                                        logError(`❌ Failed to queue media download, falling back inline:`, e)
+                                    }
+                                }
+
+                                // Fallback inline behavior
                                 let mediaResult
                                 if (isOfficialAPI) {
                                     config.logger?.info({ 
                                         messageId: msg.key?.id,
                                         jid
-                                    }, '📥 Attempting Official API media download')
-                                    // Use Official API download method
+                                    }, '📥 Attempting Official API media download (inline)')
                                     mediaResult = await downloadOfficialAPIMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
                                 } else {
-                                    // Use regular Baileys download method
                                     mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
                                 }
-                                
+
                                 if (mediaResult.success && mediaResult.localPath) {
-                                    // Update message with media URL
-                                    const updateResult = await withConnection(async () =>
+                                    await withConnection(async () =>
                                         collections.messages.updateOne(
                                             { 
                                                 instanceId, 
@@ -5894,19 +5902,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             }
                                         )
                                     )
-                                    
                                     if (mediaResult.reused) {
-                                        log(`♻️  Media reused for message ${msg.key.id}: ${mediaResult.localPath} (saved storage space)`)
+                                        log(`♻️  Media reused for message ${msg.key.id}: ${mediaResult.localPath}`)
                                     } else {
-                                        log(`✅ Media downloaded for message ${msg.key.id}: ${mediaResult.localPath}`)
-                                    }
-                                    log(`📝 MongoDB update result: matched=${updateResult.matchedCount}, modified=${updateResult.modifiedCount}`)
-                                    
-                                    if (updateResult.matchedCount === 0) {
-                                        log(`⚠️ No document found to update for message ${msg.key.id} in chat ${jid}`)
+                                        log(`✅ Media downloaded inline for message ${msg.key.id}: ${mediaResult.localPath}`)
                                     }
                                 } else if (!mediaResult.success && mediaResult.error) {
-                                    log(`⚠️ Media download failed for message ${msg.key.id}: ${mediaResult.error}`)
+                                    log(`⚠️ Media download failed inline for message ${msg.key.id}: ${mediaResult.error}`)
                                 }
                             }
                             
@@ -6292,7 +6294,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
             })
-
             // Messaging history sync with debouncing
             ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
                 if (enableMetrics) updateEventMetrics('messaging-history.set', 'received')
@@ -6560,6 +6561,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`[${instanceId}] Re-initializing profile picture retrieval with new socket`)
                 // Profile picture functionality will use the updated socket
             }
+
+            // Pass reuploadRequest into media config if available for more reliable downloads
+            try {
+                // Best-effort detection of Baileys reupload function
+                const reupload = (socket as any)?.waUploadToServer || (socket as any)?.reuploadRequest || (socket as any)?.reuploadMedia
+                if (reupload && config.media) {
+                    (config.media as any).reuploadRequest = reupload
+                    log(`[${instanceId}] Enabled reuploadRequest for media downloads`)
+                }
+            } catch {}
 
         },
 
@@ -7084,14 +7095,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             try {
-                // Fetch the message from database
-                const message = await withConnection(async () =>
+                // Fetch the message from database (fallback to id-only match if needed)
+                let message = await withConnection(async () =>
                     collections.messages.findOne({
                         instanceId,
                         jid,
                         'key.id': messageId
                     })
                 )
+                if (!message) {
+                    message = await withConnection(async () =>
+                        collections.messages.findOne({
+                            instanceId,
+                            'key.id': messageId
+                        })
+                    )
+                }
                 
                 if (!message) {
                     return { success: false, error: 'Message not found' }

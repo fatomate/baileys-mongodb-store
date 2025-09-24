@@ -48,6 +48,12 @@ export interface MediaConfig {
     downloadTimeout?: number
     
     /**
+     * Optional reupload request hook from Baileys socket to refresh media URLs
+     */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    reuploadRequest?: any
+    
+    /**
      * Official WhatsApp API configuration
      */
     officialAPI?: {
@@ -86,6 +92,10 @@ export interface MediaInfo {
     filename?: string
     caption?: string
 }
+
+// In-process in-flight download map to prevent duplicate concurrent downloads
+// Keyed by absolute target file path
+const inFlightDownloads = new Map<string, Promise<void>>()
 
 /**
  * Extract media information from a WhatsApp message
@@ -367,39 +377,47 @@ async function downloadWithRetry(
     config: MediaConfig,
     logger?: Logger
 ): Promise<void> {
-    const maxRetries = config.maxRetries || 3
-    const retryDelay = config.retryDelay || 1000
-    
+    const maxRetries = Math.max(1, config.maxRetries || 3)
+    const baseDelay = Math.max(200, config.retryDelay || 1000)
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const stream = await downloadContentFromMessage(mediaMessage, mediaType)
+            // optional options supported by Baileys; cast to any for options
+            const stream: NodeJS.ReadableStream = await (downloadContentFromMessage as any)(
+                mediaMessage,
+                mediaType,
+                config.reuploadRequest ? { reuploadRequest: config.reuploadRequest } : undefined
+            )
             const writeStream = createWriteStream(outputPath)
-            
-            // Set timeout if configured
+
+            let timeout: NodeJS.Timeout | undefined
             if (config.downloadTimeout) {
-                const timeout = setTimeout(() => {
-                    writeStream.destroy(new Error('Download timeout'))
+                timeout = setTimeout(() => {
+                    try { (stream as any)?.destroy?.(new Error('Download timeout')) } catch (e) { /* swallow */ }
+                    try { writeStream.destroy(new Error('Download timeout')) } catch (e) { /* swallow */ }
                 }, config.downloadTimeout)
-                
-                writeStream.on('finish', () => clearTimeout(timeout))
-                writeStream.on('error', () => clearTimeout(timeout))
+                writeStream.on('finish', () => { if (timeout) clearTimeout(timeout) })
+                writeStream.on('error', () => { if (timeout) clearTimeout(timeout) })
             }
-            
-            await pipeline(stream, writeStream)
+
+            await pipeline(stream as any, writeStream)
             return
         } catch (error) {
             if (attempt === maxRetries) {
                 throw error
             }
-            
+
+            const expo = Math.min(baseDelay * Math.pow(2, attempt - 1), 30000)
+            const jitter = Math.floor(Math.random() * 500)
             logger?.warn({
                 error: error instanceof Error ? error.message : 'Unknown error',
                 attempt,
                 maxRetries,
-                mediaType
+                mediaType,
+                delayMs: expo + jitter
             }, 'Media download failed, retrying...')
-            
-            await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
+
+            await new Promise(resolve => setTimeout(resolve, expo + jitter))
         }
     }
 }
@@ -409,8 +427,25 @@ async function downloadWithRetry(
  */
 function getMediaHash(mediaInfo: MediaInfo): string | undefined {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const message = mediaInfo.message as any
-    return message.fileSha256 ? Buffer.from(message.fileSha256).toString('base64') : undefined
+    const msg: any = mediaInfo.message
+    const val = msg?.fileSha256
+    if (!val) return undefined
+    try {
+        if (typeof val === 'string') {
+            // Normalize base64 string
+            return Buffer.from(val, 'base64').toString('base64')
+        }
+        if (val?.type === 'Buffer' && Array.isArray(val?.data)) {
+            return Buffer.from(val.data).toString('base64')
+        }
+        if (val instanceof Uint8Array) {
+            return Buffer.from(val).toString('base64')
+        }
+        // Fallback: try direct Buffer conversion
+        return Buffer.from(val as Buffer).toString('base64')
+    } catch (e) {
+        return undefined
+    }
 }
 
 /**
@@ -485,32 +520,69 @@ export async function downloadMedia(
         const instanceDir = join(config.baseDir, instanceId)
         const typeDir = join(instanceDir, mediaInfo.type)
         await ensureDir(typeDir)
-        
-        // Generate filename
+
+        // Generate deterministic filename using media hash when available
         const extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
-        const fileName = generateFileName(
-            message.key.id || 'unknown',
-            mediaInfo.type,
-            extension,
-            mediaInfo.filename
-        )
+        const fileName = mediaHash
+            ? `${mediaHash}${extension}`
+            : generateFileName(
+                message.key.id || 'unknown',
+                mediaInfo.type,
+                extension,
+                mediaInfo.filename
+            )
         const filePath = join(typeDir, fileName)
-        
-        // Download media
-        await downloadWithRetry(
-            mediaInfo.message,
-            mediaInfo.type,
-            filePath,
-            config,
-            logger
-        )
-        
-        // Get file stats
+
+        // If file already exists, reuse immediately
+        try {
+            const stat = await fs.stat(filePath)
+            if (stat.isFile()) {
+                return {
+                    success: true,
+                    localPath: join(instanceId, mediaInfo.type, fileName),
+                    mediaType: mediaInfo.type,
+                    fileName,
+                    fileSize: stat.size,
+                    mediaHash,
+                    reused: true
+                }
+            }
+        } catch (e) { /* file does not exist yet */ }
+
+        // Avoid duplicate concurrent downloads to the same file
+        const tmpPath = `${filePath}.tmp`
+        const perform = async () => {
+            await downloadWithRetry(
+                mediaInfo.message,
+                mediaInfo.type,
+                tmpPath,
+                config,
+                logger
+            )
+
+            // Integrity check where possible
+            const tmpStat = await fs.stat(tmpPath)
+            const declaredLen = (mediaInfo.message as any)?.fileLength ? Number((mediaInfo.message as any).fileLength) : undefined
+            if (declaredLen && tmpStat.size > 0 && Math.abs(tmpStat.size - declaredLen) > 0) {
+                // Sizes differ; treat as failure to trigger retry
+                await fs.unlink(tmpPath).catch(() => {})
+                throw new Error(`Downloaded size ${tmpStat.size} mismatch with declared ${declaredLen}`)
+            }
+
+            // Atomic move into place
+            await fs.rename(tmpPath, filePath)
+        }
+
+        let inflight = inFlightDownloads.get(filePath)
+        if (!inflight) {
+            inflight = perform()
+            inFlightDownloads.set(filePath, inflight)
+        }
+        await inflight.finally(() => inFlightDownloads.delete(filePath))
+
         const stats = await fs.stat(filePath)
-        
-        // Return relative path from base directory
         const relativePath = join(instanceId, mediaInfo.type, fileName)
-        
+
         return {
             success: true,
             localPath: relativePath,
@@ -723,20 +795,39 @@ export async function downloadOfficialAPIMedia(
         const instanceDir = join(config.baseDir, instanceId)
         const typeDir = join(instanceDir, mediaInfo.type)
         await ensureDir(typeDir)
-        
-        // Generate filename
-        const timestamp = Date.now()
+
+        // Generate deterministic filename using mediaId when available
         const extension = getExtension(mediaInfo.mimetype || 'application/octet-stream', mediaInfo.type)
-        const fileName = mediaInfo.filename || `${timestamp}.${extension}`
+        const fileName = mediaInfo.filename || `${mediaId}${extension}`
         const filePath = join(typeDir, fileName)
-        
+
+        // If file already exists, reuse immediately
+        try {
+            const stat = await fs.stat(filePath)
+            if (stat.isFile()) {
+                return {
+                    success: true,
+                    localPath: join(instanceId, mediaInfo.type, fileName),
+                    mediaType: mediaInfo.type,
+                    fileName,
+                    fileSize: stat.size,
+                    mediaHash: mediaId,
+                    reused: true
+                }
+            }
+        } catch (e) { /* file does not exist yet */ }
+
+        const tmpPath = `${filePath}.tmp`
+
         // Download the media with retry logic
         const maxRetries = config.maxRetries || 3
         const retryDelay = config.retryDelay || 1000
         
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                await downloadFromOfficialAPI(mediaId, accountData, filePath, logger)
+                await downloadFromOfficialAPI(mediaId, accountData, tmpPath, logger)
+                // Atomic move into place
+                await fs.rename(tmpPath, filePath)
                 break
             } catch (error) {
                 if (attempt === maxRetries) {
@@ -750,7 +841,9 @@ export async function downloadOfficialAPIMedia(
                     mediaId
                 }, 'Official API media download failed, retrying...')
                 
-                await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
+                const expo = Math.min(retryDelay * Math.pow(2, attempt - 1), 30000)
+                const jitter = Math.floor(Math.random() * 500)
+                await new Promise(resolve => setTimeout(resolve, expo + jitter))
             }
         }
         

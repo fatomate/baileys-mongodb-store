@@ -360,10 +360,10 @@ await store.upsertLabelAssociation({
 })
 ```
 
-### Media Handling (New!)
+### Media Handling (Improved)
 
 ```typescript
-// Configure automatic media download
+// Configure automatic media download (now queued with concurrency and dedup)
 const store = await makeEnhancedMongoDBStore({
     uri: 'mongodb://localhost:27017',
     database: 'whatsapp_bot',
@@ -372,12 +372,16 @@ const store = await makeEnhancedMongoDBStore({
         enabled: true,
         baseDir: '/var/whatsapp/media',
         maxSizeInMB: 50,
-        allowedTypes: ['image', 'video', 'document']
+        allowedTypes: ['image', 'video', 'document'],
+        // optional advanced controls
+        retryDelay: 1000,          // base delay for retries (exp backoff with jitter)
+        maxRetries: 3,             // number of retry attempts
+        downloadTimeout: 60000     // per-attempt timeout (ms)
     }
 })
 
-// Media is automatically downloaded on message receive
-// Access downloaded media URL
+// Media is automatically queued on message receive.
+// Access downloaded media URL (use a slight delay or subscribe to your own event updates)
 const result = await store.downloadMessageMedia('user@s.whatsapp.net', 'MSG_ID')
 if (result.success) {
     console.log('Media path:', result.localPath)
@@ -392,6 +396,12 @@ console.log('Total size:', stats.totalSize)
 const cleanup = await store.cleanupOldMedia(30)
 console.log('Deleted:', cleanup.deleted)
 ```
+
+Notes:
+- Normal media downloads are queued in the background (when Redis shared queues are enabled). The store prevents duplicate concurrent downloads using hash-based file naming and in-flight guards.
+- Filenames for media are deterministic based on the file's SHA-256 (when available), enabling reuse across messages with the same content.
+- The store detects and uses Baileys reupload support (when the socket is provided via `setSock(sock)`) to refresh expired media URLs automatically.
+- For apps that need the media path right away, wait briefly (1–3s) after message receipt before calling `downloadMessageMedia`, or rely on an event your app emits when `mediaUrl` is set.
 
 ## MongoDB Collections
 
