@@ -1,7 +1,7 @@
 import { downloadContentFromMessage } from 'baileys'
 import type { proto } from 'baileys'
 import { createWriteStream, promises as fs } from 'fs'
-import { join } from 'path'
+import { join, dirname } from 'path'
 import { pipeline } from 'stream/promises'
 import type { Logger } from 'pino'
 import axios from 'axios'
@@ -96,6 +96,25 @@ export interface MediaInfo {
 // In-process in-flight download map to prevent duplicate concurrent downloads
 // Keyed by absolute target file path
 const inFlightDownloads = new Map<string, Promise<void>>()
+
+/**
+ * Convert a standard base64 string to a filesystem-safe base64url variant
+ * Replaces '+' -> '-', '/' -> '_' and strips trailing '=' padding
+ */
+function toBase64Url(input: string): string {
+    return input.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+/**
+ * Sanitize a filename to prevent path traversal and invalid characters
+ * Keeps alphanumerics, dot, dash, underscore; replaces others with '_'
+ */
+function sanitizeFilename(name: string): string {
+    // Remove path separators and NULs
+    const withoutSeparators = name.replace(/[\/\\]/g, '_').replace(/\0/g, '')
+    // Collapse any remaining disallowed characters
+    return withoutSeparators.replace(/[^a-zA-Z0-9._-]/g, '_')
+}
 
 /**
  * Extract media information from a WhatsApp message
@@ -388,6 +407,8 @@ async function downloadWithRetry(
                 mediaType,
                 config.reuploadRequest ? { reuploadRequest: config.reuploadRequest } : undefined
             )
+            // Ensure destination directory exists (especially important for temp paths)
+            await ensureDir(dirname(outputPath))
             const writeStream = createWriteStream(outputPath)
 
             let timeout: NodeJS.Timeout | undefined
@@ -523,14 +544,15 @@ export async function downloadMedia(
 
         // Generate deterministic filename using media hash when available
         const extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
-        const fileName = mediaHash
-            ? `${mediaHash}${extension}`
+        let fileName = mediaHash
+            ? `${toBase64Url(mediaHash)}${extension}`
             : generateFileName(
                 message.key.id || 'unknown',
                 mediaInfo.type,
                 extension,
                 mediaInfo.filename
             )
+        fileName = sanitizeFilename(fileName)
         const filePath = join(typeDir, fileName)
 
         // If file already exists, reuse immediately
@@ -798,7 +820,8 @@ export async function downloadOfficialAPIMedia(
 
         // Generate deterministic filename using mediaId when available
         const extension = getExtension(mediaInfo.mimetype || 'application/octet-stream', mediaInfo.type)
-        const fileName = mediaInfo.filename || `${mediaId}${extension}`
+        let fileName = mediaInfo.filename || `${mediaId}${extension}`
+        fileName = sanitizeFilename(fileName)
         const filePath = join(typeDir, fileName)
 
         // If file already exists, reuse immediately
