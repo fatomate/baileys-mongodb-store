@@ -1781,7 +1781,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         validatedInstanceId,
                         config.media,
                         config.logger,
-                        checkExistingMedia
+                        checkExistingMedia,
+                        {
+                            attempt: (job.data.requeueCount ?? 0) + 1
+                        }
                     )
                 } else {
                     mediaResult = await downloadMedia(

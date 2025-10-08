@@ -38,6 +38,8 @@ export interface SharedJobData {
     data: any
     priority?: number // 0-10, higher = more urgent
     timestamp: number
+    requeueCount?: number
+    lastError?: string
 }
 
 // Queue configuration
@@ -62,7 +64,21 @@ export interface SharedQueueManagerConfig {
         lowPriority?: number
     }
     enableMetrics?: boolean
-    logLevel?: 'none' | 'error' | 'warn' | 'info' | 'debug'
+    logLevel?: 'none' | 'error' | 'warn' | 'info' | 'debug' | 'all'
+    missingProcessorHandling?: {
+        /**
+         * Maximum number of times to re-attempt a job when no processor is registered
+         */
+        maxAttempts?: number
+        /**
+         * Base delay (in ms) applied before retrying a job without a processor
+         */
+        initialDelayMs?: number
+        /**
+         * Upper bound (in ms) for the backoff delay applied to re-queued jobs
+         */
+        maxDelayMs?: number
+    }
 }
 
 // Metrics tracking
@@ -310,8 +326,9 @@ export class SharedQueueManager extends EventEmitter {
         // Get processor for this specific instance and job type
         const processors = this.instanceProcessors.get(type)
         if (!processors || !processors.has(instanceId)) {
-            this.log('warn', `⚠️ No processor registered for instance ${instanceId} and job type ${type}`)
-            return { success: false, error: `No processor for instance ${instanceId}` }
+            const errorMessage = `No processor registered for instance ${instanceId} and job type ${type}`
+            await this.handleMissingProcessor(job, _queueName, errorMessage)
+            throw new Error(errorMessage)
         }
         
         const processor = processors.get(instanceId)!
@@ -405,7 +422,8 @@ export class SharedQueueManager extends EventEmitter {
             type,
             data,
             priority,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            requeueCount: 0
         }
         
         // Add job with priority
@@ -529,6 +547,8 @@ export class SharedQueueManager extends EventEmitter {
         const { logLevel } = this.config
         
         if (logLevel === 'none') return
+
+        const normalizedLogLevel = logLevel === 'all' ? 'debug' : logLevel
         
         const levelPriority: Record<string, number> = {
             debug: 0,
@@ -537,7 +557,7 @@ export class SharedQueueManager extends EventEmitter {
             error: 3
         }
         
-        const configuredPriority = levelPriority[logLevel || 'none'] ?? 4
+        const configuredPriority = levelPriority[normalizedLogLevel || 'none'] ?? 4
         const messagePriority = levelPriority[level] ?? 0
         
         if (messagePriority >= configuredPriority) {
@@ -548,6 +568,73 @@ export class SharedQueueManager extends EventEmitter {
                 console.log(...args)
             }
         }
+    }
+
+    private getMissingProcessorConfig(): {
+        maxAttempts: number
+        initialDelayMs: number
+        maxDelayMs: number
+    } {
+        const defaults = {
+            maxAttempts: Number.POSITIVE_INFINITY,
+            initialDelayMs: 2000,
+            maxDelayMs: 15000
+        }
+        const overrides = this.config.missingProcessorHandling || {}
+        return {
+            maxAttempts: (overrides.maxAttempts && overrides.maxAttempts > 0)
+                ? overrides.maxAttempts
+                : defaults.maxAttempts,
+            initialDelayMs: overrides.initialDelayMs ?? defaults.initialDelayMs,
+            maxDelayMs: overrides.maxDelayMs ?? defaults.maxDelayMs
+        }
+    }
+
+    private async handleMissingProcessor(
+        job: Job<SharedJobData>,
+        queueName: SharedQueueName,
+        reason: string
+    ): Promise<void> {
+        const { maxAttempts, initialDelayMs, maxDelayMs } = this.getMissingProcessorConfig()
+        const currentAttempt = job.data.requeueCount ?? 0
+        const nextAttempt = currentAttempt + 1
+        
+        if (Number.isFinite(maxAttempts) && nextAttempt > maxAttempts) {
+            this.log('error', `❌ ${reason}. Reached max attempts (${maxAttempts}), leaving job failed.`)
+            return
+        }
+
+        const queue = this.queues.get(queueName)
+        if (!queue) {
+            this.log('error', `❌ Attempted to requeue job ${job.id} on missing queue ${queueName}`)
+            return
+        }
+
+        const delay = Math.min(initialDelayMs * Math.pow(2, currentAttempt), maxDelayMs)
+        const priority = job.data.priority ?? 5
+        const nextJobId = `${job.data.type}_${job.data.instanceId}_${Date.now()}`
+        const attemptLabel = Number.isFinite(maxAttempts)
+            ? `${nextAttempt}/${maxAttempts}`
+            : `${nextAttempt}`
+
+        this.log(
+            'warn',
+            `⚠️ ${reason}. Re-queuing (attempt ${attemptLabel}) with ${delay}ms delay.`
+        )
+
+        await queue.add(
+            nextJobId,
+            {
+                ...job.data,
+                requeueCount: nextAttempt,
+                lastError: reason,
+                timestamp: job.data.timestamp ?? Date.now()
+            },
+            {
+                priority: 10 - priority,
+                delay
+            }
+        )
     }
     
     /**

@@ -717,7 +717,11 @@ export async function downloadOfficialAPIMedia(
     instanceId: string,
     config: MediaConfig,
     logger?: Logger,
-    checkExisting?: (hash: string) => Promise<string | null>
+    checkExisting?: (hash: string) => Promise<string | null>,
+    options?: {
+        accountData?: OfficialAPIAccountData | null
+        attempt?: number
+    }
 ): Promise<MediaDownloadResult> {
     try {
         // Check if media download is enabled
@@ -765,7 +769,8 @@ export async function downloadOfficialAPIMedia(
             mediaType: mediaInfo.type,
             extractedMediaId: mediaId,
             mediaMessageKeys: Object.keys(mediaMessage),
-            mediaMessageStructure: JSON.stringify(mediaMessage, null, 2).substring(0, 500)
+            mediaMessageStructure: JSON.stringify(mediaMessage, null, 2).substring(0, 500),
+            attempt: options?.attempt ?? 1
         }, '🔍 DEBUG: Official API media ID extraction')
         
         if (!mediaId) {
@@ -801,7 +806,7 @@ export async function downloadOfficialAPIMedia(
         }
         
         // Get account data for this instance
-        const accountData = await config.officialAPI.getAccountData(instanceId)
+        const accountData = options?.accountData ?? await config.officialAPI.getAccountData(instanceId)
         if (!accountData || accountData.loginType !== 1 || accountData.status !== 1) {
             return { success: false, error: 'Invalid account for Official API' }
         }
@@ -850,9 +855,22 @@ export async function downloadOfficialAPIMedia(
             try {
                 await downloadFromOfficialAPI(mediaId, accountData, tmpPath, logger)
                 // Atomic move into place
-                await fs.rename(tmpPath, filePath)
+                try {
+                    await fs.rename(tmpPath, filePath)
+                } catch (renameError) {
+                    const err = renameError as NodeJS.ErrnoException
+                    if (err.code === 'EEXIST') {
+                        // Another worker already placed the file - clean up temp and reuse existing file
+                        await fs.unlink(tmpPath).catch(() => undefined)
+                    } else {
+                        throw err
+                    }
+                }
                 break
             } catch (error) {
+                // Ensure temporary file is cleaned between retries
+                await fs.unlink(tmpPath).catch(() => undefined)
+
                 if (attempt === maxRetries) {
                     throw error
                 }
