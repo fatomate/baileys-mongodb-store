@@ -148,7 +148,7 @@ function toBase64Url(input: string): string {
  */
 function sanitizeFilename(name: string): string {
     // Remove path separators and NULs
-    const withoutSeparators = name.replace(/[\/\\]/g, '_').replace(/\0/g, '')
+    const withoutSeparators = name.replace(/[/\\]/g, '_').replace(/\0/g, '')
     // Collapse any remaining disallowed characters
     return withoutSeparators.replace(/[^a-zA-Z0-9._-]/g, '_')
 }
@@ -763,7 +763,7 @@ async function downloadFromOfficialAPI(
                     throw new Error('No media URL returned from WhatsApp API')
                 }
                 directUrl = jsonResponse.url
-                officialApiUrlCache.set(mediaId, { url: directUrl, expiresAt: now + cacheTtl })
+                if (directUrl) officialApiUrlCache.set(mediaId, { url: directUrl, expiresAt: now + cacheTtl })
             } else {
                 // This is the direct media response (wabot_pro proxy behavior)
                 const writeStream = createWriteStream(filePath)
@@ -902,7 +902,7 @@ export async function downloadOfficialAPIMedia(
         }
         
         // Get account data for this instance
-        const accountData = options?.accountData ?? await config.officialAPI.getAccountData(instanceId)
+        let accountData = options?.accountData ?? await config.officialAPI.getAccountData(instanceId)
         if (!accountData || accountData.loginType !== 1 || accountData.status !== 1) {
             return { success: false, error: 'Invalid account for Official API' }
         }
@@ -950,6 +950,11 @@ export async function downloadOfficialAPIMedia(
         const downloadTask = async () => {
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
+                    // Ensure accountData is valid
+                    if (!accountData) {
+                        throw new Error('Account data unavailable for Official API download')
+                    }
+
                     // Compute step-2 timeout using size-aware policy when possible
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                     const declaredLen = (mediaInfo.message as any)?.fileLength ? Number((mediaInfo.message as any).fileLength) : undefined
@@ -982,7 +987,9 @@ export async function downloadOfficialAPIMedia(
                         try {
                             const refreshed = await config.officialAPI.getAccountData(instanceId)
                             if (refreshed) accountData = refreshed
-                        } catch {}
+                        } catch {
+                            // Ignore refresh failures, continue with existing accountData
+                        }
                     }
 
                     // Ensure temporary file is cleaned between retries

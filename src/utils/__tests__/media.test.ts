@@ -307,16 +307,23 @@ describe('Media Utilities', () => {
             const mockFiles = ['old_file_1.jpg', 'old_file_2.mp4', 'new_file.jpg']
             const oldTime = Date.now() - (31 * 24 * 60 * 60 * 1000) // 31 days ago
             const newTime = Date.now() - (1 * 24 * 60 * 60 * 1000) // 1 day ago
-            
-            ;(fs.readdir as jest.Mock).mockResolvedValue(mockFiles)
+
+            // Mock readdir: return files for 'image' type, ENOENT for others
+            ;(fs.readdir as jest.Mock)
+                .mockImplementationOnce(() => Promise.resolve(mockFiles)) // image
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // video
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // audio
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // document
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // sticker
+
             ;(fs.stat as jest.Mock)
                 .mockResolvedValueOnce({ mtimeMs: oldTime })
                 .mockResolvedValueOnce({ mtimeMs: oldTime })
                 .mockResolvedValueOnce({ mtimeMs: newTime })
             ;(fs.unlink as jest.Mock).mockResolvedValue(undefined)
-            
+
             const result = await cleanupOldMedia(mockInstanceId, mockBaseConfig, 30)
-            
+
             expect(result).toEqual({
                 deleted: 2,
                 errors: 0
@@ -326,12 +333,19 @@ describe('Media Utilities', () => {
         
         it('should handle errors gracefully', async () => {
             const mockFiles = ['file1.jpg']
-            
-            ;(fs.readdir as jest.Mock).mockResolvedValue(mockFiles)
+
+            // Mock readdir: return files for 'image' type, ENOENT for others
+            ;(fs.readdir as jest.Mock)
+                .mockImplementationOnce(() => Promise.resolve(mockFiles)) // image
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // video
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // audio
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // document
+                .mockRejectedValueOnce({ code: 'ENOENT' }) // sticker
+
             ;(fs.stat as jest.Mock).mockRejectedValue(new Error('Permission denied'))
-            
+
             const result = await cleanupOldMedia(mockInstanceId, mockBaseConfig, 30)
-            
+
             expect(result).toEqual({
                 deleted: 0,
                 errors: 1
