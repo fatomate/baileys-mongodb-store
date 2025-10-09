@@ -54,6 +54,22 @@ export interface MediaConfig {
     reuploadRequest?: any
     
     /**
+     * Enable verbose debug logs for media operations
+     */
+    enableMediaDebug?: boolean
+
+    /**
+     * Size-aware timeout multiplier (milliseconds per MB). Used when fileLength is known.
+     * Default: 3000 ms/MB
+     */
+    timeoutPerMB?: number
+
+    /**
+     * iOS HEIC/HEIF support toggle (default: true)
+     */
+    iosHeicSupport?: boolean
+
+    /**
      * Official WhatsApp API configuration
      */
     officialAPI?: {
@@ -61,6 +77,21 @@ export interface MediaConfig {
          * Function to get account data for a given instance
          */
         getAccountData?: (instanceId: string) => Promise<OfficialAPIAccountData | null>
+
+        /**
+         * Cache duration for mediaId->URL (ms). Default: 60000
+         */
+        maxUrlCacheMs?: number
+
+        /**
+         * Step-1 timeout (ms) when resolving media URL. Default: 20000
+         */
+        step1TimeoutMs?: number
+
+        /**
+         * Step-2 timeout (ms) when downloading media. If not set, uses size-aware timeout.
+         */
+        step2TimeoutMs?: number
     }
 }
 
@@ -96,6 +127,12 @@ export interface MediaInfo {
 // In-process in-flight download map to prevent duplicate concurrent downloads
 // Keyed by absolute target file path
 const inFlightDownloads = new Map<string, Promise<void>>()
+
+// In-flight map keyed by Official API mediaId to prevent duplicate parallel fetches
+const inFlightOfficialMedia = new Map<string, Promise<void>>()
+
+// Short-lived cache for Official API mediaId -> direct URL
+const officialApiUrlCache = new Map<string, { url: string; expiresAt: number }>()
 
 /**
  * Convert a standard base64 string to a filesystem-safe base64url variant
@@ -286,6 +323,11 @@ function getExtension(mimetype?: string, mediaType?: MediaType): string {
             'image/gif': '.gif',
             'image/webp': '.webp',
             'image/svg+xml': '.svg',
+            // iOS HEIC/HEIF
+            'image/heic': '.heic',
+            'image/heif': '.heic',
+            'image/heic-sequence': '.heic',
+            'image/heif-sequence': '.heic',
             
             // Videos
             'video/mp4': '.mp4',
@@ -398,9 +440,21 @@ async function downloadWithRetry(
 ): Promise<void> {
     const maxRetries = Math.max(1, config.maxRetries || 3)
     const baseDelay = Math.max(200, config.retryDelay || 1000)
+    const timeoutPerMB = Math.max(1, config.timeoutPerMB || 3000)
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+            // Compute effective timeout based on declared file size when available
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const declaredLen = (mediaMessage as any)?.fileLength ? Number((mediaMessage as any).fileLength) : undefined
+            const declaredMB = declaredLen ? declaredLen / (1024 * 1024) : undefined
+            const sizeAwareTimeout = declaredMB ? Math.floor(30000 + declaredMB * timeoutPerMB) : undefined
+            const effectiveTimeout = Math.max(
+                0,
+                config.downloadTimeout || 0,
+                sizeAwareTimeout || 0
+            ) || undefined
+
             // optional options supported by Baileys; cast to any for options
             const stream: NodeJS.ReadableStream = await (downloadContentFromMessage as any)(
                 mediaMessage,
@@ -412,12 +466,19 @@ async function downloadWithRetry(
             const writeStream = createWriteStream(outputPath)
 
             let timeout: NodeJS.Timeout | undefined
-            if (config.downloadTimeout) {
+            if (effectiveTimeout) {
+                const start = Date.now()
                 timeout = setTimeout(() => {
                     try { (stream as any)?.destroy?.(new Error('Download timeout')) } catch (e) { /* swallow */ }
                     try { writeStream.destroy(new Error('Download timeout')) } catch (e) { /* swallow */ }
-                }, config.downloadTimeout)
-                writeStream.on('finish', () => { if (timeout) clearTimeout(timeout) })
+                }, effectiveTimeout)
+                writeStream.on('finish', () => {
+                    if (timeout) clearTimeout(timeout)
+                    if (config.enableMediaDebug) {
+                        const elapsed = Date.now() - start
+                        logger?.info({ mediaType, outputPath, elapsedMs: elapsed, attempt }, 'Media download finished')
+                    }
+                })
                 writeStream.on('error', () => { if (timeout) clearTimeout(timeout) })
             }
 
@@ -543,7 +604,11 @@ export async function downloadMedia(
         await ensureDir(typeDir)
 
         // Generate deterministic filename using media hash when available
-        const extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
+        let extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
+        // Optional HEIC handling toggle
+        if (extension === '.heic' && config.iosHeicSupport === false) {
+            extension = '.jpg'
+        }
         let fileName = mediaHash
             ? `${toBase64Url(mediaHash)}${extension}`
             : generateFileName(
@@ -590,6 +655,18 @@ export async function downloadMedia(
                 await fs.unlink(tmpPath).catch(() => {})
                 throw new Error(`Downloaded size ${tmpStat.size} mismatch with declared ${declaredLen}`)
             }
+            // Enforce max size limit if declared length was not available
+            if (!declaredLen && config.maxSizeInMB && config.maxSizeInMB > 0) {
+                const limitBytes = config.maxSizeInMB * 1024 * 1024
+                if (tmpStat.size > limitBytes) {
+                    await fs.unlink(tmpPath).catch(() => {})
+                    throw new Error(`Downloaded file exceeds max size limit of ${config.maxSizeInMB}MB`)
+                }
+            }
+            if (tmpStat.size <= 0) {
+                await fs.unlink(tmpPath).catch(() => {})
+                throw new Error('Downloaded file is empty')
+            }
 
             // Atomic move into place
             await fs.rename(tmpPath, filePath)
@@ -634,65 +711,84 @@ async function downloadFromOfficialAPI(
     mediaId: string,
     accountData: OfficialAPIAccountData,
     filePath: string,
-    logger?: Logger
+    logger?: Logger,
+    options?: {
+        maxUrlCacheMs?: number
+        step1TimeoutMs?: number
+        step2TimeoutMs?: number
+    }
 ): Promise<void> {
     try {
         const { access_token, phone_number_id } = JSON.parse(accountData.tmp)
         const isWabotPro = accountData.data === 'wabot_pro'
         
-        // Step 1: Get media URL from WhatsApp API
-        const apiUrl = isWabotPro
-            ? `https://crm.wabot.pro/api/meta/v19.0/${mediaId}?phone_number_id=${phone_number_id}`
-            : `https://graph.facebook.com/v23.0/${mediaId}?phone_number_id=${phone_number_id}`
+        // Step 1: Try cache; otherwise, get media URL from WhatsApp API
+        const now = Date.now()
+        const cacheTtl = options?.maxUrlCacheMs ?? 60000
+        let directUrl: string | undefined
+        const cached = officialApiUrlCache.get(mediaId)
+        if (cached && cached.expiresAt > now) {
+            directUrl = cached.url
+            logger?.info({ mediaId }, 'Using cached Official API media URL')
+        }
         
-        const firstResponse = await axios.get(
-            apiUrl,
-            {
-                headers: {
-                    'Authorization': `Bearer ${access_token}`
-                },
-                responseType: 'stream',
-                timeout: 10000
-            }
-        )
-        
-        // Check if the response is JSON (contains URL) or direct media
-        const contentType = firstResponse.headers['content-type'] || ''
-        
-        if (contentType.includes('application/json')) {
-            // This is a JSON response with URL - need second request
-            // Convert stream to JSON
-            let data = ''
-            for await (const chunk of firstResponse.data) {
-                data += chunk.toString()
-            }
-            const jsonResponse = JSON.parse(data)
-            
-            if (!jsonResponse?.url) {
-                throw new Error('No media URL returned from WhatsApp API')
-            }
-            
-            // Step 2: Download the actual media file
-            const mediaResponse = await axios.get(
-                jsonResponse.url,
+        let contentType = ''
+        if (!directUrl) {
+            const apiUrl = isWabotPro
+                ? `https://crm.wabot.pro/api/meta/v19.0/${mediaId}?phone_number_id=${phone_number_id}`
+                : `https://graph.facebook.com/v23.0/${mediaId}?phone_number_id=${phone_number_id}`
+
+            const firstResponse = await axios.get(
+                apiUrl,
                 {
                     headers: {
                         'Authorization': `Bearer ${access_token}`
                     },
                     responseType: 'stream',
-                    timeout: 60000
+                    timeout: options?.step1TimeoutMs ?? 20000
                 }
             )
-            
-            // Write to file
-            const writeStream = createWriteStream(filePath)
-            await pipeline(mediaResponse.data, writeStream)
-        } else {
-            // This is the direct media response (wabot_pro proxy behavior)
-            // Write directly to file
-            const writeStream = createWriteStream(filePath)
-            await pipeline(firstResponse.data, writeStream)
+        
+            // Check if the response is JSON (contains URL) or direct media
+            contentType = firstResponse.headers['content-type'] || ''
+        
+            if (contentType.includes('application/json')) {
+                // Convert stream to JSON
+                let data = ''
+                for await (const chunk of firstResponse.data) {
+                    data += chunk.toString()
+                }
+                const jsonResponse = JSON.parse(data)
+                if (!jsonResponse?.url) {
+                    throw new Error('No media URL returned from WhatsApp API')
+                }
+                directUrl = jsonResponse.url
+                officialApiUrlCache.set(mediaId, { url: directUrl, expiresAt: now + cacheTtl })
+            } else {
+                // This is the direct media response (wabot_pro proxy behavior)
+                const writeStream = createWriteStream(filePath)
+                await pipeline(firstResponse.data, writeStream)
+                logger?.info({ mediaId, filePath, contentType }, 'Successfully downloaded Official API media (direct)')
+                return
+            }
         }
+
+        // Step 2: Download the actual media file using directUrl
+        if (!directUrl) {
+            throw new Error('Official API direct URL not resolved')
+        }
+        const mediaResponse = await axios.get(
+            directUrl,
+            {
+                headers: {
+                    'Authorization': `Bearer ${access_token}`
+                },
+                responseType: 'stream',
+                timeout: options?.step2TimeoutMs ?? 60000
+            }
+        )
+        const writeStream = createWriteStream(filePath)
+        await pipeline(mediaResponse.data, writeStream)
         
         logger?.info({
             mediaId,
@@ -851,42 +947,72 @@ export async function downloadOfficialAPIMedia(
         const maxRetries = config.maxRetries || 3
         const retryDelay = config.retryDelay || 1000
         
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                await downloadFromOfficialAPI(mediaId, accountData, tmpPath, logger)
-                // Atomic move into place
+        const downloadTask = async () => {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
-                    await fs.rename(tmpPath, filePath)
-                } catch (renameError) {
-                    const err = renameError as NodeJS.ErrnoException
-                    if (err.code === 'EEXIST') {
-                        // Another worker already placed the file - clean up temp and reuse existing file
-                        await fs.unlink(tmpPath).catch(() => undefined)
-                    } else {
-                        throw err
-                    }
-                }
-                break
-            } catch (error) {
-                // Ensure temporary file is cleaned between retries
-                await fs.unlink(tmpPath).catch(() => undefined)
+                    // Compute step-2 timeout using size-aware policy when possible
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const declaredLen = (mediaInfo.message as any)?.fileLength ? Number((mediaInfo.message as any).fileLength) : undefined
+                    const declaredMB = declaredLen ? declaredLen / (1024 * 1024) : undefined
+                    const step2Timeout = config.officialAPI?.step2TimeoutMs ?? (declaredMB ? Math.floor(30000 + (config.timeoutPerMB || 3000) * declaredMB) : 60000)
 
-                if (attempt === maxRetries) {
-                    throw error
+                    await downloadFromOfficialAPI(mediaId, accountData, tmpPath, logger, {
+                        maxUrlCacheMs: config.officialAPI?.maxUrlCacheMs ?? 60000,
+                        step1TimeoutMs: config.officialAPI?.step1TimeoutMs ?? 20000,
+                        step2TimeoutMs: step2Timeout
+                    })
+                    // Atomic move into place
+                    try {
+                        await fs.rename(tmpPath, filePath)
+                    } catch (renameError) {
+                        const err = renameError as NodeJS.ErrnoException
+                        if (err.code === 'EEXIST') {
+                            // Another worker already placed the file - clean up temp and reuse existing file
+                            await fs.unlink(tmpPath).catch(() => undefined)
+                        } else {
+                            throw err
+                        }
+                    }
+                    return
+                } catch (error) {
+                    // Handle 401/403 by refreshing account data once per attempt
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const status = (error as any)?.response?.status
+                    if ((status === 401 || status === 403) && config.officialAPI?.getAccountData) {
+                        try {
+                            const refreshed = await config.officialAPI.getAccountData(instanceId)
+                            if (refreshed) accountData = refreshed
+                        } catch {}
+                    }
+
+                    // Ensure temporary file is cleaned between retries
+                    await fs.unlink(tmpPath).catch(() => undefined)
+
+                    if (attempt === maxRetries) {
+                        throw error
+                    }
+                    
+                    logger?.warn({
+                        error: error instanceof Error ? error.message : 'Unknown error',
+                        attempt,
+                        maxRetries,
+                        mediaId
+                    }, 'Official API media download failed, retrying...')
+                    
+                    const expo = Math.min(retryDelay * Math.pow(2, attempt - 1), 30000)
+                    const jitter = Math.floor(Math.random() * 500)
+                    await new Promise(resolve => setTimeout(resolve, expo + jitter))
                 }
-                
-                logger?.warn({
-                    error: error instanceof Error ? error.message : 'Unknown error',
-                    attempt,
-                    maxRetries,
-                    mediaId
-                }, 'Official API media download failed, retrying...')
-                
-                const expo = Math.min(retryDelay * Math.pow(2, attempt - 1), 30000)
-                const jitter = Math.floor(Math.random() * 500)
-                await new Promise(resolve => setTimeout(resolve, expo + jitter))
             }
         }
+
+        // Prevent duplicate parallel downloads by mediaId (in addition to file path)
+        let inflightById = inFlightOfficialMedia.get(mediaId)
+        if (!inflightById) {
+            inflightById = downloadTask()
+            inFlightOfficialMedia.set(mediaId, inflightById)
+        }
+        await inflightById.finally(() => inFlightOfficialMedia.delete(mediaId))
         
         // Get file stats
         const stats = await fs.stat(filePath)
