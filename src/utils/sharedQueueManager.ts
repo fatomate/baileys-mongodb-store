@@ -1,4 +1,4 @@
-import { Queue, Worker, QueueEvents, Job } from 'bullmq'
+import { Queue, Worker, QueueEvents, Job, JobsOptions } from 'bullmq'
 import Redis from 'ioredis'
 import { EventEmitter } from 'events'
 
@@ -396,7 +396,17 @@ export class SharedQueueManager extends EventEmitter {
     /**
      * Add a job to the appropriate queue
      */
-    async addJob(type: JobType, data: any, instanceId: string, priority: number = 5): Promise<Job<SharedJobData>> {
+    async addJob(
+        type: JobType,
+        data: any,
+        instanceId: string,
+        priority: number = 5,
+        options?: {
+            delayMs?: number
+            attempts?: number
+            backoff?: JobsOptions['backoff']
+        }
+    ): Promise<Job<SharedJobData>> {
         // Find the appropriate queue for this job type
         let targetQueue: SharedQueueName | undefined
         
@@ -426,14 +436,24 @@ export class SharedQueueManager extends EventEmitter {
             requeueCount: 0
         }
         
-        // Add job with priority
+        const jobOptions: JobsOptions = {
+            priority: Math.max(0, Math.min(10 - priority, 10)), // BullMQ uses lower numbers for higher priority
+            delay: options?.delayMs ?? 0
+        }
+
+        if (options?.attempts && options.attempts > 0) {
+            jobOptions.attempts = options.attempts
+        }
+
+        if (options?.backoff) {
+            jobOptions.backoff = options.backoff
+        }
+
+        // Add job with priority and optional retry configuration
         const job = await queue.add(
             `${type}_${instanceId}_${Date.now()}`,
             jobData,
-            {
-                priority: 10 - priority, // BullMQ uses lower numbers for higher priority
-                delay: 0
-            }
+            jobOptions
         )
         
         this.log('debug', `📨 Added ${type} job to ${targetQueue} for instance ${instanceId}`)

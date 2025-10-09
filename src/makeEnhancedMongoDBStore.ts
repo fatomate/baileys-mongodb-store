@@ -1760,6 +1760,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             try {
+                const attemptNumber = (job.attemptsMade ?? 0) + 1
+                
                 // Check for existing media by hash
                 const checkExistingMedia = async (fileHash: string) => {
                     const existingMessage = await withConnection(async () =>
@@ -1783,7 +1785,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         config.logger,
                         checkExistingMedia,
                         {
-                            attempt: (job.data.requeueCount ?? 0) + 1
+                            attempt: attemptNumber
                         }
                     )
                 } else {
@@ -1798,6 +1800,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 if (mediaResult.success && mediaResult.localPath) {
                     // Update message with media URL
+                    const mediaUpdate: Record<string, any> = {
+                        mediaUrl: mediaResult.localPath,
+                        mediaDownloadedAt: new Date()
+                    }
+                    if (mediaResult.mediaType) mediaUpdate.mediaType = mediaResult.mediaType
+                    if (mediaResult.fileName) mediaUpdate.mediaFileName = mediaResult.fileName
+                    if (typeof mediaResult.fileSize === 'number') mediaUpdate.mediaFileSize = mediaResult.fileSize
+                    if (mediaResult.mediaHash) mediaUpdate.mediaHash = mediaResult.mediaHash
+                    if (typeof mediaResult.reused !== 'undefined') mediaUpdate.mediaReused = mediaResult.reused
+                    
                     await withConnection(async () =>
                         collections.messages.updateOne(
                             {
@@ -1805,17 +1817,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 'key.id': message.key?.id
                             },
                             {
-                                $set: {
-                                    mediaUrl: mediaResult.localPath,
-                                    mediaDownloadedAt: new Date()
-                                }
+                                $set: mediaUpdate
                             }
                         )
                     )
                     
                     return { success: true, mediaUrl: mediaResult.localPath }
                 } else {
-                    return { success: false, error: mediaResult.error || 'Download failed' }
+                    const errorMessage = mediaResult.error || 'Download failed'
+                    logWarn(`[Media Download Queue] Attempt ${attemptNumber} failed for ${message.key?.id}: ${errorMessage}`)
+                    throw new Error(errorMessage)
                 }
             } catch (error: any) {
                 logError(`❌ [Media Download Queue] Failed to download media:`, error)
@@ -4758,6 +4769,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Queue media download using shared queue manager
                     if (sharedQueueManager && useSharedQueues) {
                         try {
+                            const queueAttempts = config.media?.maxRetries ? Math.max(config.media.maxRetries, 3) : 5
+                            const backoffDelay = config.media?.retryDelay ?? 1000
                             await sharedQueueManager.addJob(
                                 JobType.MEDIA_DOWNLOAD,
                                 {
@@ -4766,7 +4779,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     jid: validJid
                                 },
                                 validatedInstanceId,
-                                5 // Medium priority
+                                5, // Medium priority
+                                {
+                                    attempts: queueAttempts,
+                                    backoff: { type: 'exponential', delay: backoffDelay }
+                                }
                             )
                             log(`✅ Media download queued for message ${clonedMessage.key?.id}`)
                             config.logger?.info({
@@ -5859,11 +5876,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const mediaInfo = extractMediaInfo(msg)
                                 if (mediaInfo && sharedQueueManager && useSharedQueues) {
                                     try {
+                                        const queueAttempts = config.media?.maxRetries ? Math.max(config.media.maxRetries, 3) : 5
+                                        const backoffDelay = config.media?.retryDelay ?? 1000
                                         await sharedQueueManager.addJob(
                                             JobType.MEDIA_DOWNLOAD,
                                             { message: msg, mediaInfo, jid },
                                             validatedInstanceId,
-                                            5
+                                            5,
+                                            {
+                                                attempts: queueAttempts,
+                                                backoff: { type: 'exponential', delay: backoffDelay }
+                                            }
                                         )
                                         log(`📥 Media download queued for message ${msg.key?.id}`)
                                         // Do not also attempt inline; queue will update DB when done
@@ -7135,29 +7158,51 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     ) as any
                     return existing?.mediaUrl || null
                 }
-                
-                // Download the media
-                const mediaResult = await downloadMedia(message, instanceId, config.media, config.logger, checkExistingMedia)
+
+                // Determine download strategy
+                const isOfficialAPI = (message as any).official_api === true
+                let mediaResult
+                if (isOfficialAPI) {
+                    mediaResult = await downloadOfficialAPIMedia(
+                        message as proto.IWebMessageInfo,
+                        instanceId,
+                        config.media,
+                        config.logger,
+                        checkExistingMedia,
+                        { attempt: 1 }
+                    )
+                } else {
+                    mediaResult = await downloadMedia(
+                        message as proto.IWebMessageInfo,
+                        instanceId,
+                        config.media,
+                        config.logger,
+                        checkExistingMedia
+                    )
+                }
                 
                 if (mediaResult.success && mediaResult.localPath) {
                     // Update message with media URL
+                    const filter = (message as any).jid
+                        ? { instanceId, jid: (message as any).jid, 'key.id': messageId }
+                        : jid
+                            ? { instanceId, jid, 'key.id': messageId }
+                            : { instanceId, 'key.id': messageId }
+                    const mediaUpdate: Record<string, any> = {
+                        mediaUrl: mediaResult.localPath,
+                        mediaDownloadedAt: new Date()
+                    }
+                    if (mediaResult.mediaType) mediaUpdate.mediaType = mediaResult.mediaType
+                    if (mediaResult.fileName) mediaUpdate.mediaFileName = mediaResult.fileName
+                    if (typeof mediaResult.fileSize === 'number') mediaUpdate.mediaFileSize = mediaResult.fileSize
+                    if (mediaResult.mediaHash) mediaUpdate.mediaHash = mediaResult.mediaHash
+                    if (typeof mediaResult.reused !== 'undefined') mediaUpdate.mediaReused = mediaResult.reused
+                    
                     await withConnection(async () =>
                         collections.messages.updateOne(
+                            filter,
                             { 
-                                instanceId, 
-                                jid, 
-                                'key.id': messageId 
-                            },
-                            { 
-                                $set: { 
-                                    mediaUrl: mediaResult.localPath,
-                                    mediaType: mediaResult.mediaType,
-                                    mediaFileName: mediaResult.fileName,
-                                    mediaFileSize: mediaResult.fileSize,
-                                    mediaHash: mediaResult.mediaHash,
-                                    mediaReused: mediaResult.reused || false,
-                                    mediaDownloadedAt: new Date()
-                                } 
+                                $set: mediaUpdate 
                             }
                         )
                     )
