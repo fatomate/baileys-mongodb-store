@@ -1,6 +1,7 @@
 import { Queue, Worker, QueueEvents, Job, JobsOptions } from 'bullmq'
 import Redis from 'ioredis'
 import { EventEmitter } from 'events'
+import { randomUUID } from 'crypto'
 
 // Queue names
 export enum SharedQueueName {
@@ -40,6 +41,7 @@ export interface SharedJobData {
     timestamp: number
     requeueCount?: number
     lastError?: string
+    ownerId?: string
 }
 
 // Queue configuration
@@ -63,6 +65,11 @@ export interface SharedQueueManagerConfig {
         media?: number
         lowPriority?: number
     }
+    /**
+     * Optional identifier to distinguish this worker process.
+     * Defaults to a random UUID if not provided.
+     */
+    workerId?: string
     enableMetrics?: boolean
     logLevel?: 'none' | 'error' | 'warn' | 'info' | 'debug' | 'all'
     missingProcessorHandling?: {
@@ -79,6 +86,34 @@ export interface SharedQueueManagerConfig {
          */
         maxDelayMs?: number
     }
+    ownership?: {
+        /**
+         * Key prefix for ownership tracking entries in Redis.
+         * Defaults to `baileys_shared_queue`.
+         */
+        keyPrefix?: string
+        /**
+         * TTL (in ms) applied to ownership claims. When the TTL expires,
+         * another worker can take over the instance.
+         */
+        claimTtlMs?: number
+        /**
+         * Interval (in ms) for refreshing ownership claims.
+         * Defaults to half of `claimTtlMs`, clamped to >= 5000ms.
+         */
+        heartbeatIntervalMs?: number
+        /**
+         * Delay (in ms) applied when rescheduling jobs because of ownership conflicts.
+         */
+        conflictDelayMs?: number
+    }
+}
+
+interface OwnershipConfig {
+    keyPrefix: string
+    claimTtlMs: number
+    heartbeatIntervalMs: number
+    conflictDelayMs: number
 }
 
 // Metrics tracking
@@ -101,6 +136,10 @@ export class SharedQueueManager extends EventEmitter {
     private config: SharedQueueManagerConfig
     private isShuttingDown: boolean = false
     private readonly queueConfigs: Map<SharedQueueName, QueueConfig>
+    private readonly workerId: string
+    private readonly ownershipConfig: OwnershipConfig
+    private claimedInstances: Set<string>
+    private ownershipHeartbeats: Map<string, NodeJS.Timeout>
     
     private constructor(config: SharedQueueManagerConfig) {
         super()
@@ -111,6 +150,10 @@ export class SharedQueueManager extends EventEmitter {
         this.metrics = new Map()
         this.instanceProcessors = new Map() // Initialize instance processors map
         this.redis = null as any // Will be initialized in initializeRedis()
+        this.workerId = config.workerId || this.safeRandomId()
+        this.ownershipConfig = this.buildOwnershipConfig(config.ownership)
+        this.claimedInstances = new Set()
+        this.ownershipHeartbeats = new Map()
         
         // Define queue configurations
         this.queueConfigs = new Map([
@@ -140,6 +183,14 @@ export class SharedQueueManager extends EventEmitter {
         
         // Set up graceful shutdown handlers
         this.setupShutdownHandlers()
+    }
+    
+    private safeRandomId(): string {
+        try {
+            return randomUUID()
+        } catch {
+            return `worker-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        }
     }
     
     /**
@@ -315,20 +366,32 @@ export class SharedQueueManager extends EventEmitter {
         })
     }
     
-    private async processJob(job: Job<SharedJobData>, _queueName: SharedQueueName): Promise<any> {
+    private async processJob(job: Job<SharedJobData>, queueName: SharedQueueName): Promise<any> {
         const { type, instanceId } = job.data
         
         // Check if we're shutting down
         if (this.isShuttingDown) {
             throw new Error('Queue manager is shutting down')
         }
+
+        // Ensure this worker is responsible for the instance before processing
+        const ownershipResult = await this.ensureOwnershipForJob(job, queueName)
+        if (ownershipResult.action === 'skip') {
+            return {
+                skipped: true,
+                reason: ownershipResult.reason
+            }
+        }
         
         // Get processor for this specific instance and job type
         const processors = this.instanceProcessors.get(type)
         if (!processors || !processors.has(instanceId)) {
             const errorMessage = `No processor registered for instance ${instanceId} and job type ${type}`
-            await this.handleMissingProcessor(job, _queueName, errorMessage)
-            throw new Error(errorMessage)
+            await this.handleMissingProcessor(job, queueName, errorMessage)
+            // Avoid throwing to prevent noisy failures when the job landed on a non-owner worker.
+            // We re-queued or delayed the job already in handleMissingProcessor.
+            this.log('warn', `⤴️ ${queueName}: ${errorMessage}. Job ${job.id} rescheduled.`)
+            return { skipped: true, reason: errorMessage }
         }
         
         const processor = processors.get(instanceId)!
@@ -339,6 +402,9 @@ export class SharedQueueManager extends EventEmitter {
             
             // Execute processor
             const result = await processor(job)
+
+            // Refresh ownership TTL so the claim stays active while work continues
+            await this.extendOwnership(instanceId)
             
             const processingTime = Date.now() - startTime
             this.log('debug', `✅ Processed ${type} job for instance ${instanceId} in ${processingTime}ms`)
@@ -353,6 +419,256 @@ export class SharedQueueManager extends EventEmitter {
             throw error
         }
     }
+
+    private async ensureOwnershipForJob(
+        job: Job<SharedJobData>,
+        queueName: SharedQueueName
+    ): Promise<{ action: 'process' } | { action: 'skip'; reason: string }> {
+        const instanceId = job.data.instanceId
+
+        // Fast path: we already believe we own the instance
+        if (this.claimedInstances.has(instanceId)) {
+            if (job.data.ownerId !== this.workerId) {
+                job.data.ownerId = this.workerId
+                try {
+                    await (job as any).update(job.data)
+                } catch (error) {
+                    this.log('warn', `⚠️ Failed to update job ${job.id} with local ownership`, error)
+                }
+            }
+            await this.extendOwnership(instanceId)
+            return { action: 'process' }
+        }
+
+        const jobOwnerId = job.data.ownerId
+        if (jobOwnerId && jobOwnerId !== this.workerId) {
+            await this.rescheduleForOwnershipMismatch(job, queueName, jobOwnerId)
+            return { action: 'skip', reason: `Job owned by ${jobOwnerId}` }
+        }
+
+        const claimResult = await this.claimInstanceOwnership(instanceId)
+
+        if (!claimResult.owned && claimResult.ownerId && claimResult.ownerId !== this.workerId) {
+            await this.rescheduleForOwnershipMismatch(job, queueName, claimResult.ownerId)
+            return { action: 'skip', reason: `Ownership held by ${claimResult.ownerId}` }
+        }
+
+        if (claimResult.owned) {
+            if (job.data.ownerId !== this.workerId) {
+                job.data.ownerId = this.workerId
+                try {
+                    await (job as any).update(job.data)
+                } catch (error) {
+                    this.log('warn', `⚠️ Failed to stamp ownership on job ${job.id}`, error)
+                }
+            }
+            await this.extendOwnership(instanceId)
+        }
+
+        return { action: 'process' }
+    }
+
+    private async rescheduleForOwnershipMismatch(
+        job: Job<SharedJobData>,
+        queueName: SharedQueueName,
+        ownerId: string
+    ): Promise<void> {
+        const requeueCount = (job.data.requeueCount ?? 0) + 1
+        const delay = Math.min(
+            this.ownershipConfig.conflictDelayMs * requeueCount,
+            this.ownershipConfig.conflictDelayMs * 5
+        )
+
+        try {
+            await (job as any).update({
+                ...job.data,
+                ownerId,
+                requeueCount,
+                lastError: `Ownership mismatch: job belongs to ${ownerId}, worker ${this.workerId}`
+            })
+
+            if ((job as any).token) {
+                const scheduledFor = Date.now() + delay
+                await job.moveToDelayed(scheduledFor, (job as any).token)
+            } else {
+                const queue = this.queues.get(queueName)
+                if (queue) {
+                    await queue.add(
+                        `${job.data.type}_${job.data.instanceId}_${Date.now()}`,
+                        {
+                            ...job.data,
+                            ownerId,
+                            requeueCount,
+                            lastError: `Ownership mismatch: job belongs to ${ownerId}`
+                        },
+                        {
+                            priority: job.opts.priority ?? Math.max(0, Math.min(10 - (job.data.priority ?? 5), 10)),
+                            delay
+                        }
+                    )
+                }
+            }
+
+            this.log(
+                'debug',
+                `↩️ Rescheduled job ${job.id} for instance ${job.data.instanceId} (owned by ${ownerId})`
+            )
+        } catch (error) {
+            this.log('warn', `⚠️ Failed to reschedule job ${job.id} for ownership mismatch`, error)
+        }
+    }
+
+    async claimInstanceOwnership(instanceId: string): Promise<{ owned: boolean; ownerId: string | null }> {
+        const ownerKey = this.getInstanceOwnerKey(instanceId)
+        try {
+            const existingOwner = await this.redis.get(ownerKey)
+
+            if (existingOwner === this.workerId) {
+                await this.extendOwnership(instanceId, ownerKey)
+                return { owned: true, ownerId: this.workerId }
+            }
+
+            if (existingOwner && existingOwner !== this.workerId) {
+                return { owned: false, ownerId: existingOwner }
+            }
+
+            const setResult = await this.redis.set(
+                ownerKey,
+                this.workerId,
+                'PX',
+                this.ownershipConfig.claimTtlMs,
+                'NX'
+            )
+
+            if (setResult === 'OK') {
+                this.claimedInstances.add(instanceId)
+                this.startOwnershipHeartbeat(instanceId, ownerKey)
+                return { owned: true, ownerId: this.workerId }
+            }
+
+            const postSetOwner = await this.redis.get(ownerKey)
+            return {
+                owned: postSetOwner === this.workerId,
+                ownerId: postSetOwner
+            }
+        } catch (error) {
+            this.log('error', `❌ Failed to claim ownership for instance ${instanceId}`, error)
+            return { owned: false, ownerId: null }
+        }
+    }
+
+    async releaseInstanceOwnership(instanceId: string): Promise<void> {
+        const ownerKey = this.getInstanceOwnerKey(instanceId)
+        try {
+            const script = `
+                if redis.call("get", KEYS[1]) == ARGV[1] then
+                    return redis.call("del", KEYS[1])
+                end
+                return 0
+            `
+            await this.redis.eval(script, 1, ownerKey, this.workerId)
+        } catch (error) {
+            this.log('warn', `⚠️ Failed to release ownership for instance ${instanceId}`, error)
+        } finally {
+            this.stopOwnershipHeartbeat(instanceId)
+            this.claimedInstances.delete(instanceId)
+        }
+    }
+
+    private async extendOwnership(instanceId: string, ownerKey?: string): Promise<void> {
+        const key = ownerKey ?? this.getInstanceOwnerKey(instanceId)
+        try {
+            const result = await this.redis.set(
+                key,
+                this.workerId,
+                'PX',
+                this.ownershipConfig.claimTtlMs,
+                'XX'
+            )
+
+            if (result === 'OK') {
+                this.claimedInstances.add(instanceId)
+                this.startOwnershipHeartbeat(instanceId, key)
+            } else {
+                const currentOwner = await this.redis.get(key)
+                if (currentOwner !== this.workerId) {
+                    this.stopOwnershipHeartbeat(instanceId)
+                    this.claimedInstances.delete(instanceId)
+                }
+            }
+        } catch (error) {
+            this.log('warn', `⚠️ Failed to extend ownership for instance ${instanceId}`, error)
+        }
+    }
+
+    private getInstanceOwnerKey(instanceId: string): string {
+        return `${this.ownershipConfig.keyPrefix}:owner:${instanceId}`
+    }
+
+    private async getInstanceOwner(instanceId: string): Promise<string | null> {
+        try {
+            return await this.redis.get(this.getInstanceOwnerKey(instanceId))
+        } catch (error) {
+            this.log('warn', `⚠️ Failed to read ownership for instance ${instanceId}`, error)
+            return null
+        }
+    }
+
+    private startOwnershipHeartbeat(instanceId: string, ownerKey?: string): void {
+        if (this.ownershipHeartbeats.has(instanceId)) {
+            return
+        }
+
+        const key = ownerKey ?? this.getInstanceOwnerKey(instanceId)
+        const intervalMs = this.ownershipConfig.heartbeatIntervalMs
+
+        const timer = setInterval(async () => {
+            try {
+                const result = await this.redis.set(
+                    key,
+                    this.workerId,
+                    'PX',
+                    this.ownershipConfig.claimTtlMs,
+                    'XX'
+                )
+                if (result !== 'OK') {
+                    const currentOwner = await this.redis.get(key)
+                    if (currentOwner !== this.workerId) {
+                        this.log('warn', `⚠️ Ownership heartbeat lost for instance ${instanceId}`)
+                        this.stopOwnershipHeartbeat(instanceId)
+                        this.claimedInstances.delete(instanceId)
+                    }
+                }
+            } catch (error) {
+                this.log('warn', `⚠️ Ownership heartbeat error for instance ${instanceId}`, error)
+            }
+        }, intervalMs)
+
+        if (typeof (timer as any).unref === 'function') {
+            (timer as any).unref()
+        }
+
+        this.ownershipHeartbeats.set(instanceId, timer)
+    }
+
+    private stopOwnershipHeartbeat(instanceId: string): void {
+        const timer = this.ownershipHeartbeats.get(instanceId)
+        if (timer) {
+            clearInterval(timer)
+            this.ownershipHeartbeats.delete(instanceId)
+        }
+    }
+
+    private buildOwnershipConfig(ownership?: SharedQueueManagerConfig['ownership']): OwnershipConfig {
+        const claimTtlMs = ownership?.claimTtlMs ?? 60000
+        const heartbeatIntervalMs = ownership?.heartbeatIntervalMs ?? Math.max(5000, Math.floor(claimTtlMs / 2))
+        return {
+            keyPrefix: ownership?.keyPrefix || 'baileys_shared_queue',
+            claimTtlMs,
+            heartbeatIntervalMs,
+            conflictDelayMs: ownership?.conflictDelayMs ?? 2000
+        }
+    }
     
     /**
      * Register a processor for a specific job type and instance
@@ -364,6 +680,12 @@ export class SharedQueueManager extends EventEmitter {
         }
         this.instanceProcessors.get(type)!.set(instanceId, processor)
         this.log('info', `📝 Registered processor for instance ${instanceId} and job type ${type}`)
+        
+        if (!this.claimedInstances.has(instanceId)) {
+            this.claimInstanceOwnership(instanceId).catch(error => {
+                this.log('warn', `⚠️ Failed to initiate ownership claim for instance ${instanceId}`, error)
+            })
+        }
     }
     
     /**
@@ -426,6 +748,19 @@ export class SharedQueueManager extends EventEmitter {
             throw new Error(`Queue ${targetQueue} not initialized`)
         }
         
+        // Determine owner for this instance so the correct worker handles the job
+        let ownerId: string | null = null
+        if (this.claimedInstances.has(instanceId)) {
+            ownerId = this.workerId
+            await this.extendOwnership(instanceId)
+        } else {
+            ownerId = await this.getInstanceOwner(instanceId)
+            if (!ownerId) {
+                const claimAttempt = await this.claimInstanceOwnership(instanceId)
+                ownerId = claimAttempt.ownerId
+            }
+        }
+        
         // Create job data
         const jobData: SharedJobData = {
             instanceId,
@@ -434,6 +769,9 @@ export class SharedQueueManager extends EventEmitter {
             priority,
             timestamp: Date.now(),
             requeueCount: 0
+        }
+        if (ownerId) {
+            jobData.ownerId = ownerId
         }
         
         const jobOptions: JobsOptions = {
@@ -539,6 +877,12 @@ export class SharedQueueManager extends EventEmitter {
             for (const queue of this.queues.values()) {
                 await queue.close()
             }
+
+            for (const timer of this.ownershipHeartbeats.values()) {
+                clearInterval(timer)
+            }
+            this.ownershipHeartbeats.clear()
+            this.claimedInstances.clear()
             
             // Close Redis connection
             this.redis.disconnect()
@@ -596,7 +940,7 @@ export class SharedQueueManager extends EventEmitter {
         maxDelayMs: number
     } {
         const defaults = {
-            maxAttempts: Number.POSITIVE_INFINITY,
+            maxAttempts: 5,
             initialDelayMs: 2000,
             maxDelayMs: 15000
         }
@@ -632,7 +976,6 @@ export class SharedQueueManager extends EventEmitter {
 
         const delay = Math.min(initialDelayMs * Math.pow(2, currentAttempt), maxDelayMs)
         const priority = job.data.priority ?? 5
-        const nextJobId = `${job.data.type}_${job.data.instanceId}_${Date.now()}`
         const attemptLabel = Number.isFinite(maxAttempts)
             ? `${nextAttempt}/${maxAttempts}`
             : `${nextAttempt}`
@@ -642,6 +985,23 @@ export class SharedQueueManager extends EventEmitter {
             `⚠️ ${reason}. Re-queuing (attempt ${attemptLabel}) with ${delay}ms delay.`
         )
 
+        // Prefer delaying the same job to avoid duplications
+        try {
+            await (job as any).update({
+                ...job.data,
+                requeueCount: nextAttempt,
+                lastError: reason,
+                timestamp: job.data.timestamp ?? Date.now()
+            })
+            if ((job as any).token) {
+                await job.moveToDelayed(Date.now() + delay, (job as any).token)
+                return
+            }
+        } catch (err) {
+            // Fall through to re-add as new job if update/move fails
+        }
+
+        const nextJobId = `${job.data.type}_${job.data.instanceId}_${Date.now()}`
         await queue.add(
             nextJobId,
             {
@@ -674,6 +1034,13 @@ export class SharedQueueManager extends EventEmitter {
             }
         }
         return undefined
+    }
+
+    /**
+     * Expose the worker identifier for logging/debug purposes
+     */
+    getWorkerId(): string {
+        return this.workerId
     }
     
     /**

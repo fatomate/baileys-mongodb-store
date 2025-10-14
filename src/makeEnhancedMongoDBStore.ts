@@ -1313,6 +1313,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Register processors for shared queue manager
     const registerSharedQueueProcessors = async () => {
         if (!sharedQueueManager) return
+
+        const ownership = await sharedQueueManager.claimInstanceOwnership(validatedInstanceId)
+        if (!ownership.owned && ownership.ownerId && ownership.ownerId !== sharedQueueManager.getWorkerId()) {
+            logWarn(`[${instanceId}] Shared queue ownership currently held by ${ownership.ownerId}. Jobs will be deferred until ownership changes.`)
+        } else if (ownership.owned) {
+            log(`[${instanceId}] Shared queue ownership claimed by worker ${sharedQueueManager.getWorkerId()}`)
+        }
         
         // Messages processor - use instance-specific registration to fix singleton issue
         sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.MESSAGES, async (job) => {
@@ -7326,6 +7333,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (sharedQueueManager && useSharedQueues) {
                 log(`🗑️ Unregistering processors for instance ${instanceId} from SharedQueueManager`)
                 sharedQueueManager.unregisterInstanceProcessors(validatedInstanceId)
+                try {
+                    await sharedQueueManager.releaseInstanceOwnership(validatedInstanceId)
+                    log(`[${instanceId}] Released shared queue ownership`)
+                } catch (error) {
+                    logWarn(`[${instanceId}] Failed to release shared queue ownership:`, error)
+                }
             }
             
             // Remove repeatable job for cleanup if it exists
