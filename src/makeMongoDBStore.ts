@@ -1553,7 +1553,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                 { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
                 { name: 'messages_keyid', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
-                { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } },
+                { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
             ],
             groupMetadata: [
                 { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -3395,7 +3396,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                         { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
-                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } },
+                        { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
                     ],
                     groupMetadata: [
                         { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }

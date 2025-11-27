@@ -3403,7 +3403,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
                 { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
                 // Index for LID resolution tracking
-                { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
+                { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } },
+                // Index for media deduplication by fileHash
+                { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
             ],
             groupMetadata: [
                 { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -6980,7 +6982,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
                         { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
                         // Index for LID resolution tracking
-                        { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
+                        { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } },
+                        // Index for media deduplication by fileHash
+                        { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
                     ],
                     groupMetadata: [
                         { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
