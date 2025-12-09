@@ -349,46 +349,98 @@ export class LidHandler {
 
     /**
      * Extract LID and phone number from a message
+     * Supports both new format (remoteJidAlt + addressingMode) and legacy format (senderLid + senderPn)
      */
     extractLidInfo(message: proto.IWebMessageInfo): {
         lid?: string
         phoneNumber?: string
         needsReverseLookup?: boolean
+        addressingMode?: string
         debug?: string[]
     } {
-        const result: { lid?: string; phoneNumber?: string; needsReverseLookup?: boolean; debug?: string[] } = {}
+        const result: { lid?: string; phoneNumber?: string; needsReverseLookup?: boolean; addressingMode?: string; debug?: string[] } = {}
         const debug: string[] = []
         
-        // Check if this is a sent message (fromMe: true) with LID remoteJid
-        if (message.key?.fromMe && this.isLidFormat(message.key?.remoteJid)) {
-            result.lid = message.key.remoteJid!
-            result.needsReverseLookup = true
-            debug.push(`Found LID in remoteJid (fromMe=true, needs reverse lookup): ${result.lid}`)
+        // Extract new format fields (remoteJidAlt + addressingMode)
+        const addressingMode = (message.key as any)?.addressingMode
+        const remoteJidAlt = (message.key as any)?.remoteJidAlt
+        
+        // NEW FORMAT: Handle remoteJidAlt + addressingMode
+        if (addressingMode && remoteJidAlt) {
+            result.addressingMode = addressingMode
+            debug.push(`New format detected: addressingMode=${addressingMode}`)
             
-            // For sent messages, we won't find phone number in the message itself
-            // We need to do a reverse lookup
-            if (process.env.NODE_ENV !== 'production' || debug.length > 0) {
-                result.debug = debug
+            if (addressingMode === 'pn') {
+                // Incoming message: remoteJid is phone number, remoteJidAlt is LID
+                if (this.isLidFormat(remoteJidAlt)) {
+                    result.lid = remoteJidAlt
+                    debug.push(`Found LID in remoteJidAlt (addressingMode=pn): ${result.lid}`)
+                }
+                if (message.key?.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
+                    result.phoneNumber = message.key.remoteJid
+                    debug.push(`Found phone in remoteJid (addressingMode=pn): ${result.phoneNumber}`)
+                }
+            } else if (addressingMode === 'lid') {
+                // Outgoing message: remoteJid is LID, remoteJidAlt is phone number
+                if (message.key?.remoteJid && this.isLidFormat(message.key.remoteJid)) {
+                    result.lid = message.key.remoteJid
+                    debug.push(`Found LID in remoteJid (addressingMode=lid): ${result.lid}`)
+                }
+                if (!this.isLidFormat(remoteJidAlt)) {
+                    result.phoneNumber = remoteJidAlt
+                    debug.push(`Found phone in remoteJidAlt (addressingMode=lid): ${result.phoneNumber}`)
+                }
+                // For outgoing messages with LID remoteJid but phone in remoteJidAlt, no reverse lookup needed
+                if (result.lid && result.phoneNumber) {
+                    result.needsReverseLookup = false
+                    debug.push(`Both LID and phone found via new format, no reverse lookup needed`)
+                }
             }
-            return result
+            
+            // If we got both LID and phone from new format, return early
+            if (result.lid && result.phoneNumber) {
+                if (process.env.NODE_ENV !== 'production' || debug.length > 0) {
+                    result.debug = debug
+                }
+                return result
+            }
         }
         
-        // Check remoteJid for @lid
-        if (this.isLidFormat(message.key?.remoteJid)) {
+        // LEGACY FORMAT: Check if this is a sent message (fromMe: true) with LID remoteJid
+        if (message.key?.fromMe && this.isLidFormat(message.key?.remoteJid)) {
+            result.lid = message.key.remoteJid!
+            // Only need reverse lookup if we don't already have phone from new format
+            if (!result.phoneNumber) {
+                result.needsReverseLookup = true
+                debug.push(`Found LID in remoteJid (fromMe=true, needs reverse lookup): ${result.lid}`)
+            }
+            
+            // For sent messages, we won't find phone number in the message itself
+            // We need to do a reverse lookup (unless new format provided it)
+            if (result.needsReverseLookup) {
+                if (process.env.NODE_ENV !== 'production' || debug.length > 0) {
+                    result.debug = debug
+                }
+                return result
+            }
+        }
+        
+        // LEGACY: Check remoteJid for @lid
+        if (!result.lid && this.isLidFormat(message.key?.remoteJid)) {
             result.lid = message.key!.remoteJid!
             debug.push(`Found LID in remoteJid: ${result.lid}`)
         }
         
-        // Check senderLid (some messages have this)
-        if (this.isLidFormat((message.key as any)?.senderLid)) {
+        // LEGACY: Check senderLid (some messages have this)
+        if (!result.lid && this.isLidFormat((message.key as any)?.senderLid)) {
             result.lid = (message.key as any).senderLid
             debug.push(`Found LID in senderLid: ${result.lid}`)
         }
         
-        // Extract phone number from senderPn
+        // LEGACY: Extract phone number from senderPn
         // Special handling: For fromMe messages with LID remoteJid, senderPn might incorrectly be a LID too
         // In this case, we should ignore senderPn and rely on reverse lookup
-        if ((message.key as any)?.senderPn) {
+        if (!result.phoneNumber && (message.key as any)?.senderPn) {
             const senderPn = (message.key as any).senderPn
             if (!this.isLidFormat(senderPn)) {
                 result.phoneNumber = senderPn
@@ -402,8 +454,8 @@ export class LidHandler {
             }
         }
         
-        // If remoteJid is not @lid, it might be the phone number
-        if (message.key?.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
+        // LEGACY: If remoteJid is not @lid, it might be the phone number
+        if (!result.phoneNumber && message.key?.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
             result.phoneNumber = message.key.remoteJid
             debug.push(`Found phone in remoteJid: ${result.phoneNumber}`)
         }
@@ -923,7 +975,8 @@ export class LidHandler {
 
     /**
      * Discover phone number from sent messages (fromMe: true) with LID remoteJid
-     * Searches for received messages where senderLid matches the LID
+     * Searches for received messages where senderLid or remoteJidAlt matches the LID
+     * Supports both legacy (senderLid/senderPn) and new (remoteJidAlt/addressingMode) formats
      */
     async discoverPhoneFromSentMessage(lid: string): Promise<string | null> {
         const normalizedLid = normalizeJidForStorage(lid)
@@ -937,23 +990,34 @@ export class LidHandler {
                 
                 // Search for messages where:
                 // 1. fromMe is false (received messages)
-                // 2. senderLid matches our LID
+                // 2. senderLid matches our LID (legacy format)
+                // OR remoteJidAlt matches our LID with addressingMode='pn' (new format)
                 const receivedMessage = await this.messagesCollection.findOne({
                     instanceId: this.instanceId,
                     'key.fromMe': false,
                     $or: [
+                        // Legacy format: senderLid
                         { 'key.senderLid': normalizedLid },
-                        { 'key.senderLid': lid } // Try original format too
+                        { 'key.senderLid': lid },
+                        // New format: remoteJidAlt is LID when addressingMode='pn' (incoming)
+                        { 'key.remoteJidAlt': normalizedLid, 'key.addressingMode': 'pn' },
+                        { 'key.remoteJidAlt': lid, 'key.addressingMode': 'pn' }
                     ]
                 }, { maxTimeMS: this.config.contactsQueryMaxTimeMS } as any)
                 
                 if (receivedMessage) {
-                    // Extract phone number from senderPn or remoteJid
+                    // Extract phone number from various fields
                     let phoneNumber: string | null = null
                     
-                    // First try senderPn
-                    if (receivedMessage.key?.senderPn && !this.isLidFormat(receivedMessage.key.senderPn)) {
-                        phoneNumber = receivedMessage.key.senderPn
+                    // NEW FORMAT: Check remoteJid when addressingMode='pn' (phone is in remoteJid)
+                    const addressingMode = (receivedMessage.key as any)?.addressingMode
+                    if (addressingMode === 'pn' && receivedMessage.key?.remoteJid && !this.isLidFormat(receivedMessage.key.remoteJid)) {
+                        phoneNumber = receivedMessage.key.remoteJid
+                        console.log(`[LidHandler] Found phone number in remoteJid (addressingMode=pn): ${phoneNumber}`)
+                    }
+                    // LEGACY: First try senderPn
+                    else if ((receivedMessage.key as any)?.senderPn && !this.isLidFormat((receivedMessage.key as any).senderPn)) {
+                        phoneNumber = (receivedMessage.key as any).senderPn
                         console.log(`[LidHandler] Found phone number in senderPn: ${phoneNumber}`)
                     }
                     // Then try remoteJid if it's not a LID
@@ -974,7 +1038,7 @@ export class LidHandler {
                         return phoneNumber
                     }
                 } else {
-                    console.log(`[LidHandler] No received messages found with senderLid: ${normalizedLid}`)
+                    console.log(`[LidHandler] No received messages found with senderLid/remoteJidAlt: ${normalizedLid}`)
                 }
                 
                 return null
@@ -994,6 +1058,7 @@ export class LidHandler {
     /**
      * Reverse lookup phone number from messages for a given LID
      * Used when fromMe=true messages have LID in remoteJid
+     * Supports both legacy (senderLid/senderPn) and new (remoteJidAlt/addressingMode) formats
      */
     async reversePhoneLookupFromMessages(lid: string): Promise<string | null> {
         const normalizedLid = normalizeJidForStorage(lid)
@@ -1010,7 +1075,7 @@ export class LidHandler {
                 const message = await this.messagesCollection.findOne({
                     instanceId: this.instanceId,
                     $or: [
-                        // Case 1: LID in senderLid with phone in senderPn
+                        // LEGACY Case 1: LID in senderLid with phone in senderPn
                         { 
                             'key.senderLid': normalizedLid,
                             'key.senderPn': { 
@@ -1018,7 +1083,7 @@ export class LidHandler {
                                 $nin: [null, '']
                             }
                         },
-                        // Case 2: LID in remoteJid with phone in senderPn (fromMe=false)
+                        // LEGACY Case 2: LID in remoteJid with phone in senderPn (fromMe=false)
                         {
                             'key.remoteJid': normalizedLid,
                             'key.fromMe': false,
@@ -1026,16 +1091,52 @@ export class LidHandler {
                                 $exists: true,
                                 $nin: [null, '']
                             }
+                        },
+                        // NEW FORMAT Case 3: LID in remoteJidAlt with addressingMode='pn' (phone in remoteJid)
+                        {
+                            'key.remoteJidAlt': normalizedLid,
+                            'key.addressingMode': 'pn'
+                        },
+                        // NEW FORMAT Case 4: LID in remoteJid with addressingMode='lid' (phone in remoteJidAlt)
+                        {
+                            'key.remoteJid': normalizedLid,
+                            'key.addressingMode': 'lid',
+                            'key.remoteJidAlt': { 
+                                $exists: true,
+                                $nin: [null, '']
+                            }
                         }
                     ]
                 }, {
-                    projection: { 'key.senderPn': 1 }, // Only fetch the field we need
+                    projection: { 
+                        'key.senderPn': 1, 
+                        'key.remoteJid': 1,
+                        'key.remoteJidAlt': 1,
+                        'key.addressingMode': 1
+                    },
                     maxTimeMS: this.config.contactsQueryMaxTimeMS
                 } as any)
                 
-                if (message?.key?.senderPn && !this.isLidFormat(message.key.senderPn)) {
-                    console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${message.key.senderPn}`)
-                    return message.key.senderPn
+                if (message?.key) {
+                    const addressingMode = (message.key as any)?.addressingMode
+                    const remoteJidAlt = (message.key as any)?.remoteJidAlt
+                    
+                    // NEW FORMAT: Check based on addressingMode
+                    if (addressingMode === 'pn' && message.key.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
+                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=pn): ${normalizedLid} -> ${message.key.remoteJid}`)
+                        return message.key.remoteJid
+                    }
+                    if (addressingMode === 'lid' && remoteJidAlt && !this.isLidFormat(remoteJidAlt)) {
+                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=lid): ${normalizedLid} -> ${remoteJidAlt}`)
+                        return remoteJidAlt
+                    }
+                    
+                    // LEGACY: Check senderPn
+                    const senderPn = (message.key as any)?.senderPn
+                    if (senderPn && !this.isLidFormat(senderPn)) {
+                        console.log(`[LidHandler] Reverse lookup found (legacy): ${normalizedLid} -> ${senderPn}`)
+                        return senderPn
+                    }
                 }
                 
                 return null
@@ -1091,6 +1192,7 @@ export class LidHandler {
             phoneNumber?: string
             mappingStored?: boolean
             needsReverseLookup?: boolean
+            addressingMode?: string
             debug?: string[]
         }
     }> {

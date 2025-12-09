@@ -3402,6 +3402,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
                 // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
                 { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
+                // Supports reverse lookup for new format with remoteJidAlt and addressingMode
+                { name: 'messages_remoteJidAlt_lookup', spec: { instanceId: 1, 'key.addressingMode': 1, 'key.remoteJidAlt': 1 }, options: { sparse: true } },
                 // Index for LID resolution tracking
                 { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } },
                 // Index for media deduplication by fileHash
@@ -5674,15 +5676,49 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {
                             // Enhanced LID handling with complete pattern support
+                            // Supports both new format (remoteJidAlt + addressingMode) and legacy (senderLid + senderPn)
                             if (lidHandler) {
                                 const isFromMe = msg.key.fromMe || false
                                 const remoteJid = msg.key.remoteJid
                                 const senderLid = (msg.key as any)?.senderLid
                                 const senderPn = (msg.key as any)?.senderPn
+                                // NEW FORMAT: Extract remoteJidAlt and addressingMode
+                                const addressingMode = (msg.key as any)?.addressingMode
+                                const remoteJidAlt = (msg.key as any)?.remoteJidAlt
                                 
-                                // Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
-                                if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
-                                    log(`[LID] Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
+                                // NEW PATTERN A: addressingMode='pn' - Incoming message (customer to bot)
+                                // remoteJid is phone number, remoteJidAlt is LID
+                                if (addressingMode === 'pn' && remoteJidAlt && lidHandler.isLidFormat(remoteJidAlt) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] New Pattern A: addressingMode=pn, remoteJid=phone, remoteJidAlt=lid`)
+                                    log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
+                                    
+                                    // Store the mapping (lid -> phone)
+                                    await lidHandler.storeLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    
+                                    // jid is already the phone number, no change needed
+                                    // Update existing messages with this LID
+                                    await lidHandler.updateExistingMessages(remoteJidAlt, remoteJid)
+                                }
+                                // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
+                                // remoteJid is LID, remoteJidAlt is phone number
+                                else if (addressingMode === 'lid' && remoteJidAlt && !lidHandler.isLidFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] New Pattern B: addressingMode=lid, remoteJid=lid, remoteJidAlt=phone`)
+                                    log(`[LID] Discovering: ${remoteJid} -> ${remoteJidAlt}`)
+                                    
+                                    // Store the mapping (lid -> phone)
+                                    // Outgoing message: do not persist pushName (it's our own)
+                                    await lidHandler.storeLidMapping(remoteJid, remoteJidAlt)
+                                    
+                                    // Update message to use phone number
+                                    msg.key.remoteJid = remoteJidAlt
+                                    jid = remoteJidAlt
+                                    
+                                    // Update existing messages with this LID
+                                    await lidHandler.updateExistingMessages(remoteJid, remoteJidAlt)
+                                }
+                                // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
+                                else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
+                                    log(`[LID] Legacy Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
                                     log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
                                     
                                     // Store the mapping
@@ -5695,9 +5731,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     // Update existing messages with this LID
                                     await lidHandler.updateExistingMessages(remoteJid, senderPn)
                                 }
-                                // Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
+                                // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
                                 else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
-                                    log(`[LID] Pattern 2: FromMe=true, LID remoteJid (need reverse lookup)`)
+                                    log(`[LID] Legacy Pattern 2: FromMe=true, LID remoteJid (need reverse lookup)`)
                                     
                                     // First check if we already have a mapping
                                     let phoneNumber = await lidHandler.getPhoneNumberFromLid(remoteJid)
@@ -5753,9 +5789,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 // Store debug info in message
-                                if ((remoteJid && lidHandler.isLidFormat(remoteJid)) || senderLid || (senderPn && lidHandler.isLidFormat(senderPn))) {
+                                // Include both new format fields and legacy fields for debugging
+                                if ((remoteJid && lidHandler.isLidFormat(remoteJid)) || senderLid || (senderPn && lidHandler.isLidFormat(senderPn)) || addressingMode || remoteJidAlt) {
                                     (msg as any).lidDebug = {
                                         originalRemoteJid: remoteJid,
+                                        // New format fields
+                                        addressingMode,
+                                        remoteJidAlt,
+                                        // Legacy fields
                                         senderLid,
                                         senderPn,
                                         fromMe: isFromMe,
@@ -6981,6 +7022,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
                         // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
                         { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
+                        // Supports reverse lookup for new format with remoteJidAlt and addressingMode
+                        { name: 'messages_remoteJidAlt_lookup', spec: { instanceId: 1, 'key.addressingMode': 1, 'key.remoteJidAlt': 1 }, options: { sparse: true } },
                         // Index for LID resolution tracking
                         { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } },
                         // Index for media deduplication by fileHash
