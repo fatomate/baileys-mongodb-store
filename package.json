@@ -28,7 +28,6 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "baileys": "^6.7.18",
     "bullmq": "^5.58.4",
     "ioredis": "^5.7.0",
     "mongodb": "^6.3.0",
