@@ -547,7 +547,7 @@ export async function downloadMedia(
         }
         
         // Skip group messages if configured
-        if (config.skipGroupMessages && message.key.remoteJid?.includes('@g.us')) {
+        if (config.skipGroupMessages && message.key?.remoteJid?.includes('@g.us')) {
             return { success: false, error: 'Group message skipped' }
         }
         
@@ -563,7 +563,7 @@ export async function downloadMedia(
             const existingPath = await checkExisting(mediaHash)
             if (existingPath) {
                 logger?.info({
-                    messageId: message.key.id,
+                    messageId: message.key?.id,
                     hash: mediaHash,
                     existingPath
                 }, 'Media already exists, reusing file')
@@ -612,7 +612,7 @@ export async function downloadMedia(
         let fileName = mediaHash
             ? `${toBase64Url(mediaHash)}${extension}`
             : generateFileName(
-                message.key.id || 'unknown',
+                message.key?.id || 'unknown',
                 mediaInfo.type,
                 extension,
                 mediaInfo.filename
@@ -693,7 +693,7 @@ export async function downloadMedia(
     } catch (error) {
         logger?.error({
             error: error instanceof Error ? error.message : 'Unknown error',
-            messageId: message.key.id,
+            messageId: message.key?.id,
             instanceId
         }, 'Failed to download media')
         
@@ -831,7 +831,7 @@ export async function downloadOfficialAPIMedia(
         }
         
         // Skip group messages if configured
-        if (config.skipGroupMessages && message.key.remoteJid?.includes('@g.us')) {
+        if (config.skipGroupMessages && message.key?.remoteJid?.includes('@g.us')) {
             return { success: false, error: 'Group message skipped' }
         }
         
@@ -884,7 +884,7 @@ export async function downloadOfficialAPIMedia(
             const existingPath = await checkExisting(mediaId)
             if (existingPath) {
                 logger?.info({
-                    messageId: message.key.id,
+                    messageId: message.key?.id,
                     mediaId,
                     existingPath
                 }, 'Official API media already exists, reusing file')
@@ -1038,7 +1038,7 @@ export async function downloadOfficialAPIMedia(
     } catch (error) {
         logger?.error({
             error: error instanceof Error ? error.message : 'Unknown error',
-            messageId: message.key.id,
+            messageId: message.key?.id,
             instanceId
         }, 'Failed to download Official API media')
         

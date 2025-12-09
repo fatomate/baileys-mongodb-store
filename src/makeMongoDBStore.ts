@@ -712,7 +712,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                             'message.protocolMessage': message.message.protocolMessage,
                                             revoked: true,
                                             revokedAt: new Date(),
-                                            revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                            revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid
                                         }
                                     }
                                 )
@@ -1236,7 +1236,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         filter: {
                             instanceId: validatedInstanceId,
                             jid,
-                            'key.id': message.key.id
+                            'key.id': message.key?.id
                         },
                         replacement: {
                             ...message,
@@ -2246,7 +2246,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                         'message.protocolMessage': message.message.protocolMessage,
                                         revoked: true,
                                         revokedAt: new Date(),
-                                        revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                        revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid
                                     }
                                 }
                             )
@@ -3182,10 +3182,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             ev.on('group-participants.update', async ({ id, participants, action }) => {
                 const metadata = await store.getGroupMetadata(id)
                 if (metadata) {
+                    // Extract participant IDs (participants can be GroupParticipant objects or strings)
+                    const participantIds = participants.map(p => typeof p === 'string' ? p : p.id)
                     switch (action) {
                         case 'add':
-                            metadata.participants.push(...participants.map(id => ({ 
-                                id, 
+                            metadata.participants.push(...participantIds.map(participantId => ({ 
+                                id: participantId, 
                                 isAdmin: false, 
                                 isSuperAdmin: false 
                             })))
@@ -3193,13 +3195,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         case 'demote':
                         case 'promote':
                             for (const participant of metadata.participants) {
-                                if (participants.includes(participant.id)) {
+                                if (participantIds.includes(participant.id)) {
                                     participant.isAdmin = action === 'promote'
                                 }
                             }
                             break
                         case 'remove':
-                            metadata.participants = metadata.participants.filter(p => !participants.includes(p.id))
+                            metadata.participants = metadata.participants.filter(p => !participantIds.includes(p.id))
                             break
                     }
                     await store.upsertGroupMetadata(id, metadata)

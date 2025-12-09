@@ -1343,7 +1343,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Handle REVOKE messages
                     if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
                         const revokedKey = message.message.protocolMessage.key
-                        const outerChatJid = message.key.remoteJid || jid
+                        const outerChatJid = message.key?.remoteJid || jid
                         
                         // Prefer outer chat JID and normalize via LID if available
                         let targetJid = outerChatJid
@@ -1358,7 +1358,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             'message.protocolMessage': message.message?.protocolMessage,
                             revoked: true,
                             revokedAt: new Date(),
-                            revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid,
+                            revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
                             messageStubType: 1
                         }
                         
@@ -2126,7 +2126,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                         if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
                             const revokedKey = message.message.protocolMessage.key
-                            const outerChatJid = message.key.remoteJid || jid
+                            const outerChatJid = message.key?.remoteJid || jid
                             
                             // Prefer outer chat JID and normalize via LID if available
                             let targetJid = outerChatJid
@@ -2142,7 +2142,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     'message.protocolMessage': message.message?.protocolMessage,
                                     revoked: true,
                                     revokedAt: new Date(),
-                                    revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid,
+                                    revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
                                     messageStubType: 1
                                 }
                                 
@@ -6288,17 +6288,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     try {
                         const metadata = await storeImpl.getGroupMetadata(id)
                         if (metadata) {
+                            // Extract participant IDs (participants can be GroupParticipant objects or strings)
+                            const participantIds = participants.map(p => typeof p === 'string' ? p : p.id)
                             if (action === 'add') {
-                                metadata.participants.push(...participants.map(id => ({ id, admin: null })))
+                                metadata.participants.push(...participantIds.map(participantId => ({ id: participantId, admin: null })))
                             } else if (action === 'remove') {
-                                metadata.participants = metadata.participants.filter(p => !participants.includes(p.id))
+                                metadata.participants = metadata.participants.filter(p => !participantIds.includes(p.id))
                             } else if (action === 'promote') {
                                 metadata.participants.forEach(p => {
-                                    if (participants.includes(p.id)) p.admin = 'admin'
+                                    if (participantIds.includes(p.id)) p.admin = 'admin'
                                 })
                             } else if (action === 'demote') {
                                 metadata.participants.forEach(p => {
-                                    if (participants.includes(p.id)) p.admin = null
+                                    if (participantIds.includes(p.id)) p.admin = null
                                 })
                             }
                             await storeImpl.upsertGroupMetadata(id, metadata)
@@ -6458,7 +6460,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     // Group messages by chat for batch processing
                                     const messagesByChat = new Map<string, proto.IWebMessageInfo[]>()
                                     for (const msg of allMessages) {
-                                        const chatId = msg.key.remoteJid!
+                                        const chatId = msg.key?.remoteJid
+                                        if (!chatId) continue
                                         if (!messagesByChat.has(chatId)) {
                                             messagesByChat.set(chatId, [])
                                         }
