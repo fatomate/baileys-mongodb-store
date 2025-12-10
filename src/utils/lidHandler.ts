@@ -10,6 +10,7 @@ import {
     extractLidPhonePair
 } from './jidUtils'
 import { retryWithBackoff } from './connectionRetry'
+import type { BaileysLIDMappingStore, BaileysLIDMapping } from './lidCompatibility'
 
 export interface LidMapping {
     instanceId: string
@@ -90,6 +91,9 @@ export class LidHandler {
     private lookupQueue: Array<() => void> = []
     private missBackoffCounts: Map<string, number> = new Map()
     private redis: Redis | null = null
+    
+    // Baileys v7 native LID mapping store reference
+    private baileysLidMappingStore: BaileysLIDMappingStore | null = null
 
     constructor(instanceId: string, config?: LidHandlerConfig) {
         this.instanceId = instanceId
@@ -1347,5 +1351,246 @@ export class LidHandler {
     async cleanupOldMappings(_daysOld: number = 90): Promise<number> {
         // No-op: contacts do not use lidLastSeen/lidMappingUpdatedAt anymore; avoid unintended cleanup
         return 0
+    }
+
+    // ==========================================
+    // Baileys v7 Native LID Mapping Integration
+    // ==========================================
+
+    /**
+     * Set the Baileys v7 native LID mapping store reference
+     * This enables direct integration with Baileys' internal LID mapping
+     * 
+     * @param store - Baileys v7 LIDMappingStore (sock.signalRepository.lidMapping)
+     */
+    setBaileysLidMappingStore(store: BaileysLIDMappingStore | null): void {
+        this.baileysLidMappingStore = store
+        if (store) {
+            console.log('[LidHandler] Baileys v7 native LID mapping store connected')
+        }
+    }
+
+    /**
+     * Get the Baileys v7 native LID mapping store reference
+     */
+    getBaileysLidMappingStore(): BaileysLIDMappingStore | null {
+        return this.baileysLidMappingStore
+    }
+
+    /**
+     * Check if Baileys v7 native store is available
+     */
+    hasNativeStore(): boolean {
+        return this.baileysLidMappingStore !== null
+    }
+
+    /**
+     * Sync a mapping from Baileys v7 native store to MongoDB
+     * Returns the LID if found, null otherwise
+     * 
+     * @param pn - Phone number JID (@s.whatsapp.net)
+     */
+    async syncFromBaileysStore(pn: string): Promise<string | null> {
+        if (!this.baileysLidMappingStore) {
+            return null
+        }
+
+        try {
+            const lid = await this.baileysLidMappingStore.getLIDForPN(pn)
+            if (lid) {
+                // Store in MongoDB for persistence
+                await this.storeLidMapping(lid, pn)
+                console.log(`[LidHandler] Synced from Baileys store: ${lid} -> ${pn}`)
+                return lid
+            }
+        } catch (err) {
+            console.debug('[LidHandler] syncFromBaileysStore failed:', (err as Error).message)
+        }
+
+        return null
+    }
+
+    /**
+     * Batch sync multiple PNs from Baileys v7 native store to MongoDB
+     * 
+     * @param pns - Array of phone number JIDs (@s.whatsapp.net)
+     * @returns Map of PN -> LID for successfully synced mappings
+     */
+    async batchSyncFromBaileysStore(pns: string[]): Promise<Map<string, string>> {
+        const result = new Map<string, string>()
+        
+        if (!this.baileysLidMappingStore || pns.length === 0) {
+            return result
+        }
+
+        try {
+            const mappings = await this.baileysLidMappingStore.getLIDsForPNs(pns)
+            if (mappings) {
+                for (const mapping of mappings) {
+                    const { pn, lid } = mapping
+                    result.set(pn, lid)
+                    
+                    // Store in MongoDB for persistence
+                    try {
+                        await this.storeLidMapping(lid, pn)
+                    } catch (err) {
+                        console.debug('[LidHandler] Failed to persist mapping:', (err as Error).message)
+                    }
+                }
+                
+                if (result.size > 0) {
+                    console.log(`[LidHandler] Batch synced ${result.size} mappings from Baileys store`)
+                }
+            }
+        } catch (err) {
+            console.debug('[LidHandler] batchSyncFromBaileysStore failed:', (err as Error).message)
+        }
+
+        return result
+    }
+
+    /**
+     * Sync a mapping to Baileys v7 native store from MongoDB
+     * Useful for restoring mappings after reconnection
+     * 
+     * @param lid - LID JID (@lid)
+     * @param phoneNumber - Phone number JID (@s.whatsapp.net)
+     */
+    async syncToBaileysStore(lid: string, phoneNumber: string): Promise<boolean> {
+        if (!this.baileysLidMappingStore) {
+            return false
+        }
+
+        try {
+            // Use storeLIDPNMappings for batch efficiency (single item)
+            if (this.baileysLidMappingStore.storeLIDPNMappings) {
+                await this.baileysLidMappingStore.storeLIDPNMappings([{ lid, pn: phoneNumber }])
+                console.log(`[LidHandler] Synced to Baileys store: ${lid} -> ${phoneNumber}`)
+                return true
+            }
+        } catch (err) {
+            console.debug('[LidHandler] syncToBaileysStore failed:', (err as Error).message)
+        }
+
+        return false
+    }
+
+    /**
+     * Sync all MongoDB mappings to Baileys v7 native store
+     * Useful for restoring all mappings on reconnection
+     * 
+     * @returns Number of mappings successfully synced
+     */
+    async syncAllToBaileysStore(): Promise<{ synced: number; failed: number }> {
+        let synced = 0
+        let failed = 0
+        
+        if (!this.baileysLidMappingStore?.storeLIDPNMappings) {
+            return { synced, failed }
+        }
+
+        try {
+            const allMappings = await this.getAllMappings()
+            if (allMappings.length === 0) {
+                return { synced, failed }
+            }
+
+            // Convert to Baileys format and batch sync
+            const baileysFormat: BaileysLIDMapping[] = allMappings.map(m => ({
+                lid: m.lid,
+                pn: m.phoneNumber
+            }))
+
+            try {
+                await this.baileysLidMappingStore.storeLIDPNMappings(baileysFormat)
+                synced = allMappings.length
+                console.log(`[LidHandler] Synced ${synced} mappings to Baileys store`)
+            } catch (err) {
+                console.error('[LidHandler] Batch sync to Baileys store failed:', (err as Error).message)
+                failed = allMappings.length
+            }
+        } catch (err) {
+            console.error('[LidHandler] Failed to get mappings for sync:', (err as Error).message)
+        }
+
+        return { synced, failed }
+    }
+
+    /**
+     * Handle lid-mapping.update event from Baileys v7
+     * Stores the mapping in MongoDB
+     * 
+     * @param data - Event data containing lid and pn
+     */
+    async handleLidMappingUpdate(data: { lid: string; pn: string }): Promise<void> {
+        const { lid, pn } = data
+        
+        if (!lid || !pn) {
+            console.debug('[LidHandler] Invalid lid-mapping.update data:', data)
+            return
+        }
+
+        console.log(`[LidHandler] Received lid-mapping.update: ${lid} -> ${pn}`)
+        
+        // Store in MongoDB
+        await this.storeLidMapping(lid, pn)
+    }
+
+    /**
+     * Get LID for a phone number, trying Baileys v7 native store first
+     * Falls back to MongoDB if native store doesn't have the mapping
+     * 
+     * @param pn - Phone number JID (@s.whatsapp.net)
+     */
+    async getLidWithNativeFallback(pn: string): Promise<string | null> {
+        // Try native store first if available
+        if (this.baileysLidMappingStore) {
+            try {
+                const lid = await this.baileysLidMappingStore.getLIDForPN(pn)
+                if (lid) {
+                    // Also persist to MongoDB
+                    try {
+                        await this.storeLidMapping(lid, pn)
+                    } catch {
+                        // Ignore persistence errors
+                    }
+                    return lid
+                }
+            } catch (err) {
+                console.debug('[LidHandler] Native getLIDForPN failed:', (err as Error).message)
+            }
+        }
+
+        // Fall back to MongoDB
+        return this.getLidFromPhoneNumber(pn)
+    }
+
+    /**
+     * Get phone number for a LID, trying Baileys v7 native store first
+     * Falls back to MongoDB if native store doesn't have the mapping
+     * 
+     * @param lid - LID JID (@lid)
+     */
+    async getPhoneWithNativeFallback(lid: string): Promise<string | null> {
+        // Try native store first if available
+        if (this.baileysLidMappingStore) {
+            try {
+                const pn = await this.baileysLidMappingStore.getPNForLID(lid)
+                if (pn) {
+                    // Also persist to MongoDB
+                    try {
+                        await this.storeLidMapping(lid, pn)
+                    } catch {
+                        // Ignore persistence errors
+                    }
+                    return pn
+                }
+            } catch (err) {
+                console.debug('[LidHandler] Native getPNForLID failed:', (err as Error).message)
+            }
+        }
+
+        // Fall back to MongoDB
+        return this.getPhoneNumberFromLid(lid)
     }
 }

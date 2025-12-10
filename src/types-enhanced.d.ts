@@ -34,6 +34,7 @@ export type StorableEventType =
     | 'group-participants.update'
     | 'message-receipt.update'
     | 'messages.reaction'
+    | 'lid-mapping.update'  // Baileys v7+ LID mapping update event
 
 /**
  * Configuration for individual event storage
@@ -97,6 +98,7 @@ export interface EventsConfig {
     'group-participants.update'?: EventStorageConfig
     'message-receipt.update'?: EventStorageConfig
     'messages.reaction'?: EventStorageConfig
+    'lid-mapping.update'?: EventStorageConfig  // Baileys v7+ LID mapping update event
 }
 
 /**
@@ -472,6 +474,83 @@ export interface EnhancedMongoDBStoreConfig {
          * Default: 30000 (30 seconds)
          */
         indexCreationTimeout?: number
+    }
+    
+    /**
+     * LID handling configuration for Baileys v7+
+     * Controls how LID-to-phone number mappings are managed
+     */
+    lidConfig?: {
+        /**
+         * Enable LID handling
+         * Default: true
+         */
+        enabled?: boolean
+        /**
+         * Delay between LID lookup requests in milliseconds
+         * Default: 500
+         */
+        requestDelay?: number
+        /**
+         * Number of retry attempts for failed lookups
+         * Default: 3
+         */
+        retryAttempts?: number
+        /**
+         * Maximum concurrent LID lookups
+         * Default: 10
+         */
+        maxConcurrentLookups?: number
+        /**
+         * TTL in seconds for negative cache entries (lookups with no result)
+         * Default: 300
+         */
+        negativeCacheTTL?: number
+        /**
+         * Enable LID lookups (set to false to only use cached mappings)
+         * Default: true
+         */
+        lookupsEnabled?: boolean
+        /**
+         * Prefer reverse lookup from messages before querying contacts
+         * Default: true
+         */
+        preferReverseLookupFirst?: boolean
+        /**
+         * Maximum time in ms for contacts collection queries
+         * Default: 500
+         */
+        contactsQueryMaxTimeMS?: number
+        /**
+         * Enable dynamic backoff for negative cache TTL
+         * Default: true
+         */
+        dynamicNegativeBackoff?: boolean
+        /**
+         * Minimum negative cache TTL in seconds (when backoff enabled)
+         * Default: 300
+         */
+        minNegativeCacheTTL?: number
+        /**
+         * Maximum negative cache TTL in seconds (when backoff enabled)
+         * Default: 3600
+         */
+        maxNegativeCacheTTL?: number
+        /**
+         * Enable proactive LID resolution for historical messages
+         * Default: false
+         */
+        proactiveHistoryResolution?: boolean
+        /**
+         * Sync MongoDB mappings to Baileys v7 native store on startup
+         * Default: false
+         */
+        syncToNativeStoreOnInit?: boolean
+        /**
+         * Listen for lid-mapping.update events from Baileys v7
+         * Default: true
+         */
+        handleLidMappingEvents?: boolean
     }
 }
 

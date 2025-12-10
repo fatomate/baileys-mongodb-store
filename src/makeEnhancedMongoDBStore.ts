@@ -4203,6 +4203,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             // Fetch LIDs asynchronously in the background
+            // Supports both Baileys v7 (signalRepository.lidMapping) and legacy (onWhatsApp) APIs
             if (finalLidConfig?.enabled && sock) {
                 setImmediate(async () => {
                     const lidFetchPromise = (async () => {
@@ -4215,6 +4216,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         const requestDelay = finalLidConfig.requestDelay || 500 // Increased default delay for rate limiting
                         const maxRetries = finalLidConfig.retryAttempts || 3
 
+                        // Check if Baileys v7 native LID mapping store is available
+                        const hasNativeStore = !!(sock?.signalRepository?.lidMapping?.getLIDForPN)
+                        
+                        if (hasNativeStore) {
+                            log(`📍 [Contacts] Using Baileys v7 native LID mapping store`)
+                        } else if (sock?.onWhatsApp) {
+                            log(`📍 [Contacts] Using legacy onWhatsApp API for LID fetch`)
+                        } else {
+                            log(`⚠️ [Contacts] No LID fetch API available, skipping`)
+                            return
+                        }
+
+                        // Collect contacts that need LID lookup
+                        const contactsToFetch: string[] = []
                         for (const contact of contacts) {
                             // Only fetch LIDs for user JIDs (@s.whatsapp.net)
                             // Skip groups (@g.us) and LIDs (@lid)
@@ -4229,56 +4244,136 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 log(`⏭️ [Contacts] Skipping LID for ${contact.id} (already has LID)`)
                                 continue
                             }
+                            
+                            contactsToFetch.push(contact.id)
+                        }
+                        
+                        if (contactsToFetch.length === 0) {
+                            log(`✅ [Contacts] No contacts need LID fetch`)
+                            return
+                        }
 
-                            // Rate limiting: add delay between requests
-                            if (requestDelay > 0) {
-                                await new Promise(resolve => setTimeout(resolve, requestDelay))
-                            }
-
-                            log(`📍 [Contacts] Fetching LID for ${contact.id}`)
-
-                            let attempts = 0
-                            let lid: string | undefined
-
-                            while (attempts < maxRetries && !lid) {
-                                try {
-                                    // Check if store is closing or sock is null
+                        // Baileys v7: Use batch getLIDsForPNs for efficiency
+                        if (hasNativeStore && sock) {
+                            try {
+                                const nativeStore = sock.signalRepository.lidMapping
+                                const batchSize = 50 // Process in batches to avoid overwhelming
+                                
+                                for (let i = 0; i < contactsToFetch.length; i += batchSize) {
                                     if (isClosing || !sock) {
-                                        log(`⚠️ [Contacts] Stopping LID fetch - ${isClosing ? 'closing' : 'no socket'}`)
+                                        log(`⚠️ [Contacts] Stopping LID fetch - store closing`)
                                         break
                                     }
-
-                                    const result = await sock.onWhatsApp(contact.id) as Array<{ jid: string; exists: boolean; lid?: string }> | undefined
-
-                                    if (result && result.length > 0 && result[0].exists && result[0].lid) {
-                                        lid = result[0].lid
-                                        // Update contact with LID
-                                        await withConnection(async () =>
-                                            collections.contacts.updateOne(
-                                                { instanceId, id: contact.id },
-                                                {
-                                                    $set: {
-                                                        lid,
-                                                        updatedAt: new Date()
+                                    
+                                    const batch = contactsToFetch.slice(i, i + batchSize)
+                                    
+                                    try {
+                                        const mappings = await nativeStore.getLIDsForPNs(batch)
+                                        
+                                        if (mappings && mappings.length > 0) {
+                                            for (const mapping of mappings) {
+                                                const { pn, lid } = mapping
+                                                
+                                                // Update contact with LID in MongoDB
+                                                await withConnection(async () =>
+                                                    collections.contacts.updateOne(
+                                                        { instanceId, id: pn },
+                                                        {
+                                                            $set: {
+                                                                lid,
+                                                                updatedAt: new Date()
+                                                            }
+                                                        }
+                                                    )
+                                                )
+                                                
+                                                // Also store in LidHandler for cache
+                                                if (lidHandler) {
+                                                    try {
+                                                        await lidHandler.storeLidMapping(lid, pn)
+                                                    } catch {
+                                                        // Ignore cache errors
                                                     }
                                                 }
-                                            )
-                                        )
-
-                                        log(`✅ [Contacts] Updated LID for ${contact.id}`)
-                                        break
+                                                
+                                                log(`✅ [Contacts] Updated LID for ${pn} via v7 API`)
+                                            }
+                                        }
+                                    } catch (batchError: any) {
+                                        log(`⚠️ [Contacts] Batch LID fetch failed: ${batchError?.message}`)
                                     }
-                                } catch (error: any) {
-                                    attempts++
-                                    if (attempts < maxRetries) {
-                                        log(`⚠️ [Contacts] Retry ${attempts}/${maxRetries} for ${contact.id}: ${error?.message}`)
-                                        await new Promise(resolve => setTimeout(resolve, requestDelay * 2))
+                                    
+                                    // Rate limiting between batches
+                                    if (requestDelay > 0 && i + batchSize < contactsToFetch.length) {
+                                        await new Promise(resolve => setTimeout(resolve, requestDelay))
                                     }
                                 }
+                            } catch (error: any) {
+                                log(`❌ [Contacts] Native LID fetch failed: ${error?.message}`)
                             }
+                        } 
+                        // Legacy: Use onWhatsApp API (Baileys v6 and earlier)
+                        else if (sock?.onWhatsApp) {
+                            for (const contactId of contactsToFetch) {
+                                // Rate limiting: add delay between requests
+                                if (requestDelay > 0) {
+                                    await new Promise(resolve => setTimeout(resolve, requestDelay))
+                                }
 
-                            if (!lid && attempts >= maxRetries) {
-                                log(`❌ [Contacts] Failed to fetch LID for ${contact.id} after ${maxRetries} attempts`)
+                                log(`📍 [Contacts] Fetching LID for ${contactId}`)
+
+                                let attempts = 0
+                                let lid: string | undefined
+
+                                while (attempts < maxRetries && !lid) {
+                                    try {
+                                        // Check if store is closing or sock is null
+                                        if (isClosing || !sock) {
+                                            log(`⚠️ [Contacts] Stopping LID fetch - ${isClosing ? 'closing' : 'no socket'}`)
+                                            break
+                                        }
+
+                                        const result = await sock.onWhatsApp(contactId) as Array<{ jid: string; exists: boolean; lid?: string }> | undefined
+
+                                        if (result && result.length > 0 && result[0].exists && result[0].lid) {
+                                            lid = result[0].lid
+                                            // Update contact with LID
+                                            await withConnection(async () =>
+                                                collections.contacts.updateOne(
+                                                    { instanceId, id: contactId },
+                                                    {
+                                                        $set: {
+                                                            lid,
+                                                            updatedAt: new Date()
+                                                        }
+                                                    }
+                                                )
+                                            )
+
+                                            // Also store in LidHandler for cache
+                                            if (lidHandler) {
+                                                try {
+                                                    await lidHandler.storeLidMapping(lid, contactId)
+                                                } catch {
+                                                    // Ignore cache errors
+                                                }
+                                            }
+
+                                            log(`✅ [Contacts] Updated LID for ${contactId}`)
+                                            break
+                                        }
+                                    } catch (error: any) {
+                                        attempts++
+                                        if (attempts < maxRetries) {
+                                            log(`⚠️ [Contacts] Retry ${attempts}/${maxRetries} for ${contactId}: ${error?.message}`)
+                                            await new Promise(resolve => setTimeout(resolve, requestDelay * 2))
+                                        }
+                                    }
+                                }
+
+                                if (!lid && attempts >= maxRetries) {
+                                    log(`❌ [Contacts] Failed to fetch LID for ${contactId} after ${maxRetries} attempts`)
+                                }
                             }
                         }
 
@@ -6622,6 +6717,59 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
             })
+            
+            // Baileys v7+ LID mapping update event
+            // This event is emitted when Baileys discovers a new LID-to-phone number mapping
+            ev.on('lid-mapping.update', async (data: { lid: string; pn: string }) => {
+                if (enableMetrics) updateEventMetrics('lid-mapping.update', 'received')
+                
+                // Check if LID mapping handling is enabled
+                const handleLidMappingEvents = finalLidConfig?.handleLidMappingEvents !== false
+                if (!handleLidMappingEvents) {
+                    log(`[${instanceId}] Skipping lid-mapping.update event (disabled in config)`)
+                    return
+                }
+                
+                if (await shouldStoreEvent('lid-mapping.update', data)) {
+                    try {
+                        const { lid, pn } = data
+                        
+                        if (!lid || !pn) {
+                            log(`[${instanceId}] Invalid lid-mapping.update data: missing lid or pn`)
+                            return
+                        }
+                        
+                        log(`📍 [LID Mapping Update] Received: ${lid} -> ${pn}`)
+                        
+                        // Store the mapping in MongoDB via LidHandler
+                        if (lidHandler) {
+                            await lidHandler.handleLidMappingUpdate(data)
+                            
+                            // Also update the contact if it exists
+                            await withConnection(async () =>
+                                collections.contacts.updateOne(
+                                    { instanceId: validatedInstanceId, id: pn },
+                                    {
+                                        $set: {
+                                            lid,
+                                            updatedAt: new Date()
+                                        }
+                                    },
+                                    { upsert: false }
+                                )
+                            )
+                        }
+                        
+                        if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('lid-mapping.update', data)
+                        
+                        log(`✅ [LID Mapping Update] Stored: ${lid} -> ${pn}`)
+                    } catch (error) {
+                        logError(`[${instanceId}] Failed to process lid-mapping.update:`, error)
+                        if (enableMetrics) updateEventMetrics('lid-mapping.update', 'error')
+                    }
+                }
+            })
         },
 
         // Method to update socket reference after store creation
@@ -6650,6 +6798,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`[${instanceId}] Enabled reuploadRequest for media downloads`)
                 }
             } catch {}
+
+            // Baileys v7: Connect LidHandler to native LID mapping store
+            if (lidHandler && socket?.signalRepository?.lidMapping) {
+                log(`[${instanceId}] Connecting LidHandler to Baileys v7 native LID mapping store`)
+                lidHandler.setBaileysLidMappingStore(socket.signalRepository.lidMapping)
+                
+                // Optionally sync MongoDB mappings to native store on init
+                if (finalLidConfig?.syncToNativeStoreOnInit) {
+                    log(`[${instanceId}] Syncing MongoDB LID mappings to Baileys native store`)
+                    lidHandler.syncAllToBaileysStore().then(result => {
+                        log(`[${instanceId}] LID sync to native store: ${result.synced} synced, ${result.failed} failed`)
+                    }).catch(err => {
+                        logWarn(`[${instanceId}] Failed to sync LID mappings to native store:`, err)
+                    })
+                }
+            } else if (lidHandler) {
+                // Clear native store reference if socket doesn't have v7 API
+                lidHandler.setBaileysLidMappingStore(null)
+                if (socket && !socket?.signalRepository?.lidMapping) {
+                    log(`[${instanceId}] Socket does not have Baileys v7 LID mapping API, using legacy mode`)
+                }
+            }
 
         },
 
