@@ -36,6 +36,12 @@ export interface ConnectionPool {
     acceptingOperations?: boolean
 }
 
+export interface PendingMigration {
+    fromPoolId: string
+    toPoolId: string
+    createdAt: Date
+}
+
 export interface ConnectionConfig {
     tier?: ConnectionTier           // Initial tier hint (optional)
     autoAdjust?: boolean            // Enable automatic tier adjustment (default: true)
@@ -95,7 +101,7 @@ export interface ConnectionMetrics {
 export interface PoolSelectionResult {
     pool: ConnectionPool
     isNew: boolean
-    reason: 'existing' | 'created' | 'promoted' | 'demoted'
+    reason: 'existing' | 'created' | 'promoted' | 'demoted' | 'dedicated'
 }
 
 export interface InstanceRegistration {
@@ -103,4 +109,15 @@ export interface InstanceRegistration {
     uri: string
     database: string
     config?: ConnectionConfig
+}
+
+export interface InstanceRegistrationResult {
+    client: MongoClient
+    db: Db
+    poolId: string
+}
+
+export interface InstancePoolState {
+    currentPoolId?: string
+    pendingMigration?: PendingMigration
 }

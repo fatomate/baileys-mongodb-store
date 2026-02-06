@@ -51,6 +51,12 @@ const store = await makeEnhancedMongoDBStore({
 | `maxRetries` | number | 3 | Number of retry attempts for failed downloads |
 | `retryDelay` | number | 1000 | Delay between retries in milliseconds |
 | `downloadTimeout` | number | 30000 | Timeout for download operations in milliseconds |
+| `timeoutPerMB` | number | 3000 | Additional timeout per MB when size is known |
+| `iosHeicSupport` | boolean | true | Enable HEIC/HEIF support for iOS images |
+| `enableMediaDebug` | boolean | false | Verbose debug logging for media operations |
+| `officialAPI.maxUrlCacheMs` | number | 60000 | Cache TTL for mediaId→URL resolution |
+| `officialAPI.step1TimeoutMs` | number | 20000 | Timeout for Official API URL resolution |
+| `officialAPI.step2TimeoutMs` | number | 60000 | Timeout for Official API media download |
 
 ### Media Types
 

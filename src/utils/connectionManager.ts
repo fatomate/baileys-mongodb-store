@@ -1,4 +1,4 @@
-import { MongoClient, Db, MongoClientOptions } from 'mongodb'
+import { MongoClient, MongoClientOptions } from 'mongodb'
 import {
     ConnectionTier,
     TierConfiguration,
@@ -9,7 +9,10 @@ import {
     ConnectionMetrics,
     PoolSelectionResult,
     InstanceRegistration,
-    TierClassificationRules
+    TierClassificationRules,
+    PendingMigration,
+    InstanceRegistrationResult,
+    InstancePoolState
 } from '../types/connection'
 
 /**
@@ -23,6 +26,7 @@ export class ConnectionManager {
     private pools: Map<string, ConnectionPool> = new Map()
     private instanceMetrics: Map<string, InstanceMetrics> = new Map()
     private instancePools: Map<string, string> = new Map() // instanceId -> poolId
+    private pendingMigrations: Map<string, PendingMigration> = new Map()
     
     // Configuration
     private config: Required<ConnectionManagerConfig>
@@ -36,6 +40,51 @@ export class ConnectionManager {
     
     // Logging
     private logLevel: ConnectionManagerConfig['logLevel'] = 'none'
+
+    private redactConnectionString(input: string): string {
+        if (!input) {
+            return input
+        }
+
+        try {
+            if (/mongodb(\+srv)?:\/\//i.test(input)) {
+                const sanitized = input.replace(/:\/\/([^:@]+):([^@]+)@/i, '://$1:***@')
+                const url = new URL(sanitized)
+                url.search = ''
+                return url.toString()
+            }
+            return input
+        } catch (error) {
+            return input
+        }
+    }
+
+    public beginInstanceOperation(instanceId: string): () => void {
+        const poolId = this.instancePools.get(instanceId)
+        if (!poolId) {
+            return () => {}
+        }
+
+        const pool = this.pools.get(poolId)
+        if (!pool) {
+            return () => {}
+        }
+
+        pool.activeOperations++
+        pool.lastUsedAt = new Date()
+
+        let released = false
+        return () => {
+            if (released) {
+                return
+            }
+            released = true
+            if (pool.activeOperations > 0) {
+                pool.activeOperations--
+            }
+            pool.lastUsedAt = new Date()
+        }
+    }
     
     private constructor(config?: ConnectionManagerConfig) {
         // Set default configuration
@@ -99,7 +148,7 @@ export class ConnectionManager {
     /**
      * Register an instance and get a connection
      */
-    public async registerInstance(registration: InstanceRegistration): Promise<{ db: Db; client: MongoClient }> {
+    public async registerInstance(registration: InstanceRegistration): Promise<InstanceRegistrationResult> {
         const { instanceId, uri, database, config } = registration
         
         this.log('info', `Registering instance ${instanceId}`)
@@ -123,18 +172,49 @@ export class ConnectionManager {
         // Update activity
         this.recordActivity(instanceId)
         
-        // Get or create appropriate pool
-        const poolSelection = await this.selectOrCreatePool(instanceId, uri, database, config)
-        
-        // Track instance-pool mapping
-        this.instancePools.set(instanceId, poolSelection.pool.id)
+        const pendingMigration = this.pendingMigrations.get(instanceId)
+        let poolSelection: PoolSelectionResult
+
+        if (pendingMigration) {
+            const pendingPool = this.pools.get(pendingMigration.toPoolId)
+            if (pendingPool) {
+                poolSelection = { pool: pendingPool, isNew: false, reason: 'existing' }
+            } else {
+                poolSelection = await this.selectOrCreatePool(instanceId, uri, database, config)
+            }
+        } else {
+            poolSelection = await this.selectOrCreatePool(instanceId, uri, database, config)
+        }
+
+        const poolId = poolSelection.pool.id
+        this.instancePools.set(instanceId, poolId)
         poolSelection.pool.instances.add(instanceId)
-        
-        this.log('info', `Instance ${instanceId} assigned to pool ${poolSelection.pool.id} (${poolSelection.pool.tier} tier)`)
+        poolSelection.pool.lastUsedAt = new Date()
+
+        if (pendingMigration && poolId === pendingMigration.toPoolId) {
+            const previousPool = this.pools.get(pendingMigration.fromPoolId)
+            this.pendingMigrations.delete(instanceId)
+
+            if (previousPool) {
+                previousPool.instances.delete(instanceId)
+                previousPool.acceptingOperations = true
+
+                if (previousPool.instances.size === 0) {
+                    await this.closePool(previousPool.id)
+                }
+            }
+
+            this.log('info', `Instance ${instanceId} acknowledged migration to pool ${this.redactConnectionString(poolId)}`)
+        } else if (pendingMigration) {
+            this.log('warn', `Pending migration for instance ${instanceId} expected pool ${this.redactConnectionString(pendingMigration.toPoolId)}, but selected ${this.redactConnectionString(poolId)}`)
+        }
+
+        this.log('info', `Instance ${instanceId} assigned to pool ${this.redactConnectionString(poolId)} (${poolSelection.pool.tier} tier)`)
         
         return {
             db: poolSelection.pool.db,
-            client: poolSelection.pool.client
+            client: poolSelection.pool.client,
+            poolId
         }
     }
     
@@ -156,6 +236,18 @@ export class ConnectionManager {
                 }
             }
         }
+
+        const pendingMigration = this.pendingMigrations.get(instanceId)
+        if (pendingMigration) {
+            const pendingPool = this.pools.get(pendingMigration.toPoolId)
+            if (pendingPool) {
+                pendingPool.instances.delete(instanceId)
+                if (pendingPool.instances.size === 0) {
+                    await this.closePool(pendingPool.id)
+                }
+            }
+            this.pendingMigrations.delete(instanceId)
+        }
         
         this.instancePools.delete(instanceId)
         this.instanceMetrics.delete(instanceId)
@@ -175,6 +267,21 @@ export class ConnectionManager {
         if (responseTime !== undefined) {
             // Update average response time
             metrics.avgResponseTime = (metrics.avgResponseTime * (metrics.totalOperations - 1) + responseTime) / metrics.totalOperations
+        }
+    }
+
+    public getInstancePoolState(instanceId: string): InstancePoolState {
+        const pending = this.pendingMigrations.get(instanceId)
+        const currentPoolId = this.instancePools.get(instanceId)
+        return {
+            currentPoolId: currentPoolId ?? undefined,
+            pendingMigration: pending
+                ? {
+                    fromPoolId: pending.fromPoolId,
+                    toPoolId: pending.toPoolId,
+                    createdAt: pending.createdAt
+                }
+                : undefined
         }
     }
     
@@ -292,6 +399,7 @@ export class ConnectionManager {
         this.pools.clear()
         this.instanceMetrics.clear()
         this.instancePools.clear()
+        this.pendingMigrations.clear()
         
         // Clear singleton instance
         ConnectionManager.instance = null
@@ -306,15 +414,27 @@ export class ConnectionManager {
         config?: ConnectionConfig
     ): Promise<PoolSelectionResult> {
         const metrics = this.instanceMetrics.get(instanceId)!
-        const tier = config?.poolStrategy === 'dedicated' ? metrics.tier : metrics.tier
-        
+        const tier = metrics.tier
+
+        if (config?.poolStrategy === 'dedicated') {
+            if (this.getTotalConnections() + this.tierConfigs[tier].minPoolSize > this.config.maxTotalConnections) {
+                await this.closeIdlePools()
+
+                if (this.getTotalConnections() + this.tierConfigs[tier].minPoolSize > this.config.maxTotalConnections) {
+                    throw new Error(`Cannot allocate dedicated pool: would exceed maximum connections (${this.config.maxTotalConnections})`)
+                }
+            }
+            const pool = await this.createPool(uri, database, tier)
+            return { pool, isNew: true, reason: 'dedicated' }
+        }
+
         // Look for existing pool with capacity
         for (const [, pool] of this.pools) {
             if (pool.uri === uri && 
                 pool.database === database && 
                 pool.tier === tier &&
                 pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
-                
+
                 pool.lastUsedAt = new Date()
                 return { pool, isNew: false, reason: 'existing' }
             }
@@ -331,7 +451,7 @@ export class ConnectionManager {
                 this.log('warn', `Connection limit reached, using fallback pool for ${instanceId}`)
                 return { pool: fallbackPool, isNew: false, reason: 'existing' }
             }
-            
+
             throw new Error(`Cannot create new pool: would exceed maximum connections (${this.config.maxTotalConnections})`)
         }
         
@@ -344,7 +464,7 @@ export class ConnectionManager {
         const poolId = `${uri}:${database}:${tier}:${Date.now()}`
         const tierConfig = this.tierConfigs[tier]
         
-        this.log('info', `Creating new ${tier} pool: ${poolId}`)
+        this.log('info', `Creating new ${tier} pool: ${this.redactConnectionString(poolId)}`)
         
         const clientOptions: MongoClientOptions = {
             maxPoolSize: tierConfig.maxPoolSize,
@@ -379,7 +499,7 @@ export class ConnectionManager {
         const pool = this.pools.get(poolId)
         if (!pool) return
         
-        this.log('info', `Closing pool ${poolId}`)
+        this.log('info', `Closing pool ${this.redactConnectionString(poolId)}`)
         
         // Mark pool as closing
         pool.isClosing = true
@@ -389,12 +509,12 @@ export class ConnectionManager {
         
         // Wait for active operations to complete (with timeout)
         const waitForOperations = async () => {
-            const maxWait = 5000 // 5 seconds
+            const maxWait = 15000 // 15 seconds grace
             const startTime = Date.now()
             
             while (pool.activeOperations > 0) {
                 if (Date.now() - startTime > maxWait) {
-                    this.log('warn', `Timeout waiting for operations to complete in pool ${poolId}, forcing close`)
+                    this.log('warn', `Timeout waiting for operations to complete in pool ${this.redactConnectionString(poolId)}, forcing close`)
                     break
                 }
                 await new Promise(resolve => setTimeout(resolve, 100))
@@ -403,15 +523,19 @@ export class ConnectionManager {
         
         try {
             await waitForOperations()
-            
-            // Close the MongoDB client with force flag
-            await pool.client.close(true)
-            
+
+            try {
+                await pool.client.close()
+            } catch (gracefulError) {
+                this.log('warn', `Graceful close failed for pool ${this.redactConnectionString(poolId)} (${gracefulError}), forcing shutdown`)
+                await pool.client.close(true)
+            }
+
             // Wait a bit for the close to complete
             await new Promise(resolve => setTimeout(resolve, 200))
             
         } catch (error) {
-            this.log('error', `Error closing pool ${poolId}: ${error}`)
+            this.log('error', `Error closing pool ${this.redactConnectionString(poolId)}: ${error}`)
         } finally {
             // Always remove from pools map
             this.pools.delete(poolId)
@@ -422,9 +546,15 @@ export class ConnectionManager {
                     this.instancePools.delete(instanceId)
                 }
             }
+
+            for (const [instanceId, migration] of this.pendingMigrations) {
+                if (migration.toPoolId === poolId || migration.fromPoolId === poolId) {
+                    this.pendingMigrations.delete(instanceId)
+                }
+            }
         }
         
-        this.log('info', `Pool ${poolId} closed successfully`)
+        this.log('info', `Pool ${this.redactConnectionString(poolId)} closed successfully`)
     }
     
     private async migrateInstancePool(instanceId: string, fromTier: ConnectionTier, toTier: ConnectionTier): Promise<void> {
@@ -433,26 +563,34 @@ export class ConnectionManager {
         
         const currentPool = this.pools.get(currentPoolId)
         if (!currentPool) return
-        
+
+        if (this.pendingMigrations.has(instanceId)) {
+            this.log('warn', `Migration already pending for instance ${instanceId}`)
+            return
+        }
+
         // Get registration info from current pool
         const { uri, database } = currentPool
-        
+
         // Find or create new pool
         const newPoolSelection = await this.selectOrCreatePool(instanceId, uri, database)
-        
-        // Remove from old pool
-        currentPool.instances.delete(instanceId)
-        
-        // Add to new pool
-        newPoolSelection.pool.instances.add(instanceId)
-        this.instancePools.set(instanceId, newPoolSelection.pool.id)
-        
-        // Close old pool if empty
-        if (currentPool.instances.size === 0) {
-            await this.closePool(currentPoolId)
+
+        const pendingMigration: PendingMigration = {
+            fromPoolId: currentPoolId,
+            toPoolId: newPoolSelection.pool.id,
+            createdAt: new Date()
         }
-        
-        this.log('info', `Migrated instance ${instanceId} from ${fromTier} to ${toTier}`)
+
+        this.pendingMigrations.set(instanceId, pendingMigration)
+
+        // Track instance presence in target pool so it is not closed prematurely
+        newPoolSelection.pool.instances.add(instanceId)
+        newPoolSelection.pool.lastUsedAt = new Date()
+
+        // Prevent new allocations on the old pool while we wait for acknowledgment
+        currentPool.acceptingOperations = false
+
+        this.log('info', `Initiated migration of instance ${instanceId} from ${fromTier} to ${toTier}`)
     }
     
     private classifyInstance(metrics: InstanceMetrics): ConnectionTier {
@@ -536,8 +674,9 @@ export class ConnectionManager {
         
         for (const pool of this.pools.values()) {
             if (pool.uri !== uri || pool.database !== database) continue
-            
+
             const load = pool.instances.size / this.tierConfigs[pool.tier].maxInstancesPerPool
+            if (load >= 1) continue
             if (load < minLoad) {
                 minLoad = load
                 leastLoadedPool = pool

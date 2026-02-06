@@ -44,6 +44,12 @@ export interface TTLConfig {
      * and suppress non-critical warnings such as missing TTL index messages.
      */
     onlyCriticalAlerts?: boolean
+
+    /**
+     * Enable sorted lookup for the oldest document in each collection to compute age.
+     * This performs an indexed sorted read; keep disabled by default to minimize scans.
+     */
+    enableOldestDocumentLookup?: boolean
 }
 
 export interface TTLIndexInfo {
@@ -88,6 +94,7 @@ export class TTLMonitor {
         collectionPrefix?: string
         collectionsToCheck?: string[]
         onlyCriticalAlerts?: boolean
+        enableOldestDocumentLookup?: boolean
     }
     private metrics: TTLMetrics = {
         lastCheck: new Date(),
@@ -107,7 +114,8 @@ export class TTLMonitor {
             alertThresholdDays: config.alertThresholdDays ?? 1,
             collectionPrefix: config.collectionPrefix,
             collectionsToCheck: config.collectionsToCheck,
-            onlyCriticalAlerts: config.onlyCriticalAlerts
+            onlyCriticalAlerts: config.onlyCriticalAlerts,
+            enableOldestDocumentLookup: config.enableOldestDocumentLookup ?? false
         }
     }
     
@@ -229,19 +237,27 @@ export class TTLMonitor {
             const expiryDate = new Date()
             expiryDate.setDate(expiryDate.getDate() - this.config.days)
             
-            // Count total documents
-            const totalDocuments = await collection.countDocuments({})
+            // Count total documents using metadata to avoid collection scan
+            const totalDocuments = await collection.estimatedDocumentCount()
             
-            // Count expired documents
-            const expiredDocuments = await collection.countDocuments({
-                [fieldName]: { $lt: expiryDate }
-            })
-            
-            // Find oldest document
-            const oldestDoc = await collection.findOne(
-                {},
-                { sort: { [fieldName]: 1 } }
+            // Count expired documents; hint TTL field index when present
+            const expiredDocuments = await collection.countDocuments(
+                { [fieldName]: { $lt: expiryDate } },
+                { hint: { [fieldName]: 1 } as any }
             )
+            
+            // Optionally find oldest document (guarded)
+            let oldestDoc: any = null
+            if (this.config.enableOldestDocumentLookup) {
+                const cursor = collection.find({}, { projection: { [fieldName]: 1 } }).sort({ [fieldName]: 1 }).limit(1)
+                try {
+                    // Best-effort hint
+                    (cursor as any).hint({ [fieldName]: 1 })
+                } catch (_e) {
+                    // ignore hint errors
+                }
+                oldestDoc = await cursor.next()
+            }
             
             let oldestDocument
             if (oldestDoc && oldestDoc[fieldName]) {
@@ -317,7 +333,7 @@ export class TTLMonitor {
                     }
                 }
                 
-                if (result.oldestDocument && 
+                if (this.config.enableOldestDocumentLookup && result.oldestDocument && 
                     result.oldestDocument.age > this.config.days + this.config.alertThresholdDays) {
                     this.metrics.warnings.push(
                         `Very old document (${result.oldestDocument.age} days) in ${collectionName}`

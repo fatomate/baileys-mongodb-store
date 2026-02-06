@@ -94,6 +94,66 @@ export function findMissingIndexes(existingIndexes: any[], requiredIndexes: Inde
     return missingIndexes
 }
 
+const isPlainObject = (value: unknown): value is Record<string, any> => {
+    if (value === null || typeof value !== 'object') {
+        return false
+    }
+    const proto = Object.getPrototypeOf(value)
+    return proto === Object.prototype || proto === null
+}
+
+const isBsonNumeric = (value: any): value is { toNumber: () => number } => {
+    return value && typeof value === 'object' && typeof value.toNumber === 'function' && typeof value._bsontype === 'string'
+}
+
+const normalizeOptionValue = (value: any): any => {
+    if (value === undefined || value === null) {
+        return value
+    }
+
+    if (value instanceof Date) {
+        return value.getTime()
+    }
+
+    if (Array.isArray(value)) {
+        return value.map(normalizeOptionValue)
+    }
+
+    if (isBsonNumeric(value)) {
+        try {
+            return value.toNumber()
+        } catch (_err) {
+            return Number(value)
+        }
+    }
+
+    if (isPlainObject(value)) {
+        const normalized: Record<string, any> = {}
+        const keys = Object.keys(value).sort()
+        for (const key of keys) {
+            normalized[key] = normalizeOptionValue(value[key])
+        }
+        return normalized
+    }
+
+    return value
+}
+
+const valuesEqual = (a: any, b: any): boolean => {
+    const normalizedA = normalizeOptionValue(a)
+    const normalizedB = normalizeOptionValue(b)
+
+    if (normalizedA === normalizedB) {
+        return true
+    }
+
+    if (typeof normalizedA === 'object' || typeof normalizedB === 'object') {
+        return JSON.stringify(normalizedA) === JSON.stringify(normalizedB)
+    }
+
+    return false
+}
+
 /**
  * Validate if existing index options match required options
  * Used for checking if index recreation is needed due to option changes
@@ -106,18 +166,50 @@ export function validateIndexOptions(existingIndex: any, requiredIndex: IndexSpe
     const criticalOptions = ['unique', 'expireAfterSeconds', 'sparse', 'partialFilterExpression']
     
     for (const option of criticalOptions) {
-        const existingValue = existingIndex[option]
         const requiredValue = requiredIndex.options?.[option]
-        
-        // Handle undefined/null comparisons
-        if (existingValue !== requiredValue) {
-            // Special handling for expireAfterSeconds (TTL) - allow some tolerance
-            if (option === 'expireAfterSeconds' && typeof existingValue === 'number' && typeof requiredValue === 'number') {
-                const tolerance = 60 // Allow 1 minute difference
-                if (Math.abs(existingValue - requiredValue) <= tolerance) {
-                    continue
+
+        if (requiredValue === undefined) {
+            continue
+        }
+
+        const existingValue = existingIndex[option]
+
+        if (existingValue === undefined || existingValue === null) {
+            return false
+        }
+
+        if (option === 'expireAfterSeconds') {
+            const tolerance = 60 // Allow 1 minute difference
+
+            const toSeconds = (value: any): number => {
+                if (typeof value === 'number') {
+                    return value
                 }
+                if (isBsonNumeric(value)) {
+                    return value.toNumber()
+                }
+                if (typeof value === 'bigint') {
+                    return Number(value)
+                }
+                const normalized = normalizeOptionValue(value)
+                return typeof normalized === 'number' ? normalized : Number(normalized)
             }
+
+            const existingSeconds = toSeconds(existingValue)
+            const requiredSeconds = toSeconds(requiredValue)
+
+            if (!Number.isFinite(existingSeconds) || !Number.isFinite(requiredSeconds)) {
+                return false
+            }
+
+            if (Math.abs(existingSeconds - requiredSeconds) > tolerance) {
+                return false
+            }
+
+            continue
+        }
+
+        if (!valuesEqual(existingValue, requiredValue)) {
             return false
         }
     }

@@ -29,7 +29,15 @@ async function connectWithMediaHandling() {
             skipGroupMessages: false,        // Download group media too
             maxRetries: 3,
             retryDelay: 2000,
-            downloadTimeout: 60000           // 1 minute timeout
+            downloadTimeout: 60000,          // Base timeout
+            timeoutPerMB: 3000,              // Size-aware timeout multiplier (ms per MB)
+            iosHeicSupport: true,            // Enable HEIC/HEIF support (default true)
+            enableMediaDebug: false,         // Enable verbose media logs
+            officialAPI: {                   // Optional Official API tuning
+                maxUrlCacheMs: 60000,
+                step1TimeoutMs: 20000,
+                step2TimeoutMs: 120000
+            }
         },
         
         // Optional: Set different TTL for messages with media

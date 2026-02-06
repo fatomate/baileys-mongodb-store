@@ -1,7 +1,7 @@
 import { downloadContentFromMessage } from 'baileys'
 import type { proto } from 'baileys'
 import { createWriteStream, promises as fs } from 'fs'
-import { join } from 'path'
+import { join, dirname } from 'path'
 import { pipeline } from 'stream/promises'
 import type { Logger } from 'pino'
 import axios from 'axios'
@@ -48,6 +48,28 @@ export interface MediaConfig {
     downloadTimeout?: number
     
     /**
+     * Optional reupload request hook from Baileys socket to refresh media URLs
+     */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    reuploadRequest?: any
+    
+    /**
+     * Enable verbose debug logs for media operations
+     */
+    enableMediaDebug?: boolean
+
+    /**
+     * Size-aware timeout multiplier (milliseconds per MB). Used when fileLength is known.
+     * Default: 3000 ms/MB
+     */
+    timeoutPerMB?: number
+
+    /**
+     * iOS HEIC/HEIF support toggle (default: true)
+     */
+    iosHeicSupport?: boolean
+
+    /**
      * Official WhatsApp API configuration
      */
     officialAPI?: {
@@ -55,6 +77,21 @@ export interface MediaConfig {
          * Function to get account data for a given instance
          */
         getAccountData?: (instanceId: string) => Promise<OfficialAPIAccountData | null>
+
+        /**
+         * Cache duration for mediaId->URL (ms). Default: 60000
+         */
+        maxUrlCacheMs?: number
+
+        /**
+         * Step-1 timeout (ms) when resolving media URL. Default: 20000
+         */
+        step1TimeoutMs?: number
+
+        /**
+         * Step-2 timeout (ms) when downloading media. If not set, uses size-aware timeout.
+         */
+        step2TimeoutMs?: number
     }
 }
 
@@ -85,6 +122,35 @@ export interface MediaInfo {
     mimetype?: string
     filename?: string
     caption?: string
+}
+
+// In-process in-flight download map to prevent duplicate concurrent downloads
+// Keyed by absolute target file path
+const inFlightDownloads = new Map<string, Promise<void>>()
+
+// In-flight map keyed by Official API mediaId to prevent duplicate parallel fetches
+const inFlightOfficialMedia = new Map<string, Promise<void>>()
+
+// Short-lived cache for Official API mediaId -> direct URL
+const officialApiUrlCache = new Map<string, { url: string; expiresAt: number }>()
+
+/**
+ * Convert a standard base64 string to a filesystem-safe base64url variant
+ * Replaces '+' -> '-', '/' -> '_' and strips trailing '=' padding
+ */
+function toBase64Url(input: string): string {
+    return input.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+/**
+ * Sanitize a filename to prevent path traversal and invalid characters
+ * Keeps alphanumerics, dot, dash, underscore; replaces others with '_'
+ */
+function sanitizeFilename(name: string): string {
+    // Remove path separators and NULs
+    const withoutSeparators = name.replace(/[/\\]/g, '_').replace(/\0/g, '')
+    // Collapse any remaining disallowed characters
+    return withoutSeparators.replace(/[^a-zA-Z0-9._-]/g, '_')
 }
 
 /**
@@ -257,6 +323,11 @@ function getExtension(mimetype?: string, mediaType?: MediaType): string {
             'image/gif': '.gif',
             'image/webp': '.webp',
             'image/svg+xml': '.svg',
+            // iOS HEIC/HEIF
+            'image/heic': '.heic',
+            'image/heif': '.heic',
+            'image/heic-sequence': '.heic',
+            'image/heif-sequence': '.heic',
             
             // Videos
             'video/mp4': '.mp4',
@@ -367,39 +438,68 @@ async function downloadWithRetry(
     config: MediaConfig,
     logger?: Logger
 ): Promise<void> {
-    const maxRetries = config.maxRetries || 3
-    const retryDelay = config.retryDelay || 1000
-    
+    const maxRetries = Math.max(1, config.maxRetries || 3)
+    const baseDelay = Math.max(200, config.retryDelay || 1000)
+    const timeoutPerMB = Math.max(1, config.timeoutPerMB || 3000)
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const stream = await downloadContentFromMessage(mediaMessage, mediaType)
+            // Compute effective timeout based on declared file size when available
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const declaredLen = (mediaMessage as any)?.fileLength ? Number((mediaMessage as any).fileLength) : undefined
+            const declaredMB = declaredLen ? declaredLen / (1024 * 1024) : undefined
+            const sizeAwareTimeout = declaredMB ? Math.floor(30000 + declaredMB * timeoutPerMB) : undefined
+            const effectiveTimeout = Math.max(
+                0,
+                config.downloadTimeout || 0,
+                sizeAwareTimeout || 0
+            ) || undefined
+
+            // optional options supported by Baileys; cast to any for options
+            const stream: NodeJS.ReadableStream = await (downloadContentFromMessage as any)(
+                mediaMessage,
+                mediaType,
+                config.reuploadRequest ? { reuploadRequest: config.reuploadRequest } : undefined
+            )
+            // Ensure destination directory exists (especially important for temp paths)
+            await ensureDir(dirname(outputPath))
             const writeStream = createWriteStream(outputPath)
-            
-            // Set timeout if configured
-            if (config.downloadTimeout) {
-                const timeout = setTimeout(() => {
-                    writeStream.destroy(new Error('Download timeout'))
-                }, config.downloadTimeout)
-                
-                writeStream.on('finish', () => clearTimeout(timeout))
-                writeStream.on('error', () => clearTimeout(timeout))
+
+            let timeout: NodeJS.Timeout | undefined
+            if (effectiveTimeout) {
+                const start = Date.now()
+                timeout = setTimeout(() => {
+                    try { (stream as any)?.destroy?.(new Error('Download timeout')) } catch (e) { /* swallow */ }
+                    try { writeStream.destroy(new Error('Download timeout')) } catch (e) { /* swallow */ }
+                }, effectiveTimeout)
+                writeStream.on('finish', () => {
+                    if (timeout) clearTimeout(timeout)
+                    if (config.enableMediaDebug) {
+                        const elapsed = Date.now() - start
+                        logger?.info({ mediaType, outputPath, elapsedMs: elapsed, attempt }, 'Media download finished')
+                    }
+                })
+                writeStream.on('error', () => { if (timeout) clearTimeout(timeout) })
             }
-            
-            await pipeline(stream, writeStream)
+
+            await pipeline(stream as any, writeStream)
             return
         } catch (error) {
             if (attempt === maxRetries) {
                 throw error
             }
-            
+
+            const expo = Math.min(baseDelay * Math.pow(2, attempt - 1), 30000)
+            const jitter = Math.floor(Math.random() * 500)
             logger?.warn({
                 error: error instanceof Error ? error.message : 'Unknown error',
                 attempt,
                 maxRetries,
-                mediaType
+                mediaType,
+                delayMs: expo + jitter
             }, 'Media download failed, retrying...')
-            
-            await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
+
+            await new Promise(resolve => setTimeout(resolve, expo + jitter))
         }
     }
 }
@@ -409,8 +509,25 @@ async function downloadWithRetry(
  */
 function getMediaHash(mediaInfo: MediaInfo): string | undefined {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const message = mediaInfo.message as any
-    return message.fileSha256 ? Buffer.from(message.fileSha256).toString('base64') : undefined
+    const msg: any = mediaInfo.message
+    const val = msg?.fileSha256
+    if (!val) return undefined
+    try {
+        if (typeof val === 'string') {
+            // Normalize base64 string
+            return Buffer.from(val, 'base64').toString('base64')
+        }
+        if (val?.type === 'Buffer' && Array.isArray(val?.data)) {
+            return Buffer.from(val.data).toString('base64')
+        }
+        if (val instanceof Uint8Array) {
+            return Buffer.from(val).toString('base64')
+        }
+        // Fallback: try direct Buffer conversion
+        return Buffer.from(val as Buffer).toString('base64')
+    } catch (e) {
+        return undefined
+    }
 }
 
 /**
@@ -430,7 +547,7 @@ export async function downloadMedia(
         }
         
         // Skip group messages if configured
-        if (config.skipGroupMessages && message.key.remoteJid?.includes('@g.us')) {
+        if (config.skipGroupMessages && message.key?.remoteJid?.includes('@g.us')) {
             return { success: false, error: 'Group message skipped' }
         }
         
@@ -446,7 +563,7 @@ export async function downloadMedia(
             const existingPath = await checkExisting(mediaHash)
             if (existingPath) {
                 logger?.info({
-                    messageId: message.key.id,
+                    messageId: message.key?.id,
                     hash: mediaHash,
                     existingPath
                 }, 'Media already exists, reusing file')
@@ -485,32 +602,86 @@ export async function downloadMedia(
         const instanceDir = join(config.baseDir, instanceId)
         const typeDir = join(instanceDir, mediaInfo.type)
         await ensureDir(typeDir)
-        
-        // Generate filename
-        const extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
-        const fileName = generateFileName(
-            message.key.id || 'unknown',
-            mediaInfo.type,
-            extension,
-            mediaInfo.filename
-        )
+
+        // Generate deterministic filename using media hash when available
+        let extension = getExtension(mediaInfo.mimetype, mediaInfo.type)
+        // Optional HEIC handling toggle
+        if (extension === '.heic' && config.iosHeicSupport === false) {
+            extension = '.jpg'
+        }
+        let fileName = mediaHash
+            ? `${toBase64Url(mediaHash)}${extension}`
+            : generateFileName(
+                message.key?.id || 'unknown',
+                mediaInfo.type,
+                extension,
+                mediaInfo.filename
+            )
+        fileName = sanitizeFilename(fileName)
         const filePath = join(typeDir, fileName)
-        
-        // Download media
-        await downloadWithRetry(
-            mediaInfo.message,
-            mediaInfo.type,
-            filePath,
-            config,
-            logger
-        )
-        
-        // Get file stats
+
+        // If file already exists, reuse immediately
+        try {
+            const stat = await fs.stat(filePath)
+            if (stat.isFile()) {
+                return {
+                    success: true,
+                    localPath: join(instanceId, mediaInfo.type, fileName),
+                    mediaType: mediaInfo.type,
+                    fileName,
+                    fileSize: stat.size,
+                    mediaHash,
+                    reused: true
+                }
+            }
+        } catch (e) { /* file does not exist yet */ }
+
+        // Avoid duplicate concurrent downloads to the same file
+        const tmpPath = `${filePath}.tmp`
+        const perform = async () => {
+            await downloadWithRetry(
+                mediaInfo.message,
+                mediaInfo.type,
+                tmpPath,
+                config,
+                logger
+            )
+
+            // Integrity check where possible
+            const tmpStat = await fs.stat(tmpPath)
+            const declaredLen = (mediaInfo.message as any)?.fileLength ? Number((mediaInfo.message as any).fileLength) : undefined
+            if (declaredLen && tmpStat.size > 0 && Math.abs(tmpStat.size - declaredLen) > 0) {
+                // Sizes differ; treat as failure to trigger retry
+                await fs.unlink(tmpPath).catch(() => {})
+                throw new Error(`Downloaded size ${tmpStat.size} mismatch with declared ${declaredLen}`)
+            }
+            // Enforce max size limit if declared length was not available
+            if (!declaredLen && config.maxSizeInMB && config.maxSizeInMB > 0) {
+                const limitBytes = config.maxSizeInMB * 1024 * 1024
+                if (tmpStat.size > limitBytes) {
+                    await fs.unlink(tmpPath).catch(() => {})
+                    throw new Error(`Downloaded file exceeds max size limit of ${config.maxSizeInMB}MB`)
+                }
+            }
+            if (tmpStat.size <= 0) {
+                await fs.unlink(tmpPath).catch(() => {})
+                throw new Error('Downloaded file is empty')
+            }
+
+            // Atomic move into place
+            await fs.rename(tmpPath, filePath)
+        }
+
+        let inflight = inFlightDownloads.get(filePath)
+        if (!inflight) {
+            inflight = perform()
+            inFlightDownloads.set(filePath, inflight)
+        }
+        await inflight.finally(() => inFlightDownloads.delete(filePath))
+
         const stats = await fs.stat(filePath)
-        
-        // Return relative path from base directory
         const relativePath = join(instanceId, mediaInfo.type, fileName)
-        
+
         return {
             success: true,
             localPath: relativePath,
@@ -522,7 +693,7 @@ export async function downloadMedia(
     } catch (error) {
         logger?.error({
             error: error instanceof Error ? error.message : 'Unknown error',
-            messageId: message.key.id,
+            messageId: message.key?.id,
             instanceId
         }, 'Failed to download media')
         
@@ -540,65 +711,84 @@ async function downloadFromOfficialAPI(
     mediaId: string,
     accountData: OfficialAPIAccountData,
     filePath: string,
-    logger?: Logger
+    logger?: Logger,
+    options?: {
+        maxUrlCacheMs?: number
+        step1TimeoutMs?: number
+        step2TimeoutMs?: number
+    }
 ): Promise<void> {
     try {
         const { access_token, phone_number_id } = JSON.parse(accountData.tmp)
         const isWabotPro = accountData.data === 'wabot_pro'
         
-        // Step 1: Get media URL from WhatsApp API
-        const apiUrl = isWabotPro
-            ? `https://crm.wabot.pro/api/meta/v19.0/${mediaId}?phone_number_id=${phone_number_id}`
-            : `https://graph.facebook.com/v23.0/${mediaId}?phone_number_id=${phone_number_id}`
+        // Step 1: Try cache; otherwise, get media URL from WhatsApp API
+        const now = Date.now()
+        const cacheTtl = options?.maxUrlCacheMs ?? 60000
+        let directUrl: string | undefined
+        const cached = officialApiUrlCache.get(mediaId)
+        if (cached && cached.expiresAt > now) {
+            directUrl = cached.url
+            logger?.info({ mediaId }, 'Using cached Official API media URL')
+        }
         
-        const firstResponse = await axios.get(
-            apiUrl,
-            {
-                headers: {
-                    'Authorization': `Bearer ${access_token}`
-                },
-                responseType: 'stream',
-                timeout: 10000
-            }
-        )
-        
-        // Check if the response is JSON (contains URL) or direct media
-        const contentType = firstResponse.headers['content-type'] || ''
-        
-        if (contentType.includes('application/json')) {
-            // This is a JSON response with URL - need second request
-            // Convert stream to JSON
-            let data = ''
-            for await (const chunk of firstResponse.data) {
-                data += chunk.toString()
-            }
-            const jsonResponse = JSON.parse(data)
-            
-            if (!jsonResponse?.url) {
-                throw new Error('No media URL returned from WhatsApp API')
-            }
-            
-            // Step 2: Download the actual media file
-            const mediaResponse = await axios.get(
-                jsonResponse.url,
+        let contentType = ''
+        if (!directUrl) {
+            const apiUrl = isWabotPro
+                ? `https://crm.wabot.pro/api/meta/v19.0/${mediaId}?phone_number_id=${phone_number_id}`
+                : `https://graph.facebook.com/v23.0/${mediaId}?phone_number_id=${phone_number_id}`
+
+            const firstResponse = await axios.get(
+                apiUrl,
                 {
                     headers: {
                         'Authorization': `Bearer ${access_token}`
                     },
                     responseType: 'stream',
-                    timeout: 60000
+                    timeout: options?.step1TimeoutMs ?? 20000
                 }
             )
-            
-            // Write to file
-            const writeStream = createWriteStream(filePath)
-            await pipeline(mediaResponse.data, writeStream)
-        } else {
-            // This is the direct media response (wabot_pro proxy behavior)
-            // Write directly to file
-            const writeStream = createWriteStream(filePath)
-            await pipeline(firstResponse.data, writeStream)
+        
+            // Check if the response is JSON (contains URL) or direct media
+            contentType = firstResponse.headers['content-type'] || ''
+        
+            if (contentType.includes('application/json')) {
+                // Convert stream to JSON
+                let data = ''
+                for await (const chunk of firstResponse.data) {
+                    data += chunk.toString()
+                }
+                const jsonResponse = JSON.parse(data)
+                if (!jsonResponse?.url) {
+                    throw new Error('No media URL returned from WhatsApp API')
+                }
+                directUrl = jsonResponse.url
+                if (directUrl) officialApiUrlCache.set(mediaId, { url: directUrl, expiresAt: now + cacheTtl })
+            } else {
+                // This is the direct media response (wabot_pro proxy behavior)
+                const writeStream = createWriteStream(filePath)
+                await pipeline(firstResponse.data, writeStream)
+                logger?.info({ mediaId, filePath, contentType }, 'Successfully downloaded Official API media (direct)')
+                return
+            }
         }
+
+        // Step 2: Download the actual media file using directUrl
+        if (!directUrl) {
+            throw new Error('Official API direct URL not resolved')
+        }
+        const mediaResponse = await axios.get(
+            directUrl,
+            {
+                headers: {
+                    'Authorization': `Bearer ${access_token}`
+                },
+                responseType: 'stream',
+                timeout: options?.step2TimeoutMs ?? 60000
+            }
+        )
+        const writeStream = createWriteStream(filePath)
+        await pipeline(mediaResponse.data, writeStream)
         
         logger?.info({
             mediaId,
@@ -623,7 +813,11 @@ export async function downloadOfficialAPIMedia(
     instanceId: string,
     config: MediaConfig,
     logger?: Logger,
-    checkExisting?: (hash: string) => Promise<string | null>
+    checkExisting?: (hash: string) => Promise<string | null>,
+    options?: {
+        accountData?: OfficialAPIAccountData | null
+        attempt?: number
+    }
 ): Promise<MediaDownloadResult> {
     try {
         // Check if media download is enabled
@@ -637,7 +831,7 @@ export async function downloadOfficialAPIMedia(
         }
         
         // Skip group messages if configured
-        if (config.skipGroupMessages && message.key.remoteJid?.includes('@g.us')) {
+        if (config.skipGroupMessages && message.key?.remoteJid?.includes('@g.us')) {
             return { success: false, error: 'Group message skipped' }
         }
         
@@ -671,7 +865,8 @@ export async function downloadOfficialAPIMedia(
             mediaType: mediaInfo.type,
             extractedMediaId: mediaId,
             mediaMessageKeys: Object.keys(mediaMessage),
-            mediaMessageStructure: JSON.stringify(mediaMessage, null, 2).substring(0, 500)
+            mediaMessageStructure: JSON.stringify(mediaMessage, null, 2).substring(0, 500),
+            attempt: options?.attempt ?? 1
         }, '🔍 DEBUG: Official API media ID extraction')
         
         if (!mediaId) {
@@ -689,7 +884,7 @@ export async function downloadOfficialAPIMedia(
             const existingPath = await checkExisting(mediaId)
             if (existingPath) {
                 logger?.info({
-                    messageId: message.key.id,
+                    messageId: message.key?.id,
                     mediaId,
                     existingPath
                 }, 'Official API media already exists, reusing file')
@@ -707,7 +902,7 @@ export async function downloadOfficialAPIMedia(
         }
         
         // Get account data for this instance
-        const accountData = await config.officialAPI.getAccountData(instanceId)
+        let accountData = options?.accountData ?? await config.officialAPI.getAccountData(instanceId)
         if (!accountData || accountData.loginType !== 1 || accountData.status !== 1) {
             return { success: false, error: 'Invalid account for Official API' }
         }
@@ -723,36 +918,108 @@ export async function downloadOfficialAPIMedia(
         const instanceDir = join(config.baseDir, instanceId)
         const typeDir = join(instanceDir, mediaInfo.type)
         await ensureDir(typeDir)
-        
-        // Generate filename
-        const timestamp = Date.now()
+
+        // Generate deterministic filename using mediaId when available
         const extension = getExtension(mediaInfo.mimetype || 'application/octet-stream', mediaInfo.type)
-        const fileName = mediaInfo.filename || `${timestamp}.${extension}`
+        let fileName = mediaInfo.filename || `${mediaId}${extension}`
+        fileName = sanitizeFilename(fileName)
         const filePath = join(typeDir, fileName)
-        
+
+        // If file already exists, reuse immediately
+        try {
+            const stat = await fs.stat(filePath)
+            if (stat.isFile()) {
+                return {
+                    success: true,
+                    localPath: join(instanceId, mediaInfo.type, fileName),
+                    mediaType: mediaInfo.type,
+                    fileName,
+                    fileSize: stat.size,
+                    mediaHash: mediaId,
+                    reused: true
+                }
+            }
+        } catch (e) { /* file does not exist yet */ }
+
+        const tmpPath = `${filePath}.tmp`
+
         // Download the media with retry logic
         const maxRetries = config.maxRetries || 3
         const retryDelay = config.retryDelay || 1000
         
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                await downloadFromOfficialAPI(mediaId, accountData, filePath, logger)
-                break
-            } catch (error) {
-                if (attempt === maxRetries) {
-                    throw error
+        const downloadTask = async () => {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    // Ensure accountData is valid
+                    if (!accountData) {
+                        throw new Error('Account data unavailable for Official API download')
+                    }
+
+                    // Compute step-2 timeout using size-aware policy when possible
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const declaredLen = (mediaInfo.message as any)?.fileLength ? Number((mediaInfo.message as any).fileLength) : undefined
+                    const declaredMB = declaredLen ? declaredLen / (1024 * 1024) : undefined
+                    const step2Timeout = config.officialAPI?.step2TimeoutMs ?? (declaredMB ? Math.floor(30000 + (config.timeoutPerMB || 3000) * declaredMB) : 60000)
+
+                    await downloadFromOfficialAPI(mediaId, accountData, tmpPath, logger, {
+                        maxUrlCacheMs: config.officialAPI?.maxUrlCacheMs ?? 60000,
+                        step1TimeoutMs: config.officialAPI?.step1TimeoutMs ?? 20000,
+                        step2TimeoutMs: step2Timeout
+                    })
+                    // Atomic move into place
+                    try {
+                        await fs.rename(tmpPath, filePath)
+                    } catch (renameError) {
+                        const err = renameError as NodeJS.ErrnoException
+                        if (err.code === 'EEXIST') {
+                            // Another worker already placed the file - clean up temp and reuse existing file
+                            await fs.unlink(tmpPath).catch(() => undefined)
+                        } else {
+                            throw err
+                        }
+                    }
+                    return
+                } catch (error) {
+                    // Handle 401/403 by refreshing account data once per attempt
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const status = (error as any)?.response?.status
+                    if ((status === 401 || status === 403) && config.officialAPI?.getAccountData) {
+                        try {
+                            const refreshed = await config.officialAPI.getAccountData(instanceId)
+                            if (refreshed) accountData = refreshed
+                        } catch {
+                            // Ignore refresh failures, continue with existing accountData
+                        }
+                    }
+
+                    // Ensure temporary file is cleaned between retries
+                    await fs.unlink(tmpPath).catch(() => undefined)
+
+                    if (attempt === maxRetries) {
+                        throw error
+                    }
+                    
+                    logger?.warn({
+                        error: error instanceof Error ? error.message : 'Unknown error',
+                        attempt,
+                        maxRetries,
+                        mediaId
+                    }, 'Official API media download failed, retrying...')
+                    
+                    const expo = Math.min(retryDelay * Math.pow(2, attempt - 1), 30000)
+                    const jitter = Math.floor(Math.random() * 500)
+                    await new Promise(resolve => setTimeout(resolve, expo + jitter))
                 }
-                
-                logger?.warn({
-                    error: error instanceof Error ? error.message : 'Unknown error',
-                    attempt,
-                    maxRetries,
-                    mediaId
-                }, 'Official API media download failed, retrying...')
-                
-                await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
             }
         }
+
+        // Prevent duplicate parallel downloads by mediaId (in addition to file path)
+        let inflightById = inFlightOfficialMedia.get(mediaId)
+        if (!inflightById) {
+            inflightById = downloadTask()
+            inFlightOfficialMedia.set(mediaId, inflightById)
+        }
+        await inflightById.finally(() => inFlightOfficialMedia.delete(mediaId))
         
         // Get file stats
         const stats = await fs.stat(filePath)
@@ -771,7 +1038,7 @@ export async function downloadOfficialAPIMedia(
     } catch (error) {
         logger?.error({
             error: error instanceof Error ? error.message : 'Unknown error',
-            messageId: message.key.id,
+            messageId: message.key?.id,
             instanceId
         }, 'Failed to download Official API media')
         

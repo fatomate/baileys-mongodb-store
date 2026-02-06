@@ -1,4 +1,4 @@
-import { MongoClient, Collection, Db } from 'mongodb'
+import { MongoClient, Collection, Db, ClientSession } from 'mongodb'
 import { proto, getAggregateVotesInPollMessage, updateMessageWithReceipt, updateMessageWithReaction } from 'baileys'
 import type { 
     BaileysEventEmitter, 
@@ -30,21 +30,23 @@ import {
     ValidationError,
     AuthorizationError,
     createSafeErrorMessage,
-    hashForLogging
+    hashForLogging,
+    safeNormalizeJid
 } from './utils/security'
 import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
 import { MemoryMonitor, BackpressureController } from './utils/memory'
 import { TTLMonitor } from './utils/ttl'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
 import { LidHandler } from './utils/lidHandler'
+import type { LidMapping } from './utils/lidHandler'
 import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
 import { safeDropIndex, batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
 import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
-// @ts-ignore - Type is used in annotations
-import type { ConnectionConfig } from './types/connection'
+// @ts-ignore - Types are used in annotations only
+import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
 
@@ -156,6 +158,16 @@ interface ProfilePictureJob {
 // Event metrics storage
 const eventMetricsMap = new Map<string, EventMetrics>()
 
+// LID Resolution Metrics
+interface LidResolutionMetrics {
+    operationType: string
+    totalResolved: number
+    totalErrors: number
+    lastProcessedAt?: Date
+}
+
+const lidResolutionMetricsMap = new Map<string, LidResolutionMetrics>()
+
 interface MongoCollections {
     chats: Collection<Chat & { instanceId: string; updatedAt: Date }>
     contacts: Collection<Contact & { instanceId: string; updatedAt: Date }>
@@ -165,10 +177,26 @@ interface MongoCollections {
     presences: Collection<{ instanceId: string; id: string; presences: { [participant: string]: PresenceData }; updatedAt: Date }>
     labels: Collection<Label & { instanceId: string; updatedAt: Date }>
     labelAssociations: Collection<LabelAssociation & { instanceId: string; updatedAt: Date }>
+    lidMappings: Collection<LidMapping>
 }
 
 // Cache for Binary conversions
 const binaryConversionCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+// Negative cache for not-found lookups to avoid repeated slow fallbacks
+const notFoundCache = new NodeCache({ stdTTL: 60, checkperiod: 30, useClones: false })
+
+// Deduplication caches to prevent duplicate processing/log spam
+const processedEditCache = new NodeCache({ stdTTL: 10, checkperiod: 30 })
+const logThrottleCache = new NodeCache({ stdTTL: 2, checkperiod: 5 })
+
+// Helper to rate-limit repeated logs for the same key
+const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
+    if (logThrottleCache.get(key)) {
+        return false
+    }
+    logThrottleCache.set(key, true, ttlSeconds)
+    return true
+}
 
 // Helper function to convert MongoDB Binary objects to Buffers
 const convertBinaryToBuffer = (obj: any): any => {
@@ -501,8 +529,22 @@ const decryptPollVote = async (
         return null
     }
 }
-
-export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfig): Promise<EnhancedMongoDBStore> => {
+export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfig & {
+    lidConfig?: {
+        enabled: boolean;
+        requestDelay?: number;
+        retryAttempts?: number;
+        maxConcurrentLookups?: number;
+        negativeCacheTTL?: number;
+        lookupsEnabled?: boolean;
+        preferReverseLookupFirst?: boolean;
+        contactsQueryMaxTimeMS?: number;
+        dynamicNegativeBackoff?: boolean;
+        minNegativeCacheTTL?: number;
+        maxNegativeCacheTTL?: number;
+        proactiveHistoryResolution?: boolean;
+    }
+}): Promise<EnhancedMongoDBStore> => {
     const {
         uri,
         database: dbName,
@@ -522,17 +564,53 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         meId,
         lidHandler: lidHandlerConfig,
         connectionConfig,
+        connectionManager: connectionManagerOverrides,
         useSharedConnections = true,
         profilePictureConfig,
-        indexManagement
+        indexManagement,
+        lidConfig
     } = config
-    
+
+    // Set default values for lidConfig (safer CPU-friendly defaults)
+    const defaultLidConfig = {
+        enabled: true,
+        requestDelay: 500,
+        retryAttempts: 3,
+        maxConcurrentLookups: 10,
+        negativeCacheTTL: 300,
+        lookupsEnabled: true,
+        preferReverseLookupFirst: true,
+        contactsQueryMaxTimeMS: 500,
+        dynamicNegativeBackoff: true,
+        minNegativeCacheTTL: 300,
+        maxNegativeCacheTTL: 3600,
+        proactiveHistoryResolution: false
+    }
+    const finalLidConfig = { ...defaultLidConfig, ...lidConfig }
+
+
     // Configure smart index management with defaults
     const indexConfig = {
         skipExistingCollectionIndexes: indexManagement?.skipExistingCollectionIndexes ?? true,
         forceRecreateIndexes: indexManagement?.forceRecreateIndexes ?? false,
         enableIndexHealthLogging: indexManagement?.enableIndexHealthLogging ?? true,
-        indexCreationTimeout: indexManagement?.indexCreationTimeout ?? 30000
+        indexCreationTimeout: indexManagement?.indexCreationTimeout ?? null
+    }
+
+    const addIndexTimeout = <T extends IndexSpec>(index: T): T => {
+        if (!indexConfig.indexCreationTimeout || indexConfig.indexCreationTimeout <= 0) {
+            return index
+        }
+
+        const baseOptions = index.options ? { ...index.options } : {}
+
+        return {
+            ...index,
+            options: {
+                ...baseOptions,
+                maxTimeMS: indexConfig.indexCreationTimeout
+            }
+        } as T
     }
     
     // Socket can be set later using setSock() method
@@ -570,6 +648,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize memory monitor if configured
     const memoryMonitor = memory ? new MemoryMonitor(memory) : null
     const backpressureController = memory ? new BackpressureController(memory) : null
+
+    const waitForBackpressure = async (reason: string) => {
+        if (!backpressureController) {
+            return
+        }
+
+        while (backpressureController.shouldPause()) {
+            if (shouldLogOnce(`backpressure-${reason}`)) {
+                logWarn(`[${instanceId}] Memory backpressure engaged${reason ? ` during ${reason}` : ''}; pausing operations`) 
+            }
+            await new Promise(resolve => setTimeout(resolve, 200))
+        }
+    }
+
+    if (backpressureController) {
+        backpressureController.onPause(() => {
+            logWarn(`[${instanceId}] Memory pressure high, throttling new work`)
+        })
+
+        backpressureController.onResume(() => {
+            log(`[${instanceId}] Memory pressure normalized; resuming work`)
+        })
+    }
     
     // TTL monitor will be initialized after DB connection
     let ttlMonitor: TTLMonitor | null = null
@@ -577,11 +678,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // LID handler will be initialized after DB connection
     let lidHandler: LidHandler | null = null
 
+    // Redis connections
+    let redisConnection: Redis | null = null
+    let lidRedisClient: Redis | null = null
+
     // MongoDB connection
     let client: MongoClient
     let db: Db
     let connectionManager: ConnectionManager | null = null
     let isUsingSharedConnection = false
+    let currentSharedPoolId: string | null = null
     let reconnectAttempts = 0
     
     // Connection state management
@@ -597,6 +703,27 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const connectionStateEmitter = new EventEmitter()
     // Fix EventEmitter memory leak warning by setting reasonable limit
     connectionStateEmitter.setMaxListeners(50)
+
+    const dedicatedMaxPoolSize = connectionConfig?.maxPoolSize ?? 20
+    const dedicatedMinPoolSize = Math.min(connectionConfig?.minPoolSize ?? 4, dedicatedMaxPoolSize)
+    const connectionCheckInterval = connectionManagerOverrides?.monitoringInterval ?? 60000
+    let lastSuccessfulPing = 0
+
+    const markConnectionStale = (reason: string, error?: unknown) => {
+        const err = error instanceof Error ? error : new Error(reason)
+        lastSuccessfulPing = 0
+        mongoConnectionState = MongoConnectionState.DISCONNECTED
+        if (isUsingSharedConnection) {
+            currentSharedPoolId = null
+        }
+        connectionStateEmitter.emit('disconnected', err)
+        if (shouldLogOnce(`stale-connection-${reason}`)) {
+            logWarn(`[${instanceId}] Connection marked stale: ${reason}`)
+        }
+    }
+
+    // Track if proactive LID resolution has been done for this instance
+    let historyLidResolutionDone = false
     
     // Initialize health monitor
     const healthMonitor = new ConnectionHealthMonitor({
@@ -611,15 +738,45 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             connectionManager.recordActivity(validatedInstanceId, responseTime)
         }
     }
+
+    const hasErrorLabel = (error: any, label: string): boolean => {
+        if (!error) {
+            return false
+        }
+        if (Array.isArray(error.errorLabels) && error.errorLabels.includes(label)) {
+            return true
+        }
+        if (error.errorLabelSet instanceof Set && error.errorLabelSet.has(label)) {
+            return true
+        }
+        return false
+    }
+
+    const isTransientTransactionError = (error: any): boolean => {
+        if (!error) {
+            return false
+        }
+        const message = typeof error.message === 'string' ? error.message : ''
+        return hasErrorLabel(error, 'TransientTransactionError')
+            || error.code === 251
+            || error.codeName === 'NoSuchTransaction'
+            || /no such transaction/i.test(message)
+    }
     
+    const sharedConnectionManagerConfig: ConnectionManagerConfig | undefined = useSharedConnections
+        ? {
+            ...connectionManagerOverrides,
+            maxTotalConnections: connectionManagerOverrides?.maxTotalConnections ?? 900,
+            logLevel: connectionManagerOverrides?.logLevel ?? (logLevel === 'all' ? 'info' : 'none'),
+            enableMetrics: connectionManagerOverrides?.enableMetrics ?? enableMetrics ?? false
+        }
+        : undefined
+
     // Check if we should use shared connections
     if (useSharedConnections) {
         try {
             // Use ConnectionManager for shared connections
-            connectionManager = getConnectionManager({
-                logLevel: logLevel as any,
-                enableMetrics: enableMetrics
-            })
+            connectionManager = getConnectionManager(sharedConnectionManagerConfig)
             
             const connection = await connectionManager.registerInstance({
                 instanceId: validatedInstanceId,
@@ -631,15 +788,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
-            
+            currentSharedPoolId = connection.poolId
+            mongoConnectionState = MongoConnectionState.CONNECTED
+            lastSuccessfulPing = Date.now()
+
             log(`Using shared connection for instance ${instanceId}`)
         } catch (error) {
             logWarn(`Failed to use shared connection for instance ${instanceId}, falling back to dedicated connection:`, error)
             
             // Fallback to dedicated connection on error
             client = new MongoClient(uri, {
-                maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                maxPoolSize: dedicatedMaxPoolSize,
+                minPoolSize: dedicatedMinPoolSize,
                 maxIdleTimeMS: 30000,
                 writeConcern: { w: 1, j: false }
             })
@@ -647,19 +807,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             db = client.db(dbName)
             isUsingSharedConnection = false
             connectionManager = null
+            currentSharedPoolId = null
+            lastSuccessfulPing = Date.now()
         }
     } else {
         // Use dedicated connection (original behavior)
         client = new MongoClient(uri, {
-            maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-            minPoolSize: connectionConfig?.minPoolSize ?? 10,
+            maxPoolSize: dedicatedMaxPoolSize,
+            minPoolSize: dedicatedMinPoolSize,
             maxIdleTimeMS: 30000,
             writeConcern: { w: 1, j: false }
         })
         await client.connect()
         db = client.db(dbName)
         mongoConnectionState = MongoConnectionState.CONNECTED
-        
+        currentSharedPoolId = null
+        lastSuccessfulPing = Date.now()
+
         // Start health monitoring
         healthMonitor.startMonitoring(db)
     }
@@ -667,42 +831,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize TTL monitor after DB connection (do not start yet)
     if (ttlMonitoring) {
         const globalTTL = ttlDays || DEFAULT_TTL_DAYS
-        const ttlManagedCollections = ['chats', 'contacts', 'messages', 'state', 'presences']
+        // Disable TTL monitoring for contacts (no TTL for contacts)
+        const ttlManagedCollections = ['chats', 'messages', 'state', 'presences']
         ttlMonitor = new TTLMonitor(db, { 
             days: globalTTL, 
+            // Safer defaults: require explicit enableMonitoring and use daily checks by default
+            enableMonitoring: ttlMonitoring.enableMonitoring === true,
+            checkIntervalMinutes: ttlMonitoring.checkIntervalMinutes ?? 1440,
             ...ttlMonitoring,
             collectionPrefix,
             collectionsToCheck: ttlManagedCollections,
             // Silence non-critical TTL warnings unless verbose logging
-            onlyCriticalAlerts: logLevel !== 'all'
+            onlyCriticalAlerts: ttlMonitoring.onlyCriticalAlerts ?? (logLevel !== 'all')
         })
         // Start will be called after indexes are created
     }
     
-    // Initialize LID handler after DB connection with retry logic
-    if (lidHandlerConfig) {
-        lidHandler = new LidHandler(validatedInstanceId, lidHandlerConfig)
-        const initResult = await retryWithBackoff(
-            () => lidHandler!.initialize(db, collectionPrefix),
-            {
-                maxAttempts: 3,
-                initialDelay: 500,
-                maxDelay: 5000,
-                factor: 2,
-                jitter: true
-            },
-            (attempt, error, delay) => {
-                logWarn(`[LID Handler] Retry attempt ${attempt} for initialization after error: ${error.message}. Waiting ${delay}ms...`)
-            }
-        )
-        
-        if (initResult.success) {
-            log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
-        } else {
-            logError(`[LID Handler] Failed to initialize after ${initResult.attempts} attempts:`, initResult.error)
-            // Don't throw - LID handler is optional
-        }
-    }
+    // LID handler will be initialized after ensureConnection is declared
     
     // Get collections
     const getCollections = (): MongoCollections => {
@@ -717,7 +862,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
             labels: db.collection(`${collectionPrefix}labels`),
-            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`)
+            labelAssociations: db.collection(`${collectionPrefix}labelAssociations`),
+            lidMappings: db.collection(`${collectionPrefix}lidMappings`)
         }
     }
     
@@ -725,16 +871,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Ensure connection is active before operations with enhanced error handling
     const ensureConnection = async (): Promise<void> => {
+        if (isUsingSharedConnection && connectionManager && mongoConnectionState === MongoConnectionState.CONNECTED) {
+            const poolState = connectionManager.getInstancePoolState(validatedInstanceId)
+            if (poolState.pendingMigration && poolState.pendingMigration.toPoolId !== currentSharedPoolId) {
+                markConnectionStale('shared pool migration pending')
+            } else if (poolState.currentPoolId && currentSharedPoolId && poolState.currentPoolId !== currentSharedPoolId) {
+                markConnectionStale('shared pool mismatch')
+            }
+        }
+
         // Quick check if already connected
         if (mongoConnectionState === MongoConnectionState.CONNECTED && client) {
+            const now = Date.now()
+            if (now - lastSuccessfulPing < connectionCheckInterval) {
+                return
+            }
+
             try {
-                // Quick ping to verify connection is alive
                 await db.admin().ping()
+                lastSuccessfulPing = now
                 return
             } catch (error) {
                 log(`Connection check failed for instance ${validatedInstanceId}: ${error}`)
-                mongoConnectionState = MongoConnectionState.DISCONNECTED
-                    connectionStateEmitter.emit('disconnected', error)
+                markConnectionStale('ping failure', error)
             }
         }
         
@@ -780,6 +939,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     client = connection.client
                     db = connection.db
                     isUsingSharedConnection = true
+                    currentSharedPoolId = connection.poolId
                     
                     // Refresh collections after reconnection
                     collections = getCollections()
@@ -802,14 +962,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     mongoConnectionState = MongoConnectionState.CONNECTED
                     connectionStateEmitter.emit('connected')
                     healthMonitor.updateConnectionState('connected')
+                    lastSuccessfulPing = Date.now()
                     log(`Reconnected to MongoDB (shared) for instance ${validatedInstanceId}`)
                 } catch (error) {
                     // Fall back to dedicated connection if shared fails
                     logWarn(`Failed to reconnect with shared connection, falling back to dedicated:`, error)
                     
                     client = new MongoClient(uri, {
-                        maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                        minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                        maxPoolSize: dedicatedMaxPoolSize,
+                        minPoolSize: dedicatedMinPoolSize,
                         maxIdleTimeMS: 30000,
                         writeConcern: { w: 1, j: false }
                     })
@@ -817,6 +978,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     db = client.db(dbName)
                     isUsingSharedConnection = false
                     connectionManager = null
+                    currentSharedPoolId = null
                     
                     // Refresh collections after reconnection
                     collections = getCollections()
@@ -839,6 +1001,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     mongoConnectionState = MongoConnectionState.CONNECTED
                     connectionStateEmitter.emit('connected')
                     healthMonitor.updateConnectionState('connected')
+                    lastSuccessfulPing = Date.now()
                     log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
                 }
             } else {
@@ -852,14 +1015,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 client = new MongoClient(uri, {
-                    maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                    minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                    maxPoolSize: dedicatedMaxPoolSize,
+                    minPoolSize: dedicatedMinPoolSize,
                     maxIdleTimeMS: 30000,
                     writeConcern: { w: 1, j: false }
                 })
                 await client.connect()
                 db = client.db(dbName)
-                
+                currentSharedPoolId = null
+
                 // Refresh collections after reconnection
                 collections = getCollections()
                 
@@ -872,6 +1036,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 mongoConnectionState = MongoConnectionState.CONNECTED
                 connectionStateEmitter.emit('connected')
                 healthMonitor.updateConnectionState('connected')
+                lastSuccessfulPing = Date.now()
                 log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
             }
         } catch (error) {
@@ -884,6 +1049,74 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             throw new Error(`Failed to connect to MongoDB: ${(error as Error).message}`)
         } finally {
             // Connection state is managed by enum now
+        }
+    }
+    
+    // Initialize LID handler after ensureConnection is available
+    if (lidHandlerConfig) {
+        // Prepare Redis for LID cache: reuse bull Redis if present, else create a light client from config
+        let redisForCache: Redis | null = null
+        if (redisConnection) {
+            redisForCache = redisConnection
+        } else if (redis?.connection) {
+            try {
+                if (typeof redis.connection === 'string') {
+                    redisForCache = new Redis(redis.connection, {
+                        maxRetriesPerRequest: null,
+                        enableReadyCheck: true,
+                        lazyConnect: false
+                    })
+                } else {
+                    redisForCache = new Redis({
+                        ...redis.connection,
+                        maxRetriesPerRequest: null,
+                        enableReadyCheck: true,
+                        lazyConnect: false
+                    })
+                }
+                await redisForCache.ping().catch(() => {})
+                lidRedisClient = redisForCache
+            } catch (_err) {
+                redisForCache = null
+                lidRedisClient = null
+            }
+        }
+        // Ensure LidHandler uses store's connection lifecycle and skip index creation by default
+        lidHandler = new LidHandler(validatedInstanceId, {
+            skipIndexCreation: true,
+            maxConcurrentLookups: lidHandlerConfig.maxConcurrentLookups ?? finalLidConfig.maxConcurrentLookups,
+            negativeCacheTTL: lidHandlerConfig.negativeCacheTTL ?? finalLidConfig.negativeCacheTTL,
+            lookupsEnabled: lidHandlerConfig.lookupsEnabled ?? finalLidConfig.lookupsEnabled,
+            preferReverseLookupFirst: lidHandlerConfig.preferReverseLookupFirst ?? finalLidConfig.preferReverseLookupFirst,
+            contactsQueryMaxTimeMS: lidHandlerConfig.contactsQueryMaxTimeMS ?? finalLidConfig.contactsQueryMaxTimeMS,
+            dynamicNegativeBackoff: lidHandlerConfig.dynamicNegativeBackoff ?? finalLidConfig.dynamicNegativeBackoff,
+            minNegativeCacheTTL: lidHandlerConfig.minNegativeCacheTTL ?? finalLidConfig.minNegativeCacheTTL,
+            maxNegativeCacheTTL: lidHandlerConfig.maxNegativeCacheTTL ?? finalLidConfig.maxNegativeCacheTTL,
+            cacheTTLSeconds: (lidHandlerConfig as any).cacheTTLSeconds ?? (finalLidConfig as any).cacheTTLSeconds ?? (3 * 24 * 60 * 60),
+            // Prefer reusing existing Redis connection; fallback to lightweight cache client
+            redisClient: (redisConnection as any) || (lidRedisClient as any) || undefined,
+            ...lidHandlerConfig,
+            ensureConnection: ensureConnection
+        })
+        const initResult = await retryWithBackoff(
+            () => lidHandler!.initialize(db, collectionPrefix),
+            {
+                maxAttempts: 3,
+                initialDelay: 500,
+                maxDelay: 5000,
+                factor: 2,
+                jitter: true
+            },
+            (attempt, error, delay) => {
+                logWarn(`[LID Handler] Retry attempt ${attempt} for initialization after error: ${error.message}. Waiting ${delay}ms...`)
+            }
+        )
+        
+        if (initResult.success) {
+            log(`[LID Handler] Initialized for instance ${validatedInstanceId}`)
+        } else {
+            logError(`[LID Handler] Failed to initialize after ${initResult.attempts} attempts:`, initResult.error)
+            // Don't throw - LID handler is optional
         }
     }
     
@@ -907,18 +1140,52 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         }
         
+        const isConnectionClosedError = (error: any): boolean => {
+            if (!error) {
+                return false
+            }
+            const message = typeof error.message === 'string' ? error.message : ''
+            return error.name === 'MongoNotConnectedError'
+                || error.name === 'MongoExpiredSessionError'
+                || error.name === 'MongoPoolClosedError'
+                || isTransientTransactionError(error)
+                || /session has ended/i.test(message)
+                || /closed connection pool/i.test(message)
+                || /client was closed/i.test(message)
+        }
+
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
-                return await operation()
+                const endPoolOperation = isUsingSharedConnection && connectionManager
+                    ? connectionManager.beginInstanceOperation(validatedInstanceId)
+                    : null
+                try {
+                    await waitForBackpressure('db-operation')
+                    return await operation()
+                } finally {
+                    if (endPoolOperation) {
+                        endPoolOperation()
+                    }
+                }
             },
             options,
             (attempt, error, delay) => {
-                logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${error.message}. Waiting ${delay}ms...`)
+                if (isConnectionClosedError(error)) {
+                    markConnectionStale('retry detected closed session', error)
+                }
+                const retryLogKey = `retry-${validatedInstanceId}-${error?.name || 'unknown'}`
+                if (shouldLogOnce(retryLogKey, 5)) {
+                    const retryMessage = error?.message ?? 'Unknown error'
+                    logWarn(`[withConnection] Retry attempt ${attempt} for instance ${validatedInstanceId} after error: ${retryMessage}. Waiting ${delay}ms...`)
+                }
             }
         )
-        
+
         if (!result.success) {
+            if (isConnectionClosedError(result.error)) {
+                markConnectionStale('retry budget exhausted', result.error)
+            }
             logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
             healthMonitor.recordFailure()
             throw result.error
@@ -928,7 +1195,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const responseTime = Date.now() - startTime
         trackActivity(responseTime)
         healthMonitor.recordSuccess(responseTime)
-        
+        lastSuccessfulPing = Date.now()
+
         return result.result as T
     }
     
@@ -939,7 +1207,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let bullInitialized = false
     const queues: Map<QueueType, Queue<any>> = new Map()
     const workers: Map<QueueType, Worker<any>> = new Map()
-    let redisConnection: Redis | null = null
     let sharedQueueManager: SharedQueueManager | null = null
     const useSharedQueues = redis?.useSharedQueues !== false // Default to true if Redis is provided
     
@@ -1043,10 +1310,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return false
         }
     }
-    
     // Register processors for shared queue manager
     const registerSharedQueueProcessors = async () => {
         if (!sharedQueueManager) return
+
+        const ownership = await sharedQueueManager.claimInstanceOwnership(validatedInstanceId)
+        if (!ownership.owned && ownership.ownerId && ownership.ownerId !== sharedQueueManager.getWorkerId()) {
+            logWarn(`[${instanceId}] Shared queue ownership currently held by ${ownership.ownerId}. Jobs will be deferred until ownership changes.`)
+        } else if (ownership.owned) {
+            log(`[${instanceId}] Shared queue ownership claimed by worker ${sharedQueueManager.getWorkerId()}`)
+        }
         
         // Messages processor - use instance-specific registration to fix singleton issue
         sharedQueueManager.registerInstanceProcessor(validatedInstanceId, JobType.MESSAGES, async (job) => {
@@ -1070,25 +1343,49 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Handle REVOKE messages
                     if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
                         const revokedKey = message.message.protocolMessage.key
-                        const targetJid = revokedKey.remoteJid || jid
+                        const outerChatJid = message.key?.remoteJid || jid
                         
-                        await withConnection(async () =>
+                        // Prefer outer chat JID and normalize via LID if available
+                        let targetJid = outerChatJid
+                        if (lidHandler && targetJid) {
+                            try {
+                                const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                if (normalized) targetJid = normalized
+                            } catch {}
+                        }
+                        
+                        const baseSet: any = {
+                            'message.protocolMessage': message.message?.protocolMessage,
+                            revoked: true,
+                            revokedAt: new Date(),
+                            revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
+                            messageStubType: 1
+                        }
+                        
+                        let updateResult = await withConnection(async () =>
                             collections.messages.updateOne(
-                                {
-                                    instanceId: validatedInstanceId,
-                                    jid: targetJid,
-                                    'key.id': revokedKey.id
-                                },
-                                {
-                                    $set: {
-                                        'message.protocolMessage': message.message?.protocolMessage,
-                                        revoked: true,
-                                        revokedAt: new Date(),
-                                        revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
-                                    }
-                                }
+                                { instanceId: validatedInstanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                { $set: baseSet }
                             )
                         )
+                        
+                        if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                            updateResult = await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                    { $set: baseSet }
+                                )
+                            )
+                        }
+                        
+                        if (updateResult.matchedCount === 0) {
+                            await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, 'key.id': revokedKey.id },
+                                    { $set: baseSet }
+                                )
+                            )
+                        }
                         return { success: true, type: 'revoke' }
                     }
                     
@@ -1138,15 +1435,24 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 )
                 return { success: true, type: 'update' }
             } else if (type === 'delete' && deleteIds) {
-                // Delete messages
+                // Mark messages as revoked instead of deleting
                 await withConnection(async () =>
-                    collections.messages.deleteMany({
-                        instanceId: validatedInstanceId,
-                        jid,
-                        'key.id': { $in: deleteIds }
-                    })
+                    collections.messages.updateMany(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid,
+                            'key.id': { $in: deleteIds }
+                        },
+                        {
+                            $set: {
+                                revoked: true,
+                                revokedAt: new Date(),
+                                updatedAt: new Date()
+                            }
+                        }
+                    )
                 )
-                return { success: true, type: 'delete', count: deleteIds.length }
+                return { success: true, type: 'delete', count: deleteIds.length, marked: true }
             }
             
             return { success: false, error: 'Unknown message job type' }
@@ -1161,38 +1467,134 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             trackActivity()
             
             if (type === 'upsert' && contacts) {
-                // Bulk upsert
-                const bulkOps = contacts.map((contact: Contact) => ({
-                    replaceOne: {
-                        filter: { instanceId: validatedInstanceId, id: contact.id },
-                        replacement: {
-                            ...contact,
-                            instanceId: validatedInstanceId,
-                            updatedAt: new Date()
-                        },
-                        upsert: true
+                // Fetch existing contacts to preserve names and profile pictures
+                const ids = contacts.map(c => c.id)
+                const existingContacts: any[] = []
+                for (let i = 0; i < ids.length; i += 1000) {  // Reduced from 5000 to optimize $in performance
+                    const idChunk = ids.slice(i, i + 1000)
+                    const chunk = await withConnection(async () =>
+                        collections.contacts.find(
+                            { instanceId: validatedInstanceId, id: { $in: idChunk } },
+                            { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
+                        ).toArray()
+                    ) as any[]
+                    existingContacts.push(...chunk)
+                }
+
+                const existingDataMap = new Map(
+                    existingContacts.map(c => [c.id, {
+                        name: c.name,
+                        profilePic: c.profilePic,
+                        profilePicUpdatedAt: c.profilePicUpdatedAt,
+                        notify: c.notify,
+                        ...(lidConfig?.enabled ? { lid: c.lid } : {})
+                    }])
+                )
+
+                // Bulk upsert without overriding user-saved notify
+                const bulkOps = contacts.map((contact: Contact) => {
+                    // Handle null name: fallback to notify or verifiedName, or skip if both are null
+                    if (contact.name === null) {
+                        contact.name = contact.notify || contact.verifiedName || undefined;
                     }
-                }))
-                
+
+                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
+                    const existing = existingDataMap.get(contact.id)
+
+                    // Always include updatedAt
+                    const setData: any = {
+                        ...rest,
+                        updatedAt: new Date()
+                    }
+
+                    // Preserve existing name if new name is null/undefined/empty
+                    if (existing?.name && (!setData.name || setData.name.trim() === '')) {
+                        setData.name = existing.name
+                    }
+
+                    // Preserve existing profile picture data if it exists
+                    if (existing?.profilePic) {
+                        setData.profilePic = existing.profilePic
+                        setData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                    }
+
+                    // Remove name from setData if it's null/undefined/empty after preservation
+                    if (setData.name == null || setData.name.trim() === '') {
+                        delete setData.name
+                    }
+
+                    // Base update with $set (always present with updatedAt)
+                    const update: any = {
+                        $set: setData,
+                        $setOnInsert: {
+                            instanceId,
+                            id: contact.id,
+                            ...(notify !== undefined ? { notify } : {})
+                        }
+                    }
+
+                    // Add $unset if needed to clean up existing null name
+                    if (existing && existing.name === null && !setData.name) {
+                        update.$unset = { name: 1 }
+                    }
+
+                    return {
+                        updateOne: {
+                            filter: { instanceId, id: contact.id },
+                            update,
+                            upsert: true
+                        }
+                    }
+                })
+
                 await withConnection(async () =>
                     collections.contacts.bulkWrite(bulkOps)
                 )
-                
+
                 return { success: true, count: contacts.length }
             } else if (type === 'update' && contact) {
-                // Single update
+                // Fetch existing contact to preserve name and profile picture
+                const existingContact = await withConnection(async () =>
+                    collections.contacts.findOne(
+                        { instanceId: validatedInstanceId, id: contact.id },
+                        { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
+                    )
+                ) as any
+
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
+
+                // Always include updatedAt
+                const setData: any = {
+                    ...rest,
+                    updatedAt: new Date()
+                }
+
+                // Preserve existing name if new name is null/undefined/empty
+                if (existingContact?.name && (!setData.name || setData.name.trim() === '')) {
+                    setData.name = existingContact.name
+                }
+
+                // Preserve existing profile picture data if it exists
+                if (existingContact?.profilePic) {
+                    setData.profilePic = existingContact.profilePic
+                    setData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
+                }
+
                 await withConnection(async () =>
-                    collections.contacts.replaceOne(
+                    collections.contacts.updateOne(
                         { instanceId: validatedInstanceId, id: contact.id },
                         {
-                            ...contact,
-                            instanceId: validatedInstanceId,
-                            updatedAt: new Date()
+                            $set: setData,
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
                         },
                         { upsert: true }
                     )
                 )
-                
+
                 return { success: true }
             }
             
@@ -1365,6 +1767,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             try {
+                const attemptNumber = (job.attemptsMade ?? 0) + 1
+                
                 // Check for existing media by hash
                 const checkExistingMedia = async (fileHash: string) => {
                     const existingMessage = await withConnection(async () =>
@@ -1386,7 +1790,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         validatedInstanceId,
                         config.media,
                         config.logger,
-                        checkExistingMedia
+                        checkExistingMedia,
+                        {
+                            attempt: attemptNumber
+                        }
                     )
                 } else {
                     mediaResult = await downloadMedia(
@@ -1400,6 +1807,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 if (mediaResult.success && mediaResult.localPath) {
                     // Update message with media URL
+                    const mediaUpdate: Record<string, any> = {
+                        mediaUrl: mediaResult.localPath,
+                        mediaDownloadedAt: new Date()
+                    }
+                    if (mediaResult.mediaType) mediaUpdate.mediaType = mediaResult.mediaType
+                    if (mediaResult.fileName) mediaUpdate.mediaFileName = mediaResult.fileName
+                    if (typeof mediaResult.fileSize === 'number') mediaUpdate.mediaFileSize = mediaResult.fileSize
+                    if (mediaResult.mediaHash) mediaUpdate.mediaHash = mediaResult.mediaHash
+                    if (typeof mediaResult.reused !== 'undefined') mediaUpdate.mediaReused = mediaResult.reused
+                    
                     await withConnection(async () =>
                         collections.messages.updateOne(
                             {
@@ -1407,17 +1824,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 'key.id': message.key?.id
                             },
                             {
-                                $set: {
-                                    mediaUrl: mediaResult.localPath,
-                                    mediaDownloadedAt: new Date()
-                                }
+                                $set: mediaUpdate
                             }
                         )
                     )
                     
                     return { success: true, mediaUrl: mediaResult.localPath }
                 } else {
-                    return { success: false, error: mediaResult.error || 'Download failed' }
+                    const errorMessage = mediaResult.error || 'Download failed'
+                    logWarn(`[Media Download Queue] Attempt ${attemptNumber} failed for ${message.key?.id}: ${errorMessage}`)
+                    throw new Error(errorMessage)
                 }
             } catch (error: any) {
                 logError(`❌ [Media Download Queue] Failed to download media:`, error)
@@ -1555,7 +1971,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         
         log(`✅ Registered all shared queue processors for instance ${instanceId}`)
     }
-    
     // Initialize Bull queues if Redis config provided
     const initializeBullQueues = async () => {
         if (!redis) return
@@ -1635,7 +2050,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Set concurrency based on queue type
                 let concurrency: number
-                if (queueType === QueueType.LABEL_ASSOCIATIONS) {
+                if (queueType === QueueType.LABEL_ASSOCIATIONS || queueType === QueueType.CONTACTS) {
                     concurrency = 1
                 } else if (queueType === QueueType.PROFILE_PICTURES) {
                     concurrency = profilePictureConfig?.maxConcurrent || 5
@@ -1711,28 +2126,50 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                         if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && message.message.protocolMessage.key) {
                             const revokedKey = message.message.protocolMessage.key
-                            log(`🔄 [Bull Queue REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                            const outerChatJid = message.key?.remoteJid || jid
+                            
+                            // Prefer outer chat JID and normalize via LID if available
+                            let targetJid = outerChatJid
+                            if (lidHandler && targetJid) {
+                                try {
+                                    const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                    if (normalized) targetJid = normalized
+                                } catch {}
+                            }
                             
                             try {
-                                // Update the revoked message to mark it as deleted/revoked
-                                const targetJid = revokedKey.remoteJid || jid
-                                const updateResult = await withConnection(async () =>
+                                const baseSet: any = {
+                                    'message.protocolMessage': message.message?.protocolMessage,
+                                    revoked: true,
+                                    revokedAt: new Date(),
+                                    revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
+                                    messageStubType: 1
+                                }
+                                
+                                let updateResult = await withConnection(async () =>
                                     collections.messages.updateOne(
-                                        {
-                                            instanceId,
-                                            jid: targetJid,
-                                            'key.id': revokedKey.id
-                                        },
-                                        {
-                                            $set: {
-                                                'message.protocolMessage': message.message?.protocolMessage,
-                                                revoked: true,
-                                                revokedAt: new Date(),
-                                                revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
-                                            }
-                                        }
+                                        { instanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
                                     )
                                 )
+                                
+                                if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
+                                
+                                if (updateResult.matchedCount === 0) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
                                 
                                 if (updateResult.matchedCount > 0) {
                                     log(`✅ [Bull Queue REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
@@ -1889,7 +2326,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     await withConnection(async () =>
                                         collections.messages.updateOne(
                                             { 
-                                                instanceId, 
+                                                instanceId: validatedInstanceId, 
                                                 jid, 
                                                 'key.id': message.key?.id 
                                             },
@@ -2010,17 +2447,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         )
                     }
                 } else if (type === 'delete') {
+                    // Mark messages as revoked/deleted instead of deleting
                     if (deleteIds && deleteIds.length > 0) {
                         await withConnection(async () =>
-                            collections.messages.deleteMany({
-                                instanceId,
-                                jid,
-                                'key.id': { $in: deleteIds }
-                            })
+                            collections.messages.updateMany(
+                                { instanceId, jid, 'key.id': { $in: deleteIds } },
+                                { $set: { revoked: true, revokedAt: new Date(), updatedAt: new Date() } }
+                            )
                         )
                     } else {
                         await withConnection(async () =>
-                            collections.messages.deleteMany({ instanceId, jid })
+                            collections.messages.updateMany(
+                                { instanceId, jid },
+                                { $set: { deleted: true, deletedAt: new Date(), updatedAt: new Date() } }
+                            )
                         )
                     }
                 }
@@ -2071,13 +2511,85 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 trackActivity() // Track request
                 
                 if (type === 'upsert' && contacts) {
-                    const bulkOps = contacts.map((contact: Contact) => ({
-                        replaceOne: {
-                            filter: { instanceId, id: contact.id },
-                            replacement: { ...contact, instanceId, updatedAt: new Date() },
-                            upsert: true
+                    // Fetch existing contacts to preserve names and profile pictures
+                    const ids = contacts.map(c => c.id)
+                    const existingContacts: any[] = []
+                    for (let i = 0; i < ids.length; i += 1000) {  // Reduced from 5000 to optimize $in performance
+                        const idChunk = ids.slice(i, i + 1000)
+                        const chunk = await withConnection(async () =>
+                            collections.contacts.find(
+                                { instanceId, id: { $in: idChunk } },
+                                { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
+                            ).toArray()
+                        ) as any[]
+                        existingContacts.push(...chunk)
+                    }
+
+                    const existingDataMap = new Map(
+                        existingContacts.map(c => [c.id, {
+                            name: c.name,
+                            profilePic: c.profilePic,
+                            profilePicUpdatedAt: c.profilePicUpdatedAt,
+                            notify: c.notify,
+                            ...(lidConfig?.enabled ? { lid: c.lid } : {})
+                        }])
+                    )
+
+                    const bulkOps = contacts.map(contact => {
+                        // Handle null name: fallback to notify or verifiedName, or skip if both are null
+                        if (contact.name === null) {
+                            contact.name = contact.notify || contact.verifiedName || undefined;
                         }
-                    }))
+
+                        const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
+                        const existing = existingDataMap.get(contact.id)
+
+                        // Always include updatedAt
+                        const setData: any = {
+                            ...rest,
+                            updatedAt: new Date()
+                        }
+
+                        // Preserve existing name if new name is null/undefined/empty
+                        if (existing?.name && (!setData.name || setData.name.trim() === '')) {
+                            setData.name = existing.name
+                        }
+
+                        // Preserve existing profile picture data if it exists
+                        if (existing?.profilePic) {
+                            setData.profilePic = existing.profilePic
+                            setData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                        }
+
+                        // Remove name from setData if it's null/undefined/empty after preservation
+                        if (setData.name == null || setData.name.trim() === '') {
+                            delete setData.name
+                        }
+
+                        // Base update with $set (always present with updatedAt)
+                        const update: any = {
+                            $set: setData,
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
+                        }
+
+                        // Add $unset if needed to clean up existing null name
+                        if (existing && existing.name === null && !setData.name) {
+                            update.$unset = { name: 1 }
+                        }
+
+                        return {
+                            updateOne: {
+                                filter: { instanceId, id: contact.id },
+                                update,
+                                upsert: true
+                            }
+                        }
+                    });
+
                     await withConnection(async () =>
                         collections.contacts.bulkWrite(bulkOps, { ordered: false })
                     )
@@ -2145,10 +2657,44 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     trackActivity(Date.now() - jobStartTime) // Track response time
                 } else if (type === 'update' && contact) {
+                    // Fetch existing contact to preserve name and profile picture
+                    const existingContact = await withConnection(async () =>
+                        collections.contacts.findOne(
+                            { instanceId: validatedInstanceId, id: contact.id },
+                            { projection: { name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
+                        )
+                    ) as any
+
+                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
+
+                    // Always include updatedAt
+                    const setData: any = {
+                        ...rest,
+                        updatedAt: new Date()
+                    }
+
+                    // Preserve existing name if new name is null/undefined/empty
+                    if (existingContact?.name && (!setData.name || setData.name.trim() === '')) {
+                        setData.name = existingContact.name
+                    }
+
+                    // Preserve existing profile picture data if it exists
+                    if (existingContact?.profilePic) {
+                        setData.profilePic = existingContact.profilePic
+                        setData.profilePicUpdatedAt = existingContact.profilePicUpdatedAt
+                    }
+
                     await withConnection(async () =>
-                        collections.contacts.replaceOne(
-                            { instanceId, id: contact.id },
-                            { ...contact, instanceId, updatedAt: new Date() },
+                        collections.contacts.updateOne(
+                            { instanceId: validatedInstanceId, id: contact.id },
+                            {
+                                $set: setData,
+                                $setOnInsert: {
+                                    instanceId,
+                                    id: contact.id,
+                                    ...(notify !== undefined ? { notify } : {})
+                                }
+                            },
                             { upsert: true }
                         )
                     )
@@ -2205,7 +2751,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 return { success: true }
             })
-            
             createQueueAndWorker<GroupMetadataJob>(QueueType.GROUP_METADATA, async (job) => {
                 const { type, jid, metadata, update } = job.data
                 
@@ -2274,7 +2819,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     )
                 } else if (type === 'delete') {
                     await withConnection(async () =>
-                        collections.labels.deleteOne({ instanceId, id })
+                        collections.labels.deleteOne({
+                            instanceId,
+                            id
+                        })
                     )
                 }
                 
@@ -2764,7 +3312,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Update event metrics
     const updateEventMetrics = (eventType: string, action: 'received' | 'stored' | 'skipped' | 'error') => {
         if (!enableMetrics) return
-        
+
         let metrics = eventMetricsMap.get(eventType)
         if (!metrics) {
             metrics = {
@@ -2776,7 +3324,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             eventMetricsMap.set(eventType, metrics)
         }
-        
+
         switch (action) {
             case 'received':
                 metrics.totalReceived++
@@ -2793,7 +3341,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 break
         }
     }
-    
+
+    const updateLidResolutionMetrics = (operationType: string, action: 'resolved' | 'error') => {
+        if (!enableMetrics) return
+
+        let metrics = lidResolutionMetricsMap.get(operationType)
+        if (!metrics) {
+            metrics = {
+                operationType,
+                totalResolved: 0,
+                totalErrors: 0
+            }
+            lidResolutionMetricsMap.set(operationType, metrics)
+        }
+
+        switch (action) {
+            case 'resolved':
+                metrics.totalResolved++
+                metrics.lastProcessedAt = new Date()
+                break
+            case 'error':
+                metrics.totalErrors++
+                break
+        }
+    }
     // Smart index creation with collection existence checking and custom TTL
     const createIndexes = async () => {
         // Migration: Drop obsolete TTL indexes from collections that should persist indefinitely
@@ -2814,15 +3385,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             ],
             contacts: [
                 { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('contacts') * 24 * 60 * 60 } }
+                { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } },
+                // NEW: Composite index for efficient $in queries with projection fields
+                { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} },
+                // NEW: Covering index for lid->id lookups to avoid document fetch
+                { name: 'contacts_lid_id_cover', spec: { instanceId: 1, lid: 1, id: 1 }, options: { partialFilterExpression: { lid: { $type: 'string' } } } }
             ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
-                { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
+                { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
                 { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
+                // Ensure compound index exists for manual per-instance cleanup
+                { name: 'messages_instance_updatedAt', spec: { instanceId: 1, updatedAt: 1 }, options: {} },
                 { name: 'messages_media_dedup', spec: { instanceId: 1, mediaHash: 1 }, options: { sparse: true } },
                 { name: 'messages_remote_fallback', spec: { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }, options: {} },
-                { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} }
+                { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
+                // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
+                { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
+                // Supports reverse lookup for new format with remoteJidAlt and addressingMode
+                { name: 'messages_remoteJidAlt_lookup', spec: { instanceId: 1, 'key.addressingMode': 1, 'key.remoteJidAlt': 1 }, options: { sparse: true } },
+                // Index for LID resolution tracking
+                { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } },
+                // Index for media deduplication by fileHash
+                { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
             ],
             groupMetadata: [
                 { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -2841,8 +3426,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // No TTL - persists indefinitely
             ],
             labelAssociations: [
-                { name: 'label_assoc_primary', spec: { instanceId: 1, type: 1, chatId: 1, labelId: 1 }, options: { unique: true } }
+                { name: 'labelAssociations_primary', spec: { instanceId: 1, chatId: 1, messageId: 1, labelId: 1 }, options: { unique: true } },
+                { name: 'labelAssociations_chatId_labelId', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: {} },
+                { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} },
+                // Index for LID resolution tracking
+                { name: 'labelAssociations_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
                 // No TTL - persists indefinitely
+            ],
+            // Include LidHandler's collection in smart index management
+            lidMappings: [
+                { name: 'lidMappings_primary', spec: { instanceId: 1, lid: 1 }, options: { unique: true } },
+                { name: 'lidMappings_phone_lookup', spec: { instanceId: 1, phoneNumber: 1 }, options: {} }
             ]
         }
         
@@ -2868,10 +3462,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     // Force recreate: drop and recreate all indexes with timeout applied
-                    const timedIndexes = requiredIndexes.map(idx => ({
-                        ...idx,
-                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                    }))
+                    const timedIndexes = requiredIndexes.map(addIndexTimeout)
                     const batchResult = await withConnection(() => 
                         recreateIndexes(collection, timedIndexes)
                     )
@@ -2885,7 +3476,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     totalCreated += batchResult.successful
                 } else if (indexConfig.skipExistingCollectionIndexes) {
                     // Smart mode: check what indexes are needed
-                    const checkResult = await shouldCreateIndexes(collection as any, requiredIndexes)
+                    const checkResult = await withConnection(() => shouldCreateIndexes(collection as any, requiredIndexes))
                     
                     if (checkResult.missingIndexes.length === 0) {
                         if (indexConfig.enableIndexHealthLogging) {
@@ -2906,13 +3497,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                         
                         // Create missing indexes using batch operation with timeout applied
-                        const timedMissingIndexes = checkResult.missingIndexes.map(idx => ({
-                            ...idx,
-                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                        }))
-                        const batchResult = await withConnection(() => 
-                            batchCreateIndexes(collection, timedMissingIndexes)
-                        )
+                        const timedMissingIndexes = checkResult.missingIndexes.map(addIndexTimeout)
+                        const batchResult = await batchCreateIndexes(collection, timedMissingIndexes, withConnection)
                         
                         createResults.push({
                             collection: collectionName,
@@ -2949,13 +3535,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     // Apply timeout to all indexes for legacy mode
-                    const timedIndexes = requiredIndexes.map(idx => ({
-                        ...idx,
-                        options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                    }))
-                    const batchResult = await withConnection(() => 
-                        batchCreateIndexes(collection, timedIndexes)
-                    )
+                    const timedIndexes = requiredIndexes.map(addIndexTimeout)
+                    const batchResult = await batchCreateIndexes(collection, timedIndexes, withConnection)
                     
                     createResults.push({
                         collection: collectionName,
@@ -3029,8 +3610,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     // Initialize indexes
     await createIndexes()
     
-    // Start TTL monitor after indexes are ensured
-    if (ttlMonitor) {
+    // Start TTL monitor after indexes are ensured (only if explicitly enabled)
+    if (ttlMonitor && ttlMonitoring?.enableMonitoring === true) {
         ttlMonitor.startMonitoring((message: string) => {
             logWarn(`[TTL Monitor] ${message}`)
         })
@@ -3043,6 +3624,111 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let currentEventEmitter: BaileysEventEmitter | null = null
     const eventHandlers = new Map<string, (...args: any[]) => Promise<void>>()
     
+    // LID resolution helper function
+    const performProactiveLidResolutionForLabelAssociations = async (
+        lidMappings: Array<{ lid: string | undefined; id: string }>
+    ): Promise<number> => {
+        let totalLabelAssociationsUpdated = 0
+        const batchSize = 50
+
+        for (let i = 0; i < lidMappings.length; i += batchSize) {
+            const batch = lidMappings.slice(i, i + batchSize)
+            const batchPromises = batch.map(async (mapping: any) => {
+                const lid = mapping.lid
+                const phoneNumber = mapping.id
+
+                if (!lid || !lidHandler!.isLidFormat(lid) || lidHandler!.isLidFormat(phoneNumber)) {
+                    return 0 // Skip invalid mappings
+                }
+
+                try {
+                    // Update label associations where chatId equals the LID
+                    const updateResult = await withConnection(async () =>
+                        collections.labelAssociations.updateMany(
+                            {
+                                instanceId: validatedInstanceId,
+                                chatId: lid,
+                                type: 'label_jid' as any // Only update chat-based associations
+                            },
+                            {
+                                $set: {
+                                    chatId: phoneNumber,
+                                    'lidMapping.resolved': true,
+                                    'lidMapping.resolvedAt': new Date(),
+                                    'lidMapping.originalLid': lid,
+                                    updatedAt: new Date()
+                                }
+                            }
+                        )
+                    )
+
+                    if (updateResult.modifiedCount > 0) {
+                        log(`[${instanceId}] Updated ${updateResult.modifiedCount} label associations: ${lid} -> ${phoneNumber}`)
+                        if (enableMetrics) {
+                            updateLidResolutionMetrics('proactive-label-associations', 'resolved')
+                        }
+                    }
+
+                    return updateResult.modifiedCount
+                } catch (error) {
+                    logError(`[${instanceId}] Error updating label associations for LID ${lid}:`, error)
+                    if (enableMetrics) {
+                        updateLidResolutionMetrics('proactive-label-associations', 'error')
+                    }
+                    return 0
+                }
+            })
+
+            const batchResults = await Promise.all(batchPromises)
+            totalLabelAssociationsUpdated += batchResults.reduce((sum, count) => sum + count, 0)
+
+            // Small delay between batches to prevent overwhelming
+            if (i + batchSize < lidMappings.length) {
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+        }
+
+        return totalLabelAssociationsUpdated
+    }
+    // Safe LID setter - handles E11000 duplicate key conflicts on contacts_lid_lookup
+    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<void> => {
+        const inst = targetInstanceId || instanceId
+        try {
+            await withConnection(async () =>
+                collections.contacts.updateOne(
+                    { instanceId: inst, id: contactId },
+                    { $set: { lid, updatedAt: new Date() } }
+                )
+            )
+        } catch (e: any) {
+            if (e?.code === 11000 && e?.keyPattern?.lid) {
+                log(`[LID] Conflict: LID ${lid} already assigned, reassigning to ${contactId}`)
+                await withConnection(async () =>
+                    collections.contacts.updateOne(
+                        { instanceId: inst, lid, id: { $ne: contactId } },
+                        { $unset: { lid: 1 }, $set: { updatedAt: new Date() } }
+                    )
+                )
+                try {
+                    await withConnection(async () =>
+                        collections.contacts.updateOne(
+                            { instanceId: inst, id: contactId },
+                            { $set: { lid, updatedAt: new Date() } }
+                        )
+                    )
+                } catch (retryError: any) {
+                    if (retryError?.code === 11000) {
+                        log(`[LID] Failed to assign LID ${lid} to ${contactId} after retry`)
+                    } else {
+                        throw retryError
+                    }
+                }
+            } else {
+                throw e
+            }
+        }
+    }
+
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
         instanceId,
@@ -3075,6 +3761,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 eventMetricsMap.delete(eventType)
             } else {
                 eventMetricsMap.clear()
+            }
+        },
+
+        getLidResolutionMetrics(operationType?: string): LidResolutionMetrics | LidResolutionMetrics[] {
+            if (operationType) {
+                return lidResolutionMetricsMap.get(operationType) || {
+                    operationType,
+                    totalResolved: 0,
+                    totalErrors: 0
+                }
+            }
+            return Array.from(lidResolutionMetricsMap.values())
+        },
+
+        resetLidResolutionMetrics(operationType?: string): void {
+            if (operationType) {
+                lidResolutionMetricsMap.delete(operationType)
+            } else {
+                lidResolutionMetricsMap.clear()
             }
         },
 
@@ -3288,50 +3993,121 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             log(`📝 [Contacts] Saving ${contacts.length} contacts to database`)
             
-            // Fetch existing contacts to preserve profile picture data
-            const existingContacts = await withConnection(async () =>
-                collections.contacts.find({
-                    instanceId,
-                    id: { $in: contacts.map(c => c.id) }
-                }).toArray()
-            ) as any[]
-            
-            // Create a map of existing profile picture data
+            // Fetch existing contacts to preserve profile picture data, existing notify, and name (chunked + projected)
+            const ids = contacts.map(c => c.id)
+            const existingContacts: any[] = []
+            const idChunkSize = 1000  // Reduced from 5000 to optimize $in performance
+            for (let i = 0; i < ids.length; i += idChunkSize) {
+                const idChunk = ids.slice(i, i + idChunkSize)
+                const chunk = await withConnection(async () =>
+                    collections.contacts.find(
+                        { instanceId, id: { $in: idChunk } },
+                        { projection: { id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, ...(lidConfig?.enabled ? { lid: 1 } : {}) } }
+                    ).toArray()
+                ) as any[]
+                existingContacts.push(...chunk)
+            }
+
+            // Create a map of existing contact data to preserve
             const existingDataMap = new Map(
                 existingContacts.map(c => [c.id, {
+                    name: c.name,
                     profilePic: c.profilePic,
-                    profilePicUpdatedAt: c.profilePicUpdatedAt
+                    profilePicUpdatedAt: c.profilePicUpdatedAt,
+                    notify: c.notify,
+                    ...(lidConfig?.enabled ? { lid: c.lid } : {})
                 }])
             )
             
             // IMPORTANT: Save contacts directly to ensure data persistence
             // This bypasses the broken SharedQueueManager that causes processor conflicts
             const bulkOps = contacts.map(contact => {
+                // Handle null name: fallback to notify or verifiedName, or skip if both are null
+                if (contact.name === null) {
+                    contact.name = contact.notify || contact.verifiedName || undefined;
+                }
+
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
+
+                // Always include updatedAt
+                const setData: any = {
+                    ...rest,
+                    updatedAt: new Date()
+                }
+
+                // Preserve existing name if new name is null/undefined/empty
+                if (existing?.name && (!setData.name || setData.name.trim() === '')) {
+                    setData.name = existing.name
+                }
+
+                // Preserve existing profile picture data if it exists
+                if (existing?.profilePic) {
+                    setData.profilePic = existing.profilePic
+                    setData.profilePicUpdatedAt = existing.profilePicUpdatedAt
+                }
+
+                // Remove name from setData if it's null/undefined/empty after preservation
+                if (setData.name == null || setData.name.trim() === '') {
+                    delete setData.name
+                }
+
+                // Base update with $set (always present with updatedAt)
+                const update: any = {
+                    $set: setData,
+                    $setOnInsert: {
+                        instanceId,
+                        id: contact.id,
+                        ...(notify !== undefined ? { notify } : {})
+                    }
+                }
+
+                // Add $unset if needed to clean up existing null name
+                if (existing && existing.name === null && !setData.name) {
+                    update.$unset = { name: 1 }
+                }
+
                 return {
-                    replaceOne: {
-                        filter: { instanceId, id: contact.id },
-                        replacement: {
-                            ...contact,
-                            instanceId,
-                            updatedAt: new Date(),
-                            // Preserve existing profile picture data if it exists
-                            ...(existing?.profilePic && {
-                                profilePic: existing.profilePic,
-                                profilePicUpdatedAt: existing.profilePicUpdatedAt
-                            })
-                        },
+                    updateOne: {
+                        filter: { instanceId: validatedInstanceId, id: contact.id },
+                        update,
                         upsert: true
                     }
                 }
-            })
+            });
             
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
                 const chunk = bulkOps.slice(i, i + BATCH_SIZE)
-                await withConnection(async () =>
-                    collections.contacts.bulkWrite(chunk, { ordered: false })
-                )
+                try {
+                    await withConnection(async () =>
+                        collections.contacts.bulkWrite(chunk, { ordered: false })
+                    )
+                } catch (e: any) {
+                    // Handle duplicate and path conflict errors by retrying without upsert
+                    if (e?.code === 11000 || e?.code === 40 || String(e?.message || '').includes("conflict at 'id'")) {
+                        const fallbackOps = chunk.map(op => {
+                            const u = (op as any).updateOne
+                            return {
+                                updateOne: {
+                                    filter: u.filter,
+                                    update: {
+                                        $set: {
+                                            ...(u.update?.$set || {}),
+                                            updatedAt: new Date()  // Ensure atomic operator
+                                        }
+                                    },
+                                    upsert: false
+                                }
+                            }
+                        })
+                        await withConnection(async () =>
+                            collections.contacts.bulkWrite(fallbackOps as any, { ordered: false })
+                        )
+                    } else {
+                        throw e
+                    }
+                }
             }
             
             log(`✅ [Contacts] Saved ${contacts.length} contacts to database`)
@@ -3464,6 +4240,169 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     trackOperation(profileFetchPromise, `Profile picture fetch for ${contacts.length} contacts`)
                 })
             }
+
+            // Fetch LIDs asynchronously in the background
+            // Supports both Baileys v7 (signalRepository.lidMapping) and legacy (onWhatsApp) APIs
+            if (finalLidConfig?.enabled && sock) {
+                setImmediate(async () => {
+                    const lidFetchPromise = (async () => {
+                        if (isClosing || clearAllInProgress) {
+                            log(`⚠️ [Contacts] Skipping LID fetch - store is ${isClosing ? 'closing' : 'clearing'}`)
+                            return
+                        }
+                        log(`📍 [Contacts] Starting LID fetch for ${contacts.length} contacts`)
+
+                        const requestDelay = finalLidConfig.requestDelay || 500 // Increased default delay for rate limiting
+                        const maxRetries = finalLidConfig.retryAttempts || 3
+
+                        // Check if Baileys v7 native LID mapping store is available
+                        const hasNativeStore = !!(sock?.signalRepository?.lidMapping?.getLIDForPN)
+                        
+                        if (hasNativeStore) {
+                            log(`📍 [Contacts] Using Baileys v7 native LID mapping store`)
+                        } else if (sock?.onWhatsApp) {
+                            log(`📍 [Contacts] Using legacy onWhatsApp API for LID fetch`)
+                        } else {
+                            log(`⚠️ [Contacts] No LID fetch API available, skipping`)
+                            return
+                        }
+
+                        // Collect contacts that need LID lookup
+                        const contactsToFetch: string[] = []
+                        for (const contact of contacts) {
+                            // Only fetch LIDs for user JIDs (@s.whatsapp.net)
+                            // Skip groups (@g.us) and LIDs (@lid)
+                            if (!contact.id.endsWith('@s.whatsapp.net') || contact.id.includes('@lid') || contact.id.endsWith('@g.us')) {
+                                continue
+                            }
+
+                            // Check if we need to fetch LID for this contact
+                            const existingData = existingDataMap.get(contact.id)
+
+                            if (existingData?.lid) {
+                                log(`⏭️ [Contacts] Skipping LID for ${contact.id} (already has LID)`)
+                                continue
+                            }
+                            
+                            contactsToFetch.push(contact.id)
+                        }
+                        
+                        if (contactsToFetch.length === 0) {
+                            log(`✅ [Contacts] No contacts need LID fetch`)
+                            return
+                        }
+
+                        // Baileys v7: Use batch getLIDsForPNs for efficiency
+                        if (hasNativeStore && sock) {
+                            try {
+                                const nativeStore = sock.signalRepository.lidMapping
+                                const batchSize = 50 // Process in batches to avoid overwhelming
+                                
+                                for (let i = 0; i < contactsToFetch.length; i += batchSize) {
+                                    if (isClosing || !sock) {
+                                        log(`⚠️ [Contacts] Stopping LID fetch - store closing`)
+                                        break
+                                    }
+                                    
+                                    const batch = contactsToFetch.slice(i, i + batchSize)
+                                    
+                                    try {
+                                        const mappings = await nativeStore.getLIDsForPNs(batch)
+                                        
+                                        if (mappings && mappings.length > 0) {
+                                            for (const mapping of mappings) {
+                                                const { pn, lid } = mapping
+                                                
+                                                // Update contact with LID in MongoDB (safe against duplicate key)
+                                                await safeSetLid(pn, lid)
+                                                
+                                                // Also store in LidHandler for cache
+                                                if (lidHandler) {
+                                                    try {
+                                                        await lidHandler.storeLidMapping(lid, pn)
+                                                    } catch {
+                                                        // Ignore cache errors
+                                                    }
+                                                }
+                                                
+                                                log(`✅ [Contacts] Updated LID for ${pn} via v7 API`)
+                                            }
+                                        }
+                                    } catch (batchError: any) {
+                                        log(`⚠️ [Contacts] Batch LID fetch failed: ${batchError?.message}`)
+                                    }
+                                    
+                                    // Rate limiting between batches
+                                    if (requestDelay > 0 && i + batchSize < contactsToFetch.length) {
+                                        await new Promise(resolve => setTimeout(resolve, requestDelay))
+                                    }
+                                }
+                            } catch (error: any) {
+                                log(`❌ [Contacts] Native LID fetch failed: ${error?.message}`)
+                            }
+                        } 
+                        // Legacy: Use onWhatsApp API (Baileys v6 and earlier)
+                        else if (sock?.onWhatsApp) {
+                            for (const contactId of contactsToFetch) {
+                                // Rate limiting: add delay between requests
+                                if (requestDelay > 0) {
+                                    await new Promise(resolve => setTimeout(resolve, requestDelay))
+                                }
+
+                                log(`📍 [Contacts] Fetching LID for ${contactId}`)
+
+                                let attempts = 0
+                                let lid: string | undefined
+
+                                while (attempts < maxRetries && !lid) {
+                                    try {
+                                        // Check if store is closing or sock is null
+                                        if (isClosing || !sock) {
+                                            log(`⚠️ [Contacts] Stopping LID fetch - ${isClosing ? 'closing' : 'no socket'}`)
+                                            break
+                                        }
+
+                                        const result = await sock.onWhatsApp(contactId) as Array<{ jid: string; exists: boolean; lid?: string }> | undefined
+
+                                        if (result && result.length > 0 && result[0].exists && result[0].lid) {
+                                            lid = result[0].lid
+                                            // Update contact with LID (safe against duplicate key)
+                                            await safeSetLid(contactId, lid)
+
+                                            // Also store in LidHandler for cache
+                                            if (lidHandler) {
+                                                try {
+                                                    await lidHandler.storeLidMapping(lid, contactId)
+                                                } catch {
+                                                    // Ignore cache errors
+                                                }
+                                            }
+
+                                            log(`✅ [Contacts] Updated LID for ${contactId}`)
+                                            break
+                                        }
+                                    } catch (error: any) {
+                                        attempts++
+                                        if (attempts < maxRetries) {
+                                            log(`⚠️ [Contacts] Retry ${attempts}/${maxRetries} for ${contactId}: ${error?.message}`)
+                                            await new Promise(resolve => setTimeout(resolve, requestDelay * 2))
+                                        }
+                                    }
+                                }
+
+                                if (!lid && attempts >= maxRetries) {
+                                    log(`❌ [Contacts] Failed to fetch LID for ${contactId} after ${maxRetries} attempts`)
+                                }
+                            }
+                        }
+
+                        log(`✅ [Contacts] LID fetch completed for ${contacts.length} contacts`)
+                    })()
+
+                    // Track this operation with metadata
+                    trackOperation(lidFetchPromise, `LID fetch for ${contacts.length} contacts`)
+                })
+            }
         },
 
         async getMessages(jid: string): Promise<proto.IWebMessageInfo[]> {
@@ -3483,8 +4422,30 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const startTime = Date.now()
                 trackActivity() // Track request
                 
-                const validJid = safeValidateJID(jid)
+                // Normalize out any :XX suffixes for safe comparison/lookup
+                const validJid = safeValidateJID(safeNormalizeJid(jid))
+                
+                // Fast-exit for placeholder IDs to avoid unnecessary DB queries
+                if (typeof id === 'string' && id.startsWith('PLACEHOLDER_')) {
+                    const nfKey1 = `nf_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(id)}`
+                    const nfKey2 = `nf_${validatedInstanceId}_${hashForLogging(id)}`
+                    notFoundCache.set(nfKey1, true)
+                    notFoundCache.set(nfKey2, true)
+                    return null
+                }
+                
                 const validId = safeValidateMessageId(id)
+                
+                // Early JID normalization: try normalized variant first when available
+                const candidateJids: string[] = [validJid]
+                if (lidHandler) {
+                    try {
+                        const normalized = await lidHandler.normalizeJid(validJid)
+                        if (normalized && normalized !== validJid) {
+                            candidateJids.unshift(normalized)
+                        }
+                    } catch {}
+                }
                 
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
                 
@@ -3494,30 +4455,62 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     return cached
                 }
                 
-                // First try the standard query
-                let message = await withConnection(async () => 
-                    collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        'key.id': validId
-                    })
-                )
+                // Negative cache: avoid repeated slow lookups for recent misses
+                const nfKey1 = `nf_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
+                const nfKey2 = `nf_${validatedInstanceId}_${hashForLogging(validId)}`
+                if (notFoundCache.get(nfKey1) || notFoundCache.get(nfKey2)) {
+                    return null
+                }
+                
+                // First try the standard query, with hint and time budget; try normalized JID first
+                let message: any = null
+                for (const tryJid of candidateJids) {
+                    message = await withConnection(async () => 
+                        collections.messages.findOne({
+                            instanceId: validatedInstanceId,
+                            jid: tryJid,
+                            'key.id': validId
+                        }, {
+                            // @ts-ignore - hint & maxTimeMS supported by driver
+                            hint: { instanceId: 1, jid: 1, 'key.id': 1 },
+                            maxTimeMS: 150
+                        } as any)
+                    )
+                    if (message) break
+                }
                 
                 // If not found, try alternative queries for poll messages and other edge cases
                 if (!message) {
                     
                     // Try with key.remoteJid instead of jid field (common for poll messages)
                     log(`[getMessage] Primary query failed, trying fallback with key.remoteJid for ${validJid}/${validId}`)
-                    message = await withConnection(async () =>
-                        collections.messages.findOne({
+                    message = await withConnection(async () => {
+                        const cursor = collections.messages.find({
                             instanceId: validatedInstanceId,
                             'key.remoteJid': validJid,
                             'key.id': validId
-                        })
-                    )
+                        }).limit(1)
+                        try { cursor.hint({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }) } catch {}
+                        try {
+                            const arr = await cursor.maxTimeMS(150).toArray()
+                            return arr[0] || null
+                        } catch {
+                            const arr = await cursor.toArray()
+                            return arr[0] || null
+                        }
+                    })
                     
                     if (message) {
                         log(`[getMessage] Found message using key.remoteJid fallback for ${validJid}/${validId}`)
+                        // Read-repair: ensure future primary lookups hit the primary index
+                        try {
+                            await withConnection(async () =>
+                                collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, 'key.id': validId },
+                                    { $set: { jid: validJid, 'key.remoteJid': validJid } }
+                                )
+                            )
+                        } catch {}
                     }
                 }
                     
@@ -3540,15 +4533,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             // Hint not supported, continue without it
                         }
                         
-                        const results = await cursor.toArray()
-                        return results[0] || null
+                        try {
+                            const results = await cursor.maxTimeMS(200).toArray()
+                            return results[0] || null
+                        } catch {
+                            const results = await cursor.toArray()
+                            return results[0] || null
+                        }
                     })
                     const queryTime = Date.now() - queryStart
                     if (queryTime > 100) {
                         logWarn(`[getMessage] Slow query detected: ${queryTime}ms for key.id lookup (${validId})`)
                     }
                     
-                    // Check if the JID mismatch is acceptable
+                    // Check if the JID mismatch is acceptable, and attempt read-repair when resolvable
                     if (message && message.key?.remoteJid !== validJid) {
                             const foundJid = message.key?.remoteJid || message.jid
                             
@@ -3597,6 +4595,26 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         } catch (updateError) {
                                             logError(`Failed to update messages with new LID mapping:`, updateError)
                                         }
+                                        
+                                        // Read-repair for the current message document
+                                        try {
+                                            await withConnection(async () =>
+                                                collections.messages.updateOne(
+                                                    {
+                                                        instanceId: validatedInstanceId,
+                                                        'key.id': validId
+                                                    },
+                                                    {
+                                                        $set: {
+                                                            jid: phoneJid,
+                                                            'key.remoteJid': phoneJid,
+                                                            'lidMapping.resolved': true,
+                                                            'lidMapping.resolvedAt': new Date()
+                                                        }
+                                                    }
+                                                )
+                                            )
+                                        } catch {}
                                     }
                                 }
                             }
@@ -3612,6 +4630,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (!message) {
                         // Only log basic info, avoid expensive debug queries
                         log(`Message not found - ID: ${validId}, JID: ${validJid}`)
+                        notFoundCache.set(nfKey1, true)
+                        notFoundCache.set(nfKey2, true)
                         return null
                     }
                 
@@ -3647,27 +4667,52 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                     if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && clonedMessage.message.protocolMessage.key) {
                         const revokedKey = clonedMessage.message.protocolMessage.key
-                        log(`🔄 [Direct REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                        const outerChatJid = clonedMessage.key.remoteJid || jid
+                        
+                        // Prefer outer chat JID; normalize if LID
+                        let targetJid = outerChatJid
+                        if (lidHandler && targetJid) {
+                            try {
+                                const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                if (normalized) targetJid = normalized
+                            } catch {}
+                        }
+                        
+                        log(`🔄 [Direct REVOKE] Processing revoke message for ${revokedKey.id} in chat ${targetJid}`)
                         
                         try {
-                            // Update the revoked message to mark it as deleted/revoked
-                            const updateResult = await withConnection(async () =>
+                            const baseSet: any = {
+                                'message.protocolMessage': clonedMessage.message.protocolMessage,
+                                revoked: true,
+                                revokedAt: new Date(),
+                                revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid,
+                                messageStubType: 1
+                            }
+                            
+                            let updateResult = await withConnection(async () =>
                                 collections.messages.updateOne(
-                                    {
-                                        instanceId: validatedInstanceId,
-                                        jid: revokedKey.remoteJid || jid,
-                                        'key.id': revokedKey.id
-                                    },
-                                    {
-                                        $set: {
-                                            'message.protocolMessage': clonedMessage.message.protocolMessage,
-                                            revoked: true,
-                                            revokedAt: new Date(),
-                                            revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid
-                                        }
-                                    }
+                                    { instanceId: validatedInstanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                    { $set: baseSet }
                                 )
                             )
+                            
+                            if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                                updateResult = await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        { instanceId: validatedInstanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
+                                    )
+                                )
+                            }
+                            
+                            if (updateResult.matchedCount === 0) {
+                                updateResult = await withConnection(async () =>
+                                    collections.messages.updateOne(
+                                        { instanceId: validatedInstanceId, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
+                                    )
+                                )
+                            }
                             
                             if (updateResult.matchedCount > 0) {
                                 log(`✅ [Direct REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
@@ -3849,6 +4894,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     // Queue media download using shared queue manager
                     if (sharedQueueManager && useSharedQueues) {
                         try {
+                            const queueAttempts = config.media?.maxRetries ? Math.max(config.media.maxRetries, 3) : 5
+                            const backoffDelay = config.media?.retryDelay ?? 1000
                             await sharedQueueManager.addJob(
                                 JobType.MEDIA_DOWNLOAD,
                                 {
@@ -3857,7 +4904,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     jid: validJid
                                 },
                                 validatedInstanceId,
-                                5 // Medium priority
+                                5, // Medium priority
+                                {
+                                    attempts: queueAttempts,
+                                    backoff: { type: 'exponential', delay: backoffDelay }
+                                }
                             )
                             log(`✅ Media download queued for message ${clonedMessage.key?.id}`)
                             config.logger?.info({
@@ -4000,15 +5051,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const originalTimestamp = existingMsg.messageTimestamp
                 
                 if (isMessageEdit) {
-                    log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
-                    log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                    if (shouldLogOnce(`um_det_${id}`, 5)) {
+                        log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
+                    }
+                    if (shouldLogOnce(`um_ts_${id}`, 5)) {
+                        log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                    }
                 }
                 
                 // Preserve original timestamp for edits
                 if (isMessageEdit && originalTimestamp) {
                     finalUpdate = { ...update }
                     finalUpdate.messageTimestamp = originalTimestamp
-                    log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                    if (shouldLogOnce(`um_pres_${id}`, 5)) {
+                        log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                    }
                 }
                 
                 // If existing message has quoted message and update has message content, preserve quoted structure
@@ -4104,16 +5161,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
-            // Fallback to direct delete
-            const filter: any = { instanceId: validatedInstanceId, jid: validJid }
-            
+            // Fallback to marking as revoked/deleted instead of deleting
             if (validIds && validIds.length > 0) {
-                filter['key.id'] = { $in: validIds }
+                await withConnection(async () =>
+                    collections.messages.updateMany(
+                        { instanceId: validatedInstanceId, jid: validJid, 'key.id': { $in: validIds } },
+                        { $set: { revoked: true, revokedAt: new Date(), updatedAt: new Date() } }
+                    )
+                )
+            } else {
+                await withConnection(async () =>
+                    collections.messages.updateMany(
+                        { instanceId: validatedInstanceId, jid: validJid },
+                        { $set: { deleted: true, deletedAt: new Date(), updatedAt: new Date() } }
+                    )
+                )
             }
-            
-            await withConnection(async () =>
-                collections.messages.deleteMany(filter)
-            )
             } catch (error) {
                 if (error instanceof ValidationError || error instanceof AuthorizationError) {
                     throw error
@@ -4377,6 +5440,28 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async upsertLabelAssociation(association: LabelAssociation): Promise<void> {
+            // Real-time LID resolution for chatId
+            if (lidHandler && lidHandler.isLidFormat(association.chatId)) {
+                const originalLid = association.chatId
+                const resolvedChatId = await lidHandler.normalizeJid(association.chatId)
+                if (resolvedChatId && resolvedChatId !== association.chatId) {
+                    log(`[${instanceId}] Real-time LID resolution for label association: ${originalLid} -> ${resolvedChatId}`)
+                    association.chatId = resolvedChatId
+
+                    // Mark as having LID mapping for tracking
+                    ;(association as any).lidMapping = {
+                        resolved: true,
+                        resolvedAt: new Date(),
+                        originalLid: originalLid
+                    }
+
+                    // Update metrics
+                    if (enableMetrics) {
+                        updateLidResolutionMetrics('realtime-label-associations', 'resolved')
+                    }
+                }
+            }
+
             // Use Bull queue if available
             if (bullInitialized && queues.has(QueueType.LABEL_ASSOCIATIONS)) {
                 try {
@@ -4584,7 +5669,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`[Direct] ✅ Label association deleted - type: ${association.type}`)
             }
         },
-
         // bind method continues with event handling...
         bind(ev: BaileysEventEmitter): void {
             // Check if already bound to prevent duplicate bindings
@@ -4626,28 +5710,55 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         // Handle REVOKE messages - update the revoked message instead of storing the revoke message
                         if (protoType === proto.Message.ProtocolMessage.Type.REVOKE && msg.message.protocolMessage.key) {
                             const revokedKey = msg.message.protocolMessage.key
-                            log(`🔄 [REVOKE] Processing revoke message for ${revokedKey.id} in chat ${revokedKey.remoteJid || jid}`)
+                            const outerChatJid = msg.key.remoteJid || jid
+                            
+                            // Always prefer the outer chat JID; protocolMessage.key.remoteJid can be unreliable
+                            let targetJid = outerChatJid
+                            if (lidHandler && targetJid) {
+                                try {
+                                    const normalized = await (lidHandler as any).normalizeJid(targetJid)
+                                    if (normalized) targetJid = normalized
+                                } catch {}
+                            }
+                            
+                            log(`🔄 [REVOKE] Processing revoke message for ${revokedKey.id} in chat ${targetJid}`)
                             
                             try {
                                 // Update the revoked message to mark it as deleted/revoked
-                                const targetJid = revokedKey.remoteJid || jid
-                                const updateResult = await withConnection(async () =>
+                                const baseSet: any = {
+                                    'message.protocolMessage': msg.message?.protocolMessage,
+                                    revoked: true,
+                                    revokedAt: new Date(),
+                                    revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid,
+                                    messageStubType: 1 // REVOKE
+                                }
+                                
+                                let updateResult = await withConnection(async () =>
                                     collections.messages.updateOne(
-                                        {
-                                            instanceId,
-                                            jid: targetJid,
-                                            'key.id': revokedKey.id
-                                        },
-                                        {
-                                            $set: {
-                                                'message.protocolMessage': msg.message?.protocolMessage,
-                                                revoked: true,
-                                                revokedAt: new Date(),
-                                                revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid
-                                            }
-                                        }
+                                        { instanceId, jid: targetJid, 'key.id': revokedKey.id },
+                                        { $set: baseSet }
                                     )
                                 )
+                                
+                                // Fallback 1: try with outer (non-normalized) JID if different
+                                if (updateResult.matchedCount === 0 && targetJid !== outerChatJid) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, jid: outerChatJid, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
+                                
+                                // Fallback 2: match by id only within the instance (jid may have changed due to normalization/history)
+                                if (updateResult.matchedCount === 0) {
+                                    updateResult = await withConnection(async () =>
+                                        collections.messages.updateOne(
+                                            { instanceId, 'key.id': revokedKey.id },
+                                            { $set: baseSet }
+                                        )
+                                    )
+                                }
                                 
                                 if (updateResult.matchedCount > 0) {
                                     log(`✅ [REVOKE] Successfully marked message ${revokedKey.id} as revoked`)
@@ -4679,19 +5790,53 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (await shouldStoreEvent('messages.upsert', msg)) {
                         try {
                             // Enhanced LID handling with complete pattern support
+                            // Supports both new format (remoteJidAlt + addressingMode) and legacy (senderLid + senderPn)
                             if (lidHandler) {
                                 const isFromMe = msg.key.fromMe || false
                                 const remoteJid = msg.key.remoteJid
                                 const senderLid = (msg.key as any)?.senderLid
                                 const senderPn = (msg.key as any)?.senderPn
+                                // NEW FORMAT: Extract remoteJidAlt and addressingMode
+                                const addressingMode = (msg.key as any)?.addressingMode
+                                const remoteJidAlt = (msg.key as any)?.remoteJidAlt
                                 
-                                // Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
-                                if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
-                                    log(`[LID] Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
+                                // NEW PATTERN A: addressingMode='pn' - Incoming message (customer to bot)
+                                // remoteJid is phone number, remoteJidAlt is LID
+                                if (addressingMode === 'pn' && remoteJidAlt && lidHandler.isLidFormat(remoteJidAlt) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] New Pattern A: addressingMode=pn, remoteJid=phone, remoteJidAlt=lid`)
+                                    log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
+                                    
+                                    // Store the mapping (lid -> phone)
+                                    await lidHandler.storeLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    
+                                    // jid is already the phone number, no change needed
+                                    // Update existing messages with this LID
+                                    await lidHandler.updateExistingMessages(remoteJidAlt, remoteJid)
+                                }
+                                // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
+                                // remoteJid is LID, remoteJidAlt is phone number
+                                else if (addressingMode === 'lid' && remoteJidAlt && !lidHandler.isLidFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] New Pattern B: addressingMode=lid, remoteJid=lid, remoteJidAlt=phone`)
+                                    log(`[LID] Discovering: ${remoteJid} -> ${remoteJidAlt}`)
+                                    
+                                    // Store the mapping (lid -> phone)
+                                    // Outgoing message: do not persist pushName (it's our own)
+                                    await lidHandler.storeLidMapping(remoteJid, remoteJidAlt)
+                                    
+                                    // Update message to use phone number
+                                    msg.key.remoteJid = remoteJidAlt
+                                    jid = remoteJidAlt
+                                    
+                                    // Update existing messages with this LID
+                                    await lidHandler.updateExistingMessages(remoteJid, remoteJidAlt)
+                                }
+                                // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
+                                else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
+                                    log(`[LID] Legacy Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
                                     log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
                                     
                                     // Store the mapping
-                                    await lidHandler.storeLidMapping(remoteJid, senderPn)
+                                    await lidHandler.storeLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName)
                                     
                                     // Update message to use phone number
                                     msg.key.remoteJid = senderPn
@@ -4700,9 +5845,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     // Update existing messages with this LID
                                     await lidHandler.updateExistingMessages(remoteJid, senderPn)
                                 }
-                                // Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
+                                // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
                                 else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
-                                    log(`[LID] Pattern 2: FromMe=true, LID remoteJid (need reverse lookup)`)
+                                    log(`[LID] Legacy Pattern 2: FromMe=true, LID remoteJid (need reverse lookup)`)
                                     
                                     // First check if we already have a mapping
                                     let phoneNumber = await lidHandler.getPhoneNumberFromLid(remoteJid)
@@ -4714,6 +5859,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         
                                         if (phoneNumber) {
                                             log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
+                                            // Outgoing message: do not persist pushName (it's our own)
                                             await lidHandler.storeLidMapping(remoteJid, phoneNumber)
                                             await lidHandler.updateExistingMessages(remoteJid, phoneNumber)
                                         }
@@ -4727,6 +5873,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     } else {
                                         log(`[LID] Warning: Could not resolve LID ${remoteJid} for fromMe message`)
                                     }
+                                }
+                                // Pattern X: FromMe=false, senderLid present and remoteJid already a phone number
+                                // Proactively store mapping with pushName
+                                else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
+                                    log(`[LID] Pattern X: FromMe=false, senderLid with phone remoteJid`)
+                                    await lidHandler.storeLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName)
                                 }
                                 // Pattern 3: FromMe=false with only senderLid (no phone yet)
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && !senderPn) {
@@ -4751,9 +5903,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 // Store debug info in message
-                                if ((remoteJid && lidHandler.isLidFormat(remoteJid)) || senderLid || (senderPn && lidHandler.isLidFormat(senderPn))) {
+                                // Include both new format fields and legacy fields for debugging
+                                if ((remoteJid && lidHandler.isLidFormat(remoteJid)) || senderLid || (senderPn && lidHandler.isLidFormat(senderPn)) || addressingMode || remoteJidAlt) {
                                     (msg as any).lidDebug = {
                                         originalRemoteJid: remoteJid,
+                                        // New format fields
+                                        addressingMode,
+                                        remoteJidAlt,
+                                        // Legacy fields
                                         senderLid,
                                         senderPn,
                                         fromMe: isFromMe,
@@ -4787,6 +5944,63 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                             }
                             
+                            // Before storing, persist pushName to contacts.notify (no override),
+                            // only for incoming messages and user JIDs
+                            try {
+                                const pushName = (msg as any)?.pushName
+                                const targetJid = jid
+                                if (pushName && !msg.key.fromMe && targetJid && targetJid.endsWith('@s.whatsapp.net')) {
+                                    // Route through CONTACTS queue to serialize writes
+                                    if (queues.has(QueueType.CONTACTS)) {
+                                        const queue = queues.get(QueueType.CONTACTS)!
+                                        await queue.add(
+                                            'update',
+                                            {
+                                                type: 'update',
+                                                contact: { id: targetJid, notify: pushName },
+                                                instanceId,
+                                                timestamp: Date.now()
+                                            },
+                                            { ...defaultJobOptions, priority: 3 }
+                                        )
+                                    } else {
+                                        // Fallback to direct guarded update
+                                        const filter: any = {
+                                            instanceId,
+                                            id: targetJid,
+                                            $or: [
+                                                { notify: { $exists: false } },
+                                                { notify: { $in: [null, ''] } }
+                                            ]
+                                        }
+                                        await withConnection(async () => {
+                                            try {
+                                                await collections.contacts.updateOne(
+                                                    filter,
+                                                    {
+                                                        $set: { notify: pushName, updatedAt: new Date() },
+                                                        $setOnInsert: { instanceId, id: targetJid }
+                                                    },
+                                                    { upsert: true }
+                                                )
+                                            } catch (e: any) {
+                                                if (e?.code === 11000) {
+                                                    await collections.contacts.updateOne(
+                                                        filter,
+                                                        { $set: { notify: pushName, updatedAt: new Date() } },
+                                                        { upsert: false }
+                                                    )
+                                                } else {
+                                                    throw e
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                            } catch (err) {
+                                logWarn(`⚠️ [Contacts] Failed to persist pushName for ${jid}: ${String(err)}`)
+                            }
+
                             // Store the message with normalized JID
                             if (jid) {
                                 await storeImpl.upsertMessage(jid, msg)
@@ -4800,7 +6014,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const checkExistingMedia = async (hash: string): Promise<string | null> => {
                                     const existing = await withConnection(async () =>
                                         collections.messages.findOne({
-                                            instanceId,
+                                            instanceId: validatedInstanceId,
                                             mediaHash: hash,
                                             mediaUrl: { $exists: true }
                                         })
@@ -4822,22 +6036,43 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     }, '🔍 DEBUG: Media download detection')
                                 }
                                 
+                                // Prefer background queue when available
+                                const mediaInfo = extractMediaInfo(msg)
+                                if (mediaInfo && sharedQueueManager && useSharedQueues) {
+                                    try {
+                                        const queueAttempts = config.media?.maxRetries ? Math.max(config.media.maxRetries, 3) : 5
+                                        const backoffDelay = config.media?.retryDelay ?? 1000
+                                        await sharedQueueManager.addJob(
+                                            JobType.MEDIA_DOWNLOAD,
+                                            { message: msg, mediaInfo, jid },
+                                            validatedInstanceId,
+                                            5,
+                                            {
+                                                attempts: queueAttempts,
+                                                backoff: { type: 'exponential', delay: backoffDelay }
+                                            }
+                                        )
+                                        log(`📥 Media download queued for message ${msg.key?.id}`)
+                                        // Do not also attempt inline; queue will update DB when done
+                                    } catch (e) {
+                                        logError(`❌ Failed to queue media download, falling back inline:`, e)
+                                    }
+                                }
+
+                                // Fallback inline behavior
                                 let mediaResult
                                 if (isOfficialAPI) {
                                     config.logger?.info({ 
                                         messageId: msg.key?.id,
                                         jid
-                                    }, '📥 Attempting Official API media download')
-                                    // Use Official API download method
+                                    }, '📥 Attempting Official API media download (inline)')
                                     mediaResult = await downloadOfficialAPIMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
                                 } else {
-                                    // Use regular Baileys download method
                                     mediaResult = await downloadMedia(msg, instanceId, config.media, config.logger, checkExistingMedia)
                                 }
-                                
+
                                 if (mediaResult.success && mediaResult.localPath) {
-                                    // Update message with media URL
-                                    const updateResult = await withConnection(async () =>
+                                    await withConnection(async () =>
                                         collections.messages.updateOne(
                                             { 
                                                 instanceId, 
@@ -4857,19 +6092,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             }
                                         )
                                     )
-                                    
                                     if (mediaResult.reused) {
-                                        log(`♻️  Media reused for message ${msg.key.id}: ${mediaResult.localPath} (saved storage space)`)
+                                        log(`♻️  Media reused for message ${msg.key.id}: ${mediaResult.localPath}`)
                                     } else {
-                                        log(`✅ Media downloaded for message ${msg.key.id}: ${mediaResult.localPath}`)
-                                    }
-                                    log(`📝 MongoDB update result: matched=${updateResult.matchedCount}, modified=${updateResult.modifiedCount}`)
-                                    
-                                    if (updateResult.matchedCount === 0) {
-                                        log(`⚠️ No document found to update for message ${msg.key.id} in chat ${jid}`)
+                                        log(`✅ Media downloaded inline for message ${msg.key.id}: ${mediaResult.localPath}`)
                                     }
                                 } else if (!mediaResult.success && mediaResult.error) {
-                                    log(`⚠️ Media download failed for message ${msg.key.id}: ${mediaResult.error}`)
+                                    log(`⚠️ Media download failed inline for message ${msg.key.id}: ${mediaResult.error}`)
                                 }
                             }
                             
@@ -4893,11 +6122,34 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     let jid = update.key.remoteJid
                     if (!jid) continue
                     
+                    // Skip delivery status updates for outgoing messages (fromMe)
+                    // Only track when the RECIPIENT received/read a message
+                    if (update.key.fromMe && update.update?.status !== undefined) {
+                        const hasNonStatusFields = !!(
+                            update.update?.message ||
+                            update.update?.starred !== undefined ||
+                            update.update?.pinInChat !== undefined ||
+                            (update.update as any)?.pollUpdates ||
+                            (update.update as any)?.reactions
+                        )
+                        if (!hasNonStatusFields) continue
+                    }
+                    
                     // Normalize JID through LID handler if available
                     if (lidHandler) {
                         jid = await lidHandler.normalizeJid(jid) || jid
                     }
                     
+                    // Deduplicate identical updates for the same message within a short window
+                    try {
+                        const updateSignature = JSON.stringify(update.update?.message?.editedMessage || update.update || {})
+                        const dedupKey = `mu_${update.key.id}_${hashForLogging(updateSignature)}`
+                        if (processedEditCache.get(dedupKey)) {
+                            continue
+                        }
+                        processedEditCache.set(dedupKey, true, 5)
+                    } catch {}
+
                     if (await shouldStoreEvent('messages.update', update)) {
                         try {
                             // For edited messages, we need to preserve the quoted message structure
@@ -4912,8 +6164,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 const originalTimestamp = existingMessage.messageTimestamp
                                 
                                 if (isMessageEdit) {
-                                    log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
-                                    log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                    if (shouldLogOnce(`mu_det_${update.key.id}`, 5)) {
+                                        log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
+                                    }
+                                    if (shouldLogOnce(`mu_ts_${update.key.id}`, 5)) {
+                                        log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                    }
                                 }
                                 
                                 // Deep merge the update with existing message to preserve quoted messages
@@ -4929,7 +6185,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 // CRITICAL: Preserve original messageTimestamp for MESSAGE_EDIT
                                 if (isMessageEdit && originalTimestamp) {
                                     mergedUpdate.messageTimestamp = originalTimestamp
-                                    log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                                    if (shouldLogOnce(`mu_pres_${update.key.id}`, 5)) {
+                                        log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                                    }
                                 }
                                 
                                 // Preserve quoted message structure if it exists
@@ -4950,7 +6208,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 await storeImpl.updateMessage(jid, update.key.id!, mergedUpdate)
-                                log(`✅ Updated message ${update.key.id} preserving quoted message structure${isMessageEdit ? ' and original timestamp' : ''}`)
+                                if (shouldLogOnce(`mu_done_${update.key.id}`, 2)) {
+                                    log(`✅ Updated message ${update.key.id} preserving quoted message structure${isMessageEdit ? ' and original timestamp' : ''}`)
+                                }
                             } else {
                                 // If no existing message found, just apply the update
                                 await storeImpl.updateMessage(jid, update.key.id!, update.update!)
@@ -4980,13 +6240,35 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     
                     const ids = item.keys.map(k => k.id).filter(id => id) as string[]
+                    const fromMe = item.keys[0]?.fromMe
                     if (await shouldStoreEvent('messages.delete', item)) {
                         try {
-                            await storeImpl.deleteMessages(jid, ids)
+                            // Retain original messages but mark them as revoked/deleted instead of removing
+                            const updateFields: any = {
+                                revoked: true,
+                                revokedAt: new Date(),
+                                updatedAt: new Date()
+                            }
+                            if (typeof fromMe === 'boolean') {
+                                updateFields.revokedBy = fromMe ? 'me' : 'remote'
+                            }
+                            await withConnection(async () =>
+                                collections.messages.updateMany(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': { $in: ids }
+                                    },
+                                    { $set: updateFields }
+                                )
+                            )
+                            if (shouldLogOnce(`md_mark_${hashForLogging(jid)}_${hashForLogging(ids.join(','))}`, 5)) {
+                                log(`✅ Marked ${ids.length} message(s) as revoked in ${jid}`)
+                            }
                             if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
                             if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
                         } catch (error) {
-                            logError(`Failed to delete messages for ${jid}:`, error)
+                            logError(`Failed to mark messages revoked for ${jid}:`, error)
                             if (enableMetrics) updateEventMetrics('messages.delete', 'error')
                         }
                     }
@@ -5001,11 +6283,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     
                     if (await shouldStoreEvent('messages.delete', item)) {
                         try {
-                            await storeImpl.deleteMessages(jid)
+                            // Retain messages but mark them as deleted for the chat
+                            await withConnection(async () =>
+                                collections.messages.updateMany(
+                                    { instanceId, jid },
+                                    { $set: { deleted: true, deletedAt: new Date(), updatedAt: new Date() } }
+                                )
+                            )
+                            if (shouldLogOnce(`md_mark_all_${hashForLogging(jid)}`, 10)) {
+                                log(`✅ Marked all messages as deleted in ${jid}`)
+                            }
                             if (enableMetrics) updateEventMetrics('messages.delete', 'stored')
                             if (hooks.afterStore) await hooks.afterStore('messages.delete', item)
                         } catch (error) {
-                            logError(`Failed to delete all messages for ${item.jid}:`, error)
+                            logError(`Failed to mark all messages deleted for ${item.jid}:`, error)
                             if (enableMetrics) updateEventMetrics('messages.delete', 'error')
                         }
                     }
@@ -5124,17 +6415,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     try {
                         const metadata = await storeImpl.getGroupMetadata(id)
                         if (metadata) {
+                            // Extract participant IDs (participants can be GroupParticipant objects or strings)
+                            const participantIds = participants.map(p => typeof p === 'string' ? p : p.id)
                             if (action === 'add') {
-                                metadata.participants.push(...participants.map(id => ({ id, admin: null })))
+                                metadata.participants.push(...participantIds.map(participantId => ({ id: participantId, admin: null })))
                             } else if (action === 'remove') {
-                                metadata.participants = metadata.participants.filter(p => !participants.includes(p.id))
+                                metadata.participants = metadata.participants.filter(p => !participantIds.includes(p.id))
                             } else if (action === 'promote') {
                                 metadata.participants.forEach(p => {
-                                    if (participants.includes(p.id)) p.admin = 'admin'
+                                    if (participantIds.includes(p.id)) p.admin = 'admin'
                                 })
                             } else if (action === 'demote') {
                                 metadata.participants.forEach(p => {
-                                    if (participants.includes(p.id)) p.admin = null
+                                    if (participantIds.includes(p.id)) p.admin = null
                                 })
                             }
                             await storeImpl.upsertGroupMetadata(id, metadata)
@@ -5206,7 +6499,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
             })
-
             // Messaging history sync with debouncing
             ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
                 if (enableMetrics) updateEventMetrics('messaging-history.set', 'received')
@@ -5240,8 +6532,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 // Clear all data if any event has isLatest=true and clearAllOnHistorySync is enabled
                                 if (hasLatest && config.clearAllOnHistorySync) {
-                                    log(`[${instanceId}] Clearing all data before syncing latest history (isLatest=true, clearAllOnHistorySync=true)`)
-                                    await storeImpl.clearAll()
+                                log(`[${instanceId}] Clearing data before syncing latest history (isLatest=true, clearAllOnHistorySync=true) while preserving contacts`)
+                                await storeImpl.clearAll({ preserve: ['contacts'] })
                                 }
                                 
                                 // Merge all history data
@@ -5295,7 +6587,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     // Group messages by chat for batch processing
                                     const messagesByChat = new Map<string, proto.IWebMessageInfo[]>()
                                     for (const msg of allMessages) {
-                                        const chatId = msg.key.remoteJid!
+                                        const chatId = msg.key?.remoteJid
+                                        if (!chatId) continue
                                         if (!messagesByChat.has(chatId)) {
                                             messagesByChat.set(chatId, [])
                                         }
@@ -5312,6 +6605,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 await Promise.all(promises)
                                 log(`[${instanceId}] Successfully processed ${dataToProcess.length} accumulated history events`)
+
+                                // Proactively resolve LID jids in historical messages (only once per instance)
+                                if (hasLatest && lidHandler && !historyLidResolutionDone && (finalLidConfig.proactiveHistoryResolution === true)) {
+                                    try {
+                                        await storeImpl.performProactiveLidResolutionForHistory()
+                                        historyLidResolutionDone = true
+                                        log(`[${instanceId}] Completed proactive LID resolution for historical messages`)
+                                    } catch (error) {
+                                        logError(`[${instanceId}] Error during proactive LID resolution:`, error)
+                                    }
+                                }
                             } catch (error) {
                                 logError(`[${instanceId}] Error processing accumulated history:`, error)
                             }
@@ -5445,6 +6749,48 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
             })
+            
+            // Baileys v7+ LID mapping update event
+            // This event is emitted when Baileys discovers a new LID-to-phone number mapping
+            ev.on('lid-mapping.update', async (data: { lid: string; pn: string }) => {
+                if (enableMetrics) updateEventMetrics('lid-mapping.update', 'received')
+                
+                // Check if LID mapping handling is enabled
+                const handleLidMappingEvents = finalLidConfig?.handleLidMappingEvents !== false
+                if (!handleLidMappingEvents) {
+                    log(`[${instanceId}] Skipping lid-mapping.update event (disabled in config)`)
+                    return
+                }
+                
+                if (await shouldStoreEvent('lid-mapping.update', data)) {
+                    try {
+                        const { lid, pn } = data
+                        
+                        if (!lid || !pn) {
+                            log(`[${instanceId}] Invalid lid-mapping.update data: missing lid or pn`)
+                            return
+                        }
+                        
+                        log(`📍 [LID Mapping Update] Received: ${lid} -> ${pn}`)
+                        
+                        // Store the mapping in MongoDB via LidHandler
+                        if (lidHandler) {
+                            await lidHandler.handleLidMappingUpdate(data)
+                            
+                            // Also update the contact if it exists (safe against duplicate key)
+                            await safeSetLid(pn, lid, validatedInstanceId)
+                        }
+                        
+                        if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')
+                        if (hooks.afterStore) await hooks.afterStore('lid-mapping.update', data)
+                        
+                        log(`✅ [LID Mapping Update] Stored: ${lid} -> ${pn}`)
+                    } catch (error) {
+                        logError(`[${instanceId}] Failed to process lid-mapping.update:`, error)
+                        if (enableMetrics) updateEventMetrics('lid-mapping.update', 'error')
+                    }
+                }
+            })
         },
 
         // Method to update socket reference after store creation
@@ -5463,6 +6809,39 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`[${instanceId}] Re-initializing profile picture retrieval with new socket`)
                 // Profile picture functionality will use the updated socket
             }
+
+            // Pass reuploadRequest into media config if available for more reliable downloads
+            try {
+                // Best-effort detection of Baileys reupload function
+                const reupload = (socket as any)?.waUploadToServer || (socket as any)?.reuploadRequest || (socket as any)?.reuploadMedia
+                if (reupload && config.media) {
+                    (config.media as any).reuploadRequest = reupload
+                    log(`[${instanceId}] Enabled reuploadRequest for media downloads`)
+                }
+            } catch {}
+
+            // Baileys v7: Connect LidHandler to native LID mapping store
+            if (lidHandler && socket?.signalRepository?.lidMapping) {
+                log(`[${instanceId}] Connecting LidHandler to Baileys v7 native LID mapping store`)
+                lidHandler.setBaileysLidMappingStore(socket.signalRepository.lidMapping)
+                
+                // Optionally sync MongoDB mappings to native store on init
+                if (finalLidConfig?.syncToNativeStoreOnInit) {
+                    log(`[${instanceId}] Syncing MongoDB LID mappings to Baileys native store`)
+                    lidHandler.syncAllToBaileysStore().then(result => {
+                        log(`[${instanceId}] LID sync to native store: ${result.synced} synced, ${result.failed} failed`)
+                    }).catch(err => {
+                        logWarn(`[${instanceId}] Failed to sync LID mappings to native store:`, err)
+                    })
+                }
+            } else if (lidHandler) {
+                // Clear native store reference if socket doesn't have v7 API
+                lidHandler.setBaileysLidMappingStore(null)
+                if (socket && !socket?.signalRepository?.lidMapping) {
+                    log(`[${instanceId}] Socket does not have Baileys v7 LID mapping API, using legacy mode`)
+                }
+            }
+
         },
 
         // Health check method for store and database connection
@@ -5612,7 +6991,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return messages[0]
         },
 
-        async clearAll(): Promise<void> {
+        async clearAll(options?: { preserve?: Array<'chats' | 'contacts' | 'messages' | 'presences'> }): Promise<void> {
             // Check if clearAll is already in progress
             if (clearAllInProgress) {
                 log(`[${instanceId}] clearAll already in progress, skipping duplicate call`)
@@ -5685,19 +7064,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 })
                 
                 // Perform the actual deletion
-                log(`[${instanceId}] Deleting collections...`)
-                // Note: Labels, label associations, and group metadata are excluded from clearAll()
-                // They should persist across history syncs to maintain data integrity
-                await Promise.all([
-                    collections.chats.deleteMany({ instanceId }),
-                    collections.contacts.deleteMany({ instanceId }),
-                    collections.messages.deleteMany({ instanceId }),
-                    collections.presences.deleteMany({ instanceId })
-                    // Removed: collections.groupMetadata.deleteMany({ instanceId })
-                    // Removed: collections.labels.deleteMany({ instanceId })
-                    // Removed: collections.labelAssociations.deleteMany({ instanceId })
-                ])
-                
+                const preserveSet = new Set(options?.preserve || [])
+
+                const runDeletes = async (session?: ClientSession) => {
+                    const deletions: Array<Promise<any>> = []
+
+                    log(`[${instanceId}] Deleting collections${preserveSet.size ? ` (preserving: ${Array.from(preserveSet).join(', ')})` : ''}...`)
+                    if (!preserveSet.has('chats')) {
+                        deletions.push(collections.chats.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+                    if (!preserveSet.has('contacts')) {
+                        deletions.push(collections.contacts.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+                    if (!preserveSet.has('messages')) {
+                        deletions.push(collections.messages.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+                    if (!preserveSet.has('presences')) {
+                        deletions.push(collections.presences.deleteMany({ instanceId: validatedInstanceId }, { session }))
+                    }
+
+                    if (deletions.length === 0) {
+                        log(`[${instanceId}] No collections selected for deletion during clearAll`)
+                        return
+                    }
+
+                    await Promise.all(deletions)
+                }
+
+                await withConnection(async () => {
+                    await runDeletes()
+                })
+
                 const duration = Date.now() - startTime
                 log(`[CLEAR_ALL_END] Instance: ${instanceId}, Duration: ${duration}ms`)
                 
@@ -5802,12 +7199,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     ],
                     contacts: [
                         { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                        { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('contacts') * 24 * 60 * 60 } }
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } },
+                        // NEW: Composite index for efficient $in queries with projection fields
+                        { name: 'contacts_batch_lookup', spec: { instanceId: 1, id: 1, name: 1, profilePic: 1, profilePicUpdatedAt: 1, notify: 1, lid: 1 }, options: {} },
+                        // NEW: Covering index for lid->id lookups to avoid document fetch
+                        { name: 'contacts_lid_id_cover', spec: { instanceId: 1, lid: 1, id: 1 }, options: { partialFilterExpression: { lid: { $type: 'string' } } } }
                     ],
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                         { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
-                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } }
+                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: getTTLForCollection('messages') * 24 * 60 * 60 } },
+                        // Ensure compound index exists for manual per-instance cleanup
+                        { name: 'messages_instance_updatedAt', spec: { instanceId: 1, updatedAt: 1 }, options: {} },
+                        { name: 'messages_media_dedup', spec: { instanceId: 1, mediaHash: 1 }, options: { sparse: true } },
+                        { name: 'messages_remote_fallback', spec: { instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }, options: {} },
+                        { name: 'messages_keyid_direct', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
+                        // Supports reverse lookup for LID discovery when only senderLid is present on incoming messages
+                        { name: 'messages_senderLid_lookup', spec: { instanceId: 1, 'key.fromMe': 1, 'key.senderLid': 1 }, options: {} },
+                        // Supports reverse lookup for new format with remoteJidAlt and addressingMode
+                        { name: 'messages_remoteJidAlt_lookup', spec: { instanceId: 1, 'key.addressingMode': 1, 'key.remoteJidAlt': 1 }, options: { sparse: true } },
+                        // Index for LID resolution tracking
+                        { name: 'messages_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } },
+                        // Index for media deduplication by fileHash
+                        { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
                     ],
                     groupMetadata: [
                         { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -5826,7 +7240,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     labelAssociations: [
                         { name: 'labelAssociations_primary', spec: { instanceId: 1, chatId: 1, messageId: 1, labelId: 1 }, options: { unique: true } },
                         { name: 'labelAssociations_chatId_labelId', spec: { instanceId: 1, chatId: 1, labelId: 1 }, options: {} },
-                        { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} }
+                        { name: 'labelAssociations_messageId_labelId', spec: { instanceId: 1, messageId: 1, labelId: 1 }, options: {} },
+                        // Index for LID resolution tracking
+                        { name: 'labelAssociations_lid_resolution', spec: { instanceId: 1, 'lidMapping.resolved': 1 }, options: { sparse: true } }
+                    ],
+                    // Include LidHandler's collection in smart index management
+                    lidMappings: [
+                        { name: 'lidMappings_primary', spec: { instanceId: 1, lid: 1 }, options: { unique: true } },
+                        { name: 'lidMappings_phone_lookup', spec: { instanceId: 1, phoneNumber: 1 }, options: {} }
                     ]
                 }
                 
@@ -5836,10 +7257,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         const collection = collections[collectionName as keyof typeof collections]
                         
                         // Apply timeout to indexes
-                        const timedIndexes = requiredIndexes.map(idx => ({
-                            ...idx,
-                            options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
-                        }))
+                        const timedIndexes = requiredIndexes.map(addIndexTimeout)
                         
                         const result = await recreateIndexes(collection, timedIndexes)
                         totalCreated += result.successful
@@ -5951,14 +7369,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             try {
-                // Fetch the message from database
-                const message = await withConnection(async () =>
+                // Fetch the message from database (fallback to id-only match if needed)
+                let message = await withConnection(async () =>
                     collections.messages.findOne({
                         instanceId,
                         jid,
                         'key.id': messageId
                     })
                 )
+                if (!message) {
+                    message = await withConnection(async () =>
+                        collections.messages.findOne({
+                            instanceId,
+                            'key.id': messageId
+                        })
+                    )
+                }
                 
                 if (!message) {
                     return { success: false, error: 'Message not found' }
@@ -5973,36 +7399,58 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 const checkExistingMedia = async (hash: string): Promise<string | null> => {
                     const existing = await withConnection(async () =>
                         collections.messages.findOne({
-                            instanceId,
+                            instanceId: validatedInstanceId,
                             mediaHash: hash,
                             mediaUrl: { $exists: true }
                         })
                     ) as any
                     return existing?.mediaUrl || null
                 }
-                
-                // Download the media
-                const mediaResult = await downloadMedia(message, instanceId, config.media, config.logger, checkExistingMedia)
+
+                // Determine download strategy
+                const isOfficialAPI = (message as any).official_api === true
+                let mediaResult
+                if (isOfficialAPI) {
+                    mediaResult = await downloadOfficialAPIMedia(
+                        message as proto.IWebMessageInfo,
+                        instanceId,
+                        config.media,
+                        config.logger,
+                        checkExistingMedia,
+                        { attempt: 1 }
+                    )
+                } else {
+                    mediaResult = await downloadMedia(
+                        message as proto.IWebMessageInfo,
+                        instanceId,
+                        config.media,
+                        config.logger,
+                        checkExistingMedia
+                    )
+                }
                 
                 if (mediaResult.success && mediaResult.localPath) {
                     // Update message with media URL
+                    const filter = (message as any).jid
+                        ? { instanceId, jid: (message as any).jid, 'key.id': messageId }
+                        : jid
+                            ? { instanceId, jid, 'key.id': messageId }
+                            : { instanceId, 'key.id': messageId }
+                    const mediaUpdate: Record<string, any> = {
+                        mediaUrl: mediaResult.localPath,
+                        mediaDownloadedAt: new Date()
+                    }
+                    if (mediaResult.mediaType) mediaUpdate.mediaType = mediaResult.mediaType
+                    if (mediaResult.fileName) mediaUpdate.mediaFileName = mediaResult.fileName
+                    if (typeof mediaResult.fileSize === 'number') mediaUpdate.mediaFileSize = mediaResult.fileSize
+                    if (mediaResult.mediaHash) mediaUpdate.mediaHash = mediaResult.mediaHash
+                    if (typeof mediaResult.reused !== 'undefined') mediaUpdate.mediaReused = mediaResult.reused
+                    
                     await withConnection(async () =>
                         collections.messages.updateOne(
+                            filter,
                             { 
-                                instanceId, 
-                                jid, 
-                                'key.id': messageId 
-                            },
-                            { 
-                                $set: { 
-                                    mediaUrl: mediaResult.localPath,
-                                    mediaType: mediaResult.mediaType,
-                                    mediaFileName: mediaResult.fileName,
-                                    mediaFileSize: mediaResult.fileSize,
-                                    mediaHash: mediaResult.mediaHash,
-                                    mediaReused: mediaResult.reused || false,
-                                    mediaDownloadedAt: new Date()
-                                } 
+                                $set: mediaUpdate 
                             }
                         )
                     )
@@ -6029,8 +7477,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     instanceId: validatedInstanceId,
                     connected: true, // If client exists, it's connected
                     connectionConfig: {
-                        maxPoolSize: connectionConfig?.maxPoolSize ?? 100,
-                        minPoolSize: connectionConfig?.minPoolSize ?? 10,
+                        maxPoolSize: dedicatedMaxPoolSize,
+                        minPoolSize: dedicatedMinPoolSize,
                         maxIdleTimeMS: 30000
                     }
                 }
@@ -6126,6 +7574,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (sharedQueueManager && useSharedQueues) {
                 log(`🗑️ Unregistering processors for instance ${instanceId} from SharedQueueManager`)
                 sharedQueueManager.unregisterInstanceProcessors(validatedInstanceId)
+                try {
+                    await sharedQueueManager.releaseInstanceOwnership(validatedInstanceId)
+                    log(`[${instanceId}] Released shared queue ownership`)
+                } catch (error) {
+                    logWarn(`[${instanceId}] Failed to release shared queue ownership:`, error)
+                }
             }
             
             // Remove repeatable job for cleanup if it exists
@@ -6161,6 +7615,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                     // Disconnect Redis
                     if (redisConnection) redisConnection.disconnect()
+                    if (lidRedisClient && lidRedisClient !== redisConnection) {
+                        try { lidRedisClient.disconnect() } catch {}
+                    }
                 } catch (error) {
                     logError('Error closing Bull queues:', error)
                 }
@@ -6190,9 +7647,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 // Unregister from connection manager
                 await connectionManager.unregisterInstance(validatedInstanceId)
                 connectionManager = null
+                currentSharedPoolId = null
             } else if (client && !isUsingSharedConnection) {
                 // Close dedicated connection
                 await client.close()
+                currentSharedPoolId = null
             }
             
             // Reset connection state
@@ -6204,6 +7663,100 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Reset binding state
             isBound = false
+        },
+
+        /**
+         * Proactively resolve LID jids in historical messages to phone numbers
+         * This runs once per instance during initial history sync
+         */
+        async performProactiveLidResolutionForHistory(): Promise<void> {
+            if (!lidHandler) return
+
+            log(`[${instanceId}] Starting proactive LID resolution for historical messages`)
+
+            // Get all LID mappings from contacts collection
+            const lidMappings = await withConnection(async () =>
+                collections.contacts.find(
+                    {
+                        instanceId: validatedInstanceId,
+                        lid: { $exists: true, $ne: '' }
+                    },
+                    { projection: { lid: 1, id: 1 } }
+                ).toArray()
+            )
+
+            if (lidMappings.length === 0) {
+                log(`[${instanceId}] No LID mappings found, skipping proactive resolution`)
+                return
+            }
+
+            log(`[${instanceId}] Found ${lidMappings.length} LID mappings for proactive resolution`)
+
+            // Process mappings in batches to avoid overwhelming the database
+            const batchSize = 50
+            let totalMessagesUpdated = 0
+
+            for (let i = 0; i < lidMappings.length; i += batchSize) {
+                const batch = lidMappings.slice(i, i + batchSize)
+                const batchPromises = batch.map(async (mapping: any) => {
+                    const lid = mapping.lid
+                    const phoneNumber = mapping.id
+
+                    if (!lidHandler!.isLidFormat(lid) || lidHandler!.isLidFormat(phoneNumber)) {
+                        return 0 // Skip invalid mappings
+                    }
+
+                    try {
+                        // Update messages where jid equals the LID
+                        const updateResult = await withConnection(async () =>
+                            collections.messages.updateMany(
+                                {
+                                    instanceId: validatedInstanceId,
+                                    jid: lid
+                                },
+                                {
+                                    $set: {
+                                        jid: phoneNumber,
+                                        'key.remoteJid': phoneNumber,
+                                        'lidMapping.resolved': true,
+                                        'lidMapping.resolvedAt': new Date(),
+                                        'lidMapping.originalLid': lid,
+                                        updatedAt: new Date()
+                                    }
+                                }
+                            )
+                        )
+
+                        if (updateResult.modifiedCount > 0) {
+                            log(`[${instanceId}] Updated ${updateResult.modifiedCount} historical messages: ${lid} -> ${phoneNumber}`)
+                        }
+
+                        return updateResult.modifiedCount
+                    } catch (error) {
+                        logError(`[${instanceId}] Error updating messages for LID ${lid}:`, error)
+                        return 0
+                    }
+                })
+
+                const batchResults = await Promise.all(batchPromises)
+                totalMessagesUpdated += batchResults.reduce((sum, count) => sum + count, 0)
+
+                // Small delay between batches to prevent overwhelming
+                if (i + batchSize < lidMappings.length) {
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                }
+            }
+
+            // Perform proactive LID resolution for label associations after messages are done
+            let totalLabelAssociationsUpdated = 0
+            if (finalLidConfig.proactiveHistoryResolution === true) {
+                log(`[${instanceId}] Starting proactive LID resolution for label associations`)
+                totalLabelAssociationsUpdated = await performProactiveLidResolutionForLabelAssociations(lidMappings as Array<{ lid: string | undefined; id: string }>)
+            } else {
+                log(`[${instanceId}] Skipping proactive LID resolution for label associations (disabled)`)
+            }
+
+            log(`[${instanceId}] Proactive LID resolution completed: ${totalMessagesUpdated} historical messages and ${totalLabelAssociationsUpdated} label associations updated`)
         }
     }
 

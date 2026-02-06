@@ -325,7 +325,11 @@ export async function dropAllTTLIndexes(collection: Collection<any>): Promise<vo
  * @param indexSpecs Array of index specifications
  * @returns Promise resolving to batch creation results
  */
-export async function batchCreateIndexes(collection: Collection<any>, indexSpecs: Array<{ name: string, spec: any, options?: any }>): Promise<{
+export async function batchCreateIndexes(
+    collection: Collection<any>,
+    indexSpecs: Array<{ name: string, spec: any, options?: any }>,
+    withConnection?: <T>(op: () => Promise<T>) => Promise<T>
+): Promise<{
     successful: number,
     failed: number,
     details: string[]
@@ -341,7 +345,12 @@ export async function batchCreateIndexes(collection: Collection<any>, indexSpecs
     
     for (const indexSpec of indexSpecs) {
         try {
-            await safeCreateIndex(collection, indexSpec.spec, indexSpec.options)
+            const op = () => safeCreateIndex(collection, indexSpec.spec, indexSpec.options)
+            if (withConnection) {
+                await withConnection(op)
+            } else {
+                await op()
+            }
             results.successful++
             results.details.push(`✅ Created index: ${indexSpec.name}`)
         } catch (error) {

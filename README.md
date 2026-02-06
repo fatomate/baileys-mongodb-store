@@ -15,6 +15,7 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - **🚀 Redis Bull Queue**: Full Redis Bull queue support for reliable background processing
 - **📸 Media Download**: Automatic download and storage of media files with URL tracking
 - **👤 Profile Picture Auto-Retrieval**: Automatically fetch and update contact profile pictures
+ - **🧭 Low‑Cost TTL Monitoring (Opt‑in)**: Metadata-based counts, daily checks by default, optional oldest-document lookup
 
 ### Existing Features
 - **Zero Code Changes Required**: All performance optimizations work automatically behind the scenes
@@ -37,6 +38,30 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - 🔧 Optimized for handling thousands of concurrent operations
 - 💪 Smart caching with automatic invalidation
 - 🎮 Connection pooling and queue management
+
+## LID Handling (LID → Phone Mapping)
+
+- Centralized on `contacts` collection. No new data is written to legacy `lidMappings` (read-only fallback may be used internally).
+- Proactive mapping on incoming messages (fromMe=false):
+  - If `remoteJid` is a LID and `senderPn` is a phone, the mapping is saved and the message is normalized to phone. Historical messages with the LID may be updated.
+  - If `senderLid` is a LID and `remoteJid` is a phone, the mapping is saved.
+- Outgoing messages (fromMe=true) with LID use reverse lookup; mapping is saved without `pushName` when discovered.
+- `pushName` is captured only for incoming messages.
+- Schema on contacts: `lid`, `lidFirstSeen`, `updatedAt`, optional `pushName`, `pushNameUpdatedAt`.
+- Removed: `lidLastSeen`, `lidMappingUpdatedAt`.
+
+### Performance controls (v2.1)
+
+- New LidHandler options (via `lidConfig` in `makeEnhancedMongoDBStore`):
+  - `lookupsEnabled` (default: true): disable to avoid any contacts lookups, relying only on cached or legacy data.
+  - `preferReverseLookupFirst` (default: true): try messages-based discovery before contacts query.
+  - `contactsQueryMaxTimeMS` (default: 500): per-lookup MongoDB time limit.
+  - `negativeCacheTTL` (default: 300s): base TTL for misses.
+  - `dynamicNegativeBackoff` (default: true), with `minNegativeCacheTTL` (300s) and `maxNegativeCacheTTL` (3600s): exponential backoff for repeated misses to reduce repeated scans.
+  - `proactiveHistoryResolution` (default: false): runs one-off migration that rewrites historical messages from LID to phone; leave off to minimize load.
+
+Indexes:
+- Added `contacts_lid_id_cover` covering index `{ instanceId: 1, lid: 1, id: 1 }` (partial) so lid→id lookups are index-only.
 
 ## Installation
 
@@ -62,11 +87,11 @@ yarn install
 ```javascript
 const makeWASocket = require('@whiskeysockets/baileys').default
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const { makeMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
+const { makeEnhancedMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
 
 async function connectToWhatsApp() {
     // Create MongoDB store with your configuration
-    const store = await makeMongoDBStore({
+    const store = await makeEnhancedMongoDBStore({
         uri: 'mongodb://localhost:27017',
         database: 'whatsapp_bot',
         instanceId: 'instance_001', // Unique ID for each WhatsApp instance
@@ -107,8 +132,9 @@ connectToWhatsApp()
 
 ## Configuration Options
 
-### Basic Configuration (v1 - Still Supported)
+### Basic Configuration (v1 - Deprecated)
 
+Deprecated: v1 basic store remains available for backward compatibility but is no longer recommended. Use the enhanced store (`makeEnhancedMongoDBStore`) for new setups.
 ```typescript
 interface MongoDBStoreConfig {
     // MongoDB connection URI
@@ -271,6 +297,8 @@ await store.upsertContacts([
 ])
 ```
 
+Performance note: bulk contact upserts now prefetch existing records in chunks with a narrow projection (`id`, `profilePic`, `profilePicUpdatedAt`) to reduce query load and memory usage on large imports.
+
 ### Group Management
 
 ```typescript
@@ -332,10 +360,10 @@ await store.upsertLabelAssociation({
 })
 ```
 
-### Media Handling (New!)
+### Media Handling (Improved)
 
 ```typescript
-// Configure automatic media download
+// Configure automatic media download (now queued with concurrency and dedup)
 const store = await makeEnhancedMongoDBStore({
     uri: 'mongodb://localhost:27017',
     database: 'whatsapp_bot',
@@ -344,12 +372,16 @@ const store = await makeEnhancedMongoDBStore({
         enabled: true,
         baseDir: '/var/whatsapp/media',
         maxSizeInMB: 50,
-        allowedTypes: ['image', 'video', 'document']
+        allowedTypes: ['image', 'video', 'document'],
+        // optional advanced controls
+        retryDelay: 1000,          // base delay for retries (exp backoff with jitter)
+        maxRetries: 3,             // number of retry attempts
+        downloadTimeout: 60000     // per-attempt timeout (ms)
     }
 })
 
-// Media is automatically downloaded on message receive
-// Access downloaded media URL
+// Media is automatically queued on message receive.
+// Access downloaded media URL (use a slight delay or subscribe to your own event updates)
 const result = await store.downloadMessageMedia('user@s.whatsapp.net', 'MSG_ID')
 if (result.success) {
     console.log('Media path:', result.localPath)
@@ -364,6 +396,12 @@ console.log('Total size:', stats.totalSize)
 const cleanup = await store.cleanupOldMedia(30)
 console.log('Deleted:', cleanup.deleted)
 ```
+
+Notes:
+- Normal media downloads are queued in the background (when Redis shared queues are enabled). The store prevents duplicate concurrent downloads using hash-based file naming and in-flight guards.
+- Filenames for media are deterministic based on the file's SHA-256 (when available), enabling reuse across messages with the same content.
+- The store detects and uses Baileys reupload support (when the socket is provided via `setSock(sock)`) to refresh expired media URLs automatically.
+- For apps that need the media path right away, wait briefly (1–3s) after message receipt before calling `downloadMessageMedia`, or rely on an event your app emits when `mediaUrl` is set.
 
 ## MongoDB Collections
 
@@ -380,8 +418,11 @@ The store creates the following collections with appropriate indexes:
 
 All collections include:
 - `instanceId` field for multi-instance isolation
-- `updatedAt` field with TTL index for automatic expiration
+- `updatedAt` field
 - Optimized indexes for query performance
+
+Notes:
+- TTL indexes apply to most collections. Contacts do not use TTL and persist indefinitely.
 
 ## TTL (Time To Live) Feature
 
@@ -401,6 +442,33 @@ This helps:
 - Comply with data retention policies
 - Reduce storage costs
 - Maintain performance
+
+### Advanced TTL Monitoring (Enhanced Store)
+
+The enhanced store includes an optional TTL monitor that validates TTL indexes and checks for expired data with minimal overhead:
+
+```typescript
+const store = await makeEnhancedMongoDBStore({
+    uri: 'mongodb://localhost:27017',
+    database: 'whatsapp_bot',
+    instanceId: 'my_instance',
+    ttlMonitoring: {
+        // Opt-in. If omitted/false, the monitor won't run periodically
+        enableMonitoring: true,
+        // Default is daily (1440 minutes). Use higher frequency only if needed
+        checkIntervalMinutes: 1440,
+        // Emit only critical alerts by default
+        onlyCriticalAlerts: true,
+        // Optional: get oldest document age (uses indexed sort)
+        enableOldestDocumentLookup: false
+    }
+})
+```
+
+Optimizations:
+- Total document count uses `estimatedDocumentCount()` (no full scan)
+- Expired document count uses `countDocuments` with a hint on `updatedAt`
+- Oldest document lookup is disabled by default; enable only when needed
 
 ## Error Handling & Cleanup
 

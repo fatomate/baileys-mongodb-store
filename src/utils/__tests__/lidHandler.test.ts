@@ -108,7 +108,6 @@ describe('LidHandler', () => {
             expect(mapping).toBeTruthy()
             expect(mapping?.phoneNumber).toBe(phoneNumber)
             expect(mapping?.firstSeen).toBeInstanceOf(Date)
-            expect(mapping?.lastSeen).toBeInstanceOf(Date)
         })
 
         it('should not store invalid mappings', async () => {
@@ -119,33 +118,6 @@ describe('LidHandler', () => {
             expect(count).toBe(0)
         })
 
-        it('should update lastSeen on duplicate mapping', async () => {
-            const lid = '114194640801953@lid'
-            const phoneNumber = '60196953307@s.whatsapp.net'
-
-            // Store first time
-            await lidHandler.storeLidMapping(lid, phoneNumber)
-            
-            // Get original timestamp
-            const original = await db.collection('test_lidMappings').findOne({
-                instanceId: 'test-instance',
-                lid
-            })
-            const originalLastSeen = original?.lastSeen
-
-            // Wait a bit and store again
-            await new Promise(resolve => setTimeout(resolve, 10))
-            await lidHandler.storeLidMapping(lid, phoneNumber)
-
-            // Check if lastSeen was updated
-            const updated = await db.collection('test_lidMappings').findOne({
-                instanceId: 'test-instance',
-                lid
-            })
-
-            expect(updated?.lastSeen.getTime()).toBeGreaterThan(originalLastSeen.getTime())
-            expect(updated?.firstSeen.getTime()).toBe(original?.firstSeen.getTime())
-        })
     })
 
     describe('getPhoneNumberFromLid', () => {
@@ -431,6 +403,159 @@ describe('LidHandler', () => {
         })
     })
 
+    describe('extractLidInfo - new format (remoteJidAlt + addressingMode)', () => {
+        it('should extract LID and phone from incoming message (addressingMode=pn)', () => {
+            // Incoming message: customer to bot
+            // remoteJid is phone number, remoteJidAlt is LID
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    remoteJidAlt: '114194640801953@lid',
+                    fromMe: false,
+                    id: '3EB0927E1937A24BEBE5B6',
+                    participant: '',
+                    addressingMode: 'pn'
+                } as any,
+                messageTimestamp: 1765263024,
+                pushName: 'Test User'
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            expect(info.lid).toBe('114194640801953@lid')
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(info.addressingMode).toBe('pn')
+            expect(info.needsReverseLookup).toBeFalsy()
+        })
+
+        it('should extract LID and phone from outgoing message (addressingMode=lid)', () => {
+            // Outgoing message: bot to customer (sent from phone)
+            // remoteJid is LID, remoteJidAlt is phone number
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    remoteJidAlt: '60196953307@s.whatsapp.net',
+                    fromMe: true,
+                    id: 'A5A396AC133134DCDF3FE694E3978A78',
+                    participant: '',
+                    addressingMode: 'lid'
+                } as any,
+                messageTimestamp: 1765263051,
+                pushName: 'Bot Name',
+                status: 2
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            expect(info.lid).toBe('114194640801953@lid')
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(info.addressingMode).toBe('lid')
+            // Should NOT need reverse lookup since phone is provided in remoteJidAlt
+            expect(info.needsReverseLookup).toBeFalsy()
+        })
+
+        it('should handle new format with missing remoteJidAlt', () => {
+            // Edge case: addressingMode present but remoteJidAlt missing
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    fromMe: false,
+                    id: 'test-id',
+                    addressingMode: 'pn'
+                } as any,
+                messageTimestamp: 1765263024
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            // Should fall back to legacy behavior
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(info.lid).toBeUndefined()
+        })
+
+        it('should prefer new format over legacy format when both present', () => {
+            // Mixed message with both new and legacy fields
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    remoteJidAlt: '114194640801953@lid',
+                    senderLid: '999999999@lid', // Different LID from legacy field
+                    senderPn: '60111111111@s.whatsapp.net', // Different phone from legacy field
+                    fromMe: false,
+                    id: 'test-id',
+                    addressingMode: 'pn'
+                } as any,
+                messageTimestamp: 1765263024
+            }
+
+            const info = lidHandler.extractLidInfo(message)
+            // Should use new format values
+            expect(info.lid).toBe('114194640801953@lid')
+            expect(info.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(info.addressingMode).toBe('pn')
+        })
+    })
+
+    describe('processMessage - new format', () => {
+        it('should process incoming message with new format (addressingMode=pn)', async () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '60196953307@s.whatsapp.net',
+                    remoteJidAlt: '114194640801953@lid',
+                    fromMe: false,
+                    id: 'test-incoming',
+                    addressingMode: 'pn'
+                } as any,
+                messageTimestamp: 1765263024,
+                pushName: 'Test User'
+            }
+
+            const result = await lidHandler.processMessage(message)
+            
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBe('114194640801953@lid')
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.addressingMode).toBe('pn')
+        })
+
+        it('should process outgoing message with new format (addressingMode=lid)', async () => {
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    remoteJidAlt: '60196953307@s.whatsapp.net',
+                    fromMe: true,
+                    id: 'test-outgoing',
+                    addressingMode: 'lid'
+                } as any,
+                messageTimestamp: 1765263051,
+                status: 2
+            }
+
+            const result = await lidHandler.processMessage(message)
+            
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBe('114194640801953@lid')
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.addressingMode).toBe('lid')
+        })
+
+        it('should maintain backward compatibility with legacy format', async () => {
+            // Legacy format message (no addressingMode/remoteJidAlt)
+            const message: proto.IWebMessageInfo = {
+                key: {
+                    remoteJid: '114194640801953@lid',
+                    senderPn: '60196953307@s.whatsapp.net'
+                } as any,
+                messageTimestamp: 1755232223
+            }
+
+            const result = await lidHandler.processMessage(message)
+            
+            expect(result.normalizedJid).toBe('60196953307@s.whatsapp.net')
+            expect(result.lidInfo.lid).toBe('114194640801953@lid')
+            expect(result.lidInfo.phoneNumber).toBe('60196953307@s.whatsapp.net')
+            // Legacy messages won't have addressingMode
+            expect(result.lidInfo.addressingMode).toBeUndefined()
+        })
+    })
+
     describe('clearCache', () => {
         it('should clear cache for instance', async () => {
             const lid = '114194640801953@lid'
@@ -464,37 +589,5 @@ describe('LidHandler', () => {
             expect(mappings.map(m => m.lid).sort()).toEqual(['111@lid', '222@lid', '333@lid'])
         })
     })
-
-    describe('cleanupOldMappings', () => {
-        it('should delete old mappings', async () => {
-            const lid1 = '111@lid'
-            const lid2 = '222@lid'
-            
-            // Insert old mapping (90+ days old)
-            const oldDate = new Date()
-            oldDate.setDate(oldDate.getDate() - 100)
-            
-            await db.collection('test_lidMappings').insertOne({
-                instanceId: 'test-instance',
-                lid: lid1,
-                phoneNumber: '601111@s.whatsapp.net',
-                firstSeen: oldDate,
-                lastSeen: oldDate,
-                updatedAt: oldDate
-            })
-
-            // Insert recent mapping
-            await lidHandler.storeLidMapping(lid2, '602222@s.whatsapp.net')
-
-            // Cleanup old mappings
-            const deletedCount = await lidHandler.cleanupOldMappings(90)
-            
-            expect(deletedCount).toBe(1)
-
-            // Verify only recent mapping remains
-            const remaining = await lidHandler.getAllMappings()
-            expect(remaining).toHaveLength(1)
-            expect(remaining[0].lid).toBe(lid2)
-        })
-    })
 })
+

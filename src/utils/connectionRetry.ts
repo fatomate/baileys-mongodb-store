@@ -15,6 +15,19 @@ export interface RetryResult<T> {
     attempts: number
 }
 
+const hasErrorLabel = (error: any, label: string): boolean => {
+    if (!error) {
+        return false
+    }
+    if (Array.isArray(error.errorLabels) && error.errorLabels.includes(label)) {
+        return true
+    }
+    if (error.errorLabelSet instanceof Set && error.errorLabelSet.has(label)) {
+        return true
+    }
+    return false
+}
+
 const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
     maxAttempts: 5,
     initialDelay: 100,
@@ -28,6 +41,7 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
             'Client must be connected',
             'Topology is closed',
             'Connection pool closed',
+            'closed connection pool',
             'client was closed', // covers "Operation interrupted because client was closed"
             'ECONNREFUSED',
             'ETIMEDOUT',
@@ -37,6 +51,8 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
             'MongoExpiredSessionError',
             'Cannot use a session that has ended',
             'session has ended',
+            'Given transaction number',
+            'NoSuchTransaction',
             'connection timed out',
             'socket hang up'
         ]
@@ -45,10 +61,15 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
                error.code === 'ECONNREFUSED' ||
                error.code === 'ETIMEDOUT' ||
                error.code === 'ENETUNREACH' ||
+               error.code === 251 ||
                error.name === 'MongoNetworkError' ||
                error.name === 'MongoNotConnectedError' ||
                error.name === 'MongoExpiredSessionError' ||
-               error.name === 'MongoClientClosedError'
+               error.name === 'MongoClientClosedError' ||
+               error.name === 'MongoPoolClosedError' ||
+               error.codeName === 'NoSuchTransaction' ||
+               hasErrorLabel(error, 'RetryableWriteError') ||
+               hasErrorLabel(error, 'TransientTransactionError')
     }
 }
 

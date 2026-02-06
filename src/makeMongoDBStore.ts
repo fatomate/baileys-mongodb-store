@@ -51,6 +51,8 @@ let activeConnections: ActiveConnection[] = []
 
 // Cache for Binary conversions (TTL: 5 minutes, check period: 60 seconds)
 const binaryConversionCache = new NodeCache({ stdTTL: 300, checkperiod: 60 })
+// Negative cache for not-found lookups
+const notFoundCache = new NodeCache({ stdTTL: 60, checkperiod: 30, useClones: false })
 
 // Queue configuration for concurrent operations
 const QUEUE_CONCURRENCY = 50 // Process up to 50 operations concurrently
@@ -380,7 +382,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Initialize TTL monitor after DB connection (do not start yet)
             if (ttlMonitoring && !ttlMonitor) {
-                const ttlManagedCollections = ['chats', 'contacts', 'messages', 'presences']
+                const ttlManagedCollections = ['chats', 'messages', 'presences']
                 ttlMonitor = new TTLMonitor(db, { 
                     days: ttlDays, 
                     ...ttlMonitoring,
@@ -511,8 +513,10 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 queues.set(queueType, queue)
                 
                 // Set concurrency based on queue type
-                // Label associations MUST have concurrency of 1 to maintain order
-                const concurrency = queueType === QueueType.LABEL_ASSOCIATIONS ? 1 : (redis.concurrency || 50)
+                // Label associations and CONTACTS MUST have concurrency of 1 to maintain order and avoid races
+                const concurrency = (queueType === QueueType.LABEL_ASSOCIATIONS || queueType === QueueType.CONTACTS)
+                    ? 1
+                    : (redis.concurrency || 50)
                 
                 // Create worker
                 const worker = new Worker<T>(
@@ -708,7 +712,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                             'message.protocolMessage': message.message.protocolMessage,
                                             revoked: true,
                                             revokedAt: new Date(),
-                                            revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                            revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid
                                         }
                                     }
                                 )
@@ -843,18 +847,36 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 const { type, contacts, contact } = job.data
                 
                 if (type === 'upsert' && contacts) {
-                    const bulkOps = contacts.map(contact => ({
-                        replaceOne: {
-                            filter: { instanceId, id: contact.id },
-                            replacement: { ...contact, instanceId, updatedAt: new Date() },
-                            upsert: true
+                    const bulkOps = contacts.map(contact => {
+                        const { notify, lid: _ignoredLid, ...rest } = (contact as any) || {}
+                        return {
+                            updateOne: {
+                                filter: { instanceId, id: contact.id },
+                                update: {
+                                    $set: { ...rest, instanceId, updatedAt: new Date() },
+                                    $setOnInsert: {
+                                        instanceId,
+                                        id: contact.id,
+                                        ...(notify !== undefined ? { notify } : {})
+                                    }
+                                },
+                                upsert: true
+                            }
                         }
-                    }))
+                    })
                     await collections.contacts.bulkWrite(bulkOps, { ordered: false })
                 } else if (type === 'update' && contact) {
-                    await collections.contacts.replaceOne(
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
+                    await collections.contacts.updateOne(
                         { instanceId, id: contact.id },
-                        { ...contact, instanceId, updatedAt: new Date() },
+                        {
+                        $set: { ...rest, updatedAt: new Date() },
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
+                        },
                         { upsert: true }
                     )
                 }
@@ -1214,7 +1236,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         filter: {
                             instanceId: validatedInstanceId,
                             jid,
-                            'key.id': message.key.id
+                            'key.id': message.key?.id
                         },
                         replacement: {
                             ...message,
@@ -1523,15 +1545,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 { name: 'chats_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
                 { name: 'chats_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
             ],
-            contacts: [
-                { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
-            ],
+                    contacts: [
+                        { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
+                    ],
             messages: [
                 { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                 { name: 'messages_query', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
                 { name: 'messages_keyid', spec: { instanceId: 1, 'key.id': 1 }, options: {} },
-                { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } },
+                { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
             ],
             groupMetadata: [
                 { name: 'groups_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
@@ -1595,7 +1618,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     totalCreated += batchResult.successful
                 } else if (indexConfig.skipExistingCollectionIndexes) {
                     // Smart mode: check what indexes are needed
-                    const checkResult = await shouldCreateIndexes(collection as any, requiredIndexes)
+                    const checkResult = await withConnection(() => shouldCreateIndexes(collection as any, requiredIndexes))
                     
                     if (checkResult.missingIndexes.length === 0) {
                         if (indexConfig.enableIndexHealthLogging) {
@@ -1620,9 +1643,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             ...idx,
                             options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
                         }))
-                        const batchResult = await withConnection(() => 
-                            batchCreateIndexes(collection, timedMissingIndexes)
-                        )
+                        const batchResult = await batchCreateIndexes(collection, timedMissingIndexes, withConnection)
                         
                         createResults.push({
                             collection: collectionName,
@@ -1663,9 +1684,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         ...idx,
                         options: { ...idx.options, maxTimeMS: indexConfig.indexCreationTimeout }
                     }))
-                    const batchResult = await withConnection(() => 
-                        batchCreateIndexes(collection, timedIndexes)
-                    )
+                    const batchResult = await batchCreateIndexes(collection, timedIndexes, withConnection)
                     
                     createResults.push({
                         collection: collectionName,
@@ -1989,13 +2008,23 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             }
             
             // Fallback to direct write
-            const bulkOps = contacts.map(contact => ({
-                replaceOne: {
-                    filter: { instanceId, id: contact.id },
-                    replacement: { ...contact, instanceId, updatedAt: new Date() },
-                    upsert: true
+            const bulkOps = contacts.map(contact => {
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
+                return {
+                    updateOne: {
+                        filter: { instanceId, id: contact.id },
+                        update: {
+                            $set: { ...rest, updatedAt: new Date() },
+                            $setOnInsert: {
+                                instanceId,
+                                id: contact.id,
+                                ...(notify !== undefined ? { notify } : {})
+                            }
+                        },
+                        upsert: true
+                    }
                 }
-            }))
+            })
             
             // Process in chunks for large contact lists
             for (let i = 0; i < bulkOps.length; i += BATCH_SIZE) {
@@ -2070,22 +2099,37 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     return cached
                 }
                 
-                // Primary query using jid
+                // Negative cache for not-found
+                const nfKey1 = `nf_${validatedInstanceId}_${hashForLogging(validJid)}_${hashForLogging(validId)}`
+                const nfKey2 = `nf_${validatedInstanceId}_${hashForLogging(validId)}`
+                if (notFoundCache.get(nfKey1) || notFoundCache.get(nfKey2)) {
+                    return null
+                }
+                
+                // Primary query using jid with index hint & time budget
                 let message = await collections.messages.findOne({
                     instanceId: validatedInstanceId,
                     jid: validJid,
                     'key.id': validId
-                })
+                }, {
+                    // @ts-ignore
+                    hint: { instanceId: 1, jid: 1, 'key.id': 1 },
+                    maxTimeMS: 150
+                } as any)
                 
                 // Fallback query using key.remoteJid (for poll messages and edge cases)
                 if (!message) {
                     const fallbackStart = Date.now()
                     log(`[getMessage] Primary query failed for jid: ${validJid}, id: ${validId}. Trying fallback with key.remoteJid`)
-                    message = await collections.messages.findOne({
+                    const remoteCursor = collections.messages.find({
                         instanceId: validatedInstanceId,
                         'key.remoteJid': validJid,
                         'key.id': validId
-                    })
+                    }).limit(1)
+                    try { remoteCursor.hint({ instanceId: 1, 'key.remoteJid': 1, 'key.id': 1 }) } catch {}
+                    // @ts-ignore
+                    const arr = await (remoteCursor.maxTimeMS?.(150)?.toArray?.() || remoteCursor.toArray())
+                    message = arr[0] || null
                     
                     const fallbackTime = Date.now() - fallbackStart
                     if (message) {
@@ -2095,14 +2139,50 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                 }
                 
+                // Last-resort fallback: instanceId + key.id only with hint & budget
+                if (!message) {
+                    const idCursor = collections.messages.find({
+                        instanceId: validatedInstanceId,
+                        'key.id': validId
+                    }).limit(1)
+                    try { idCursor.hint({ instanceId: 1, 'key.id': 1 }) } catch {}
+                    // @ts-ignore
+                    const arr = await (idCursor.maxTimeMS?.(200)?.toArray?.() || idCursor.toArray())
+                    message = arr[0] || null
+                }
+
                 if (!message) {
                     const totalTime = Date.now() - startTime
                     if (totalTime > 100) {
                         logWarn(`[getMessage] Message not found after ${totalTime}ms - ID: ${validId}, JID: ${validJid}`)
                     }
+                    notFoundCache.set(nfKey1, true)
+                    notFoundCache.set(nfKey2, true)
                     return null
                 }
                 
+                // Read-repair for LID↔phone mismatch if resolvable
+                try {
+                    const foundJid = (message as any)?.key?.remoteJid || (message as any)?.jid
+                    if (foundJid && foundJid !== validJid) {
+                        // Only attempt repair for LID/phone pairing scenarios
+                        const isPair = (lidHandler && (await (async () => {
+                            try {
+                                // naive check using LidHandler helpers if available
+                                return lidHandler.isLidFormat(foundJid) || lidHandler.isLidFormat(validJid)
+                            } catch { return false }
+                        })()))
+                        if (isPair) {
+                            try {
+                                await collections.messages.updateOne(
+                                    { instanceId: validatedInstanceId, 'key.id': validId },
+                                    { $set: { jid: validJid, 'key.remoteJid': validJid } }
+                                )
+                            } catch {}
+                        }
+                    }
+                } catch {}
+
                 // Check access permissions
                 accessContext.validateAccess(message.instanceId, 'read')
                 
@@ -2166,7 +2246,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                         'message.protocolMessage': message.message.protocolMessage,
                                         revoked: true,
                                         revokedAt: new Date(),
-                                        revokedBy: message.key.fromMe ? 'me' : message.key.participant || message.key.remoteJid
+                                        revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid
                                     }
                                 }
                             )
@@ -2975,6 +3055,59 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             log(`[LID Handler] Discovered mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
                         }
                     }
+
+                    // Persist pushName to contacts.notify if available and not from me,
+                    // without overriding existing notify or name
+                    try {
+                        const pushName = (msg as any)?.pushName
+                        if (pushName && !msg.key.fromMe && jid && jid.endsWith('@s.whatsapp.net')) {
+                            // Route via CONTACTS queue to serialize writes
+                            if (bullInitialized && queues.has(QueueType.CONTACTS)) {
+                                const queue = queues.get(QueueType.CONTACTS)!
+                                await queue.add(
+                                    'update',
+                                    {
+                                        type: 'update',
+                                        contact: { id: jid, notify: pushName },
+                                        instanceId,
+                                        timestamp: Date.now()
+                                    },
+                                    defaultJobOptions
+                                )
+                            } else {
+                                const filter: any = {
+                                    instanceId,
+                                    id: jid,
+                                    $or: [
+                                        { notify: { $exists: false } },
+                                        { notify: { $in: [null, ''] } }
+                                    ]
+                                }
+                                try {
+                                    await collections.contacts.updateOne(
+                                        filter,
+                                        {
+                                            $set: { notify: pushName, updatedAt: new Date() },
+                                            $setOnInsert: { instanceId, id: jid }
+                                        },
+                                        { upsert: true }
+                                    )
+                                } catch (e: any) {
+                                    if (e?.code === 11000) {
+                                        await collections.contacts.updateOne(
+                                            filter,
+                                            { $set: { notify: pushName, updatedAt: new Date() } },
+                                            { upsert: false }
+                                        )
+                                    } else {
+                                        throw e
+                                    }
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        log(`Failed to persist pushName for ${jid}: ${String(err)}`)
+                    }
                     
                     await store.upsertMessage(jid, msg)
                     
@@ -2990,6 +3123,19 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
             ev.on('messages.update', async updates => {
                 for (const { update, key } of updates) {
+                    // Skip delivery status updates for outgoing messages (fromMe)
+                    // Only track when the RECIPIENT received/read a message
+                    if (key.fromMe && update.status !== undefined) {
+                        const hasNonStatusFields = !!(
+                            update.message ||
+                            update.starred !== undefined ||
+                            update.pinInChat !== undefined ||
+                            (update as any).pollUpdates ||
+                            (update as any).reactions
+                        )
+                        if (!hasNonStatusFields) continue
+                    }
+
                     const jid = jidNormalizedUser(key.remoteJid!)
                     await store.updateMessage(jid, key.id!, update)
                 }
@@ -3049,10 +3195,12 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             ev.on('group-participants.update', async ({ id, participants, action }) => {
                 const metadata = await store.getGroupMetadata(id)
                 if (metadata) {
+                    // Extract participant IDs (participants can be GroupParticipant objects or strings)
+                    const participantIds = participants.map(p => typeof p === 'string' ? p : p.id)
                     switch (action) {
                         case 'add':
-                            metadata.participants.push(...participants.map(id => ({ 
-                                id, 
+                            metadata.participants.push(...participantIds.map(participantId => ({ 
+                                id: participantId, 
                                 isAdmin: false, 
                                 isSuperAdmin: false 
                             })))
@@ -3060,13 +3208,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                         case 'demote':
                         case 'promote':
                             for (const participant of metadata.participants) {
-                                if (participants.includes(participant.id)) {
+                                if (participantIds.includes(participant.id)) {
                                     participant.isAdmin = action === 'promote'
                                 }
                             }
                             break
                         case 'remove':
-                            metadata.participants = metadata.participants.filter(p => !participants.includes(p.id))
+                            metadata.participants = metadata.participants.filter(p => !participantIds.includes(p.id))
                             break
                     }
                     await store.upsertGroupMetadata(id, metadata)
@@ -3258,12 +3406,13 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     ],
                     contacts: [
                         { name: 'contacts_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } },
-                        { name: 'contacts_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                        { name: 'contacts_lid_lookup', spec: { instanceId: 1, lid: 1 }, options: { unique: true, partialFilterExpression: { lid: { $type: 'string' } } } }
                     ],
                     messages: [
                         { name: 'messages_primary', spec: { instanceId: 1, jid: 1, 'key.id': 1 }, options: { unique: true } },
                         { name: 'messages_jid_timestamp', spec: { instanceId: 1, jid: 1, messageTimestamp: -1 }, options: {} },
-                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } }
+                        { name: 'messages_ttl', spec: { updatedAt: 1 }, options: { expireAfterSeconds: ttlSeconds } },
+                        { name: 'messages_media_fileHash', spec: { 'mediaInfo.fileHash': 1 }, options: { sparse: true } }
                     ],
                     groupMetadata: [
                         { name: 'groupMetadata_primary', spec: { instanceId: 1, id: 1 }, options: { unique: true } }
