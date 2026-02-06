@@ -1498,7 +1498,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         contact.name = contact.notify || contact.verifiedName || undefined;
                     }
 
-                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
                     const existing = existingDataMap.get(contact.id)
 
                     // Always include updatedAt
@@ -1561,7 +1561,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     )
                 ) as any
 
-                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
 
                 // Always include updatedAt
                 const setData: any = {
@@ -2541,7 +2541,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             contact.name = contact.notify || contact.verifiedName || undefined;
                         }
 
-                        const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                        const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
                         const existing = existingDataMap.get(contact.id)
 
                         // Always include updatedAt
@@ -2665,7 +2665,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         )
                     ) as any
 
-                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                    const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
 
                     // Always include updatedAt
                     const setData: any = {
@@ -3690,6 +3690,45 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         return totalLabelAssociationsUpdated
     }
+    // Safe LID setter - handles E11000 duplicate key conflicts on contacts_lid_lookup
+    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<void> => {
+        const inst = targetInstanceId || instanceId
+        try {
+            await withConnection(async () =>
+                collections.contacts.updateOne(
+                    { instanceId: inst, id: contactId },
+                    { $set: { lid, updatedAt: new Date() } }
+                )
+            )
+        } catch (e: any) {
+            if (e?.code === 11000 && e?.keyPattern?.lid) {
+                log(`[LID] Conflict: LID ${lid} already assigned, reassigning to ${contactId}`)
+                await withConnection(async () =>
+                    collections.contacts.updateOne(
+                        { instanceId: inst, lid, id: { $ne: contactId } },
+                        { $unset: { lid: 1 }, $set: { updatedAt: new Date() } }
+                    )
+                )
+                try {
+                    await withConnection(async () =>
+                        collections.contacts.updateOne(
+                            { instanceId: inst, id: contactId },
+                            { $set: { lid, updatedAt: new Date() } }
+                        )
+                    )
+                } catch (retryError: any) {
+                    if (retryError?.code === 11000) {
+                        log(`[LID] Failed to assign LID ${lid} to ${contactId} after retry`)
+                    } else {
+                        throw retryError
+                    }
+                }
+            } else {
+                throw e
+            }
+        }
+    }
+
     // Main store implementation
     const storeImpl: EnhancedMongoDBStore = {
         instanceId,
@@ -3988,7 +4027,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     contact.name = contact.notify || contact.verifiedName || undefined;
                 }
 
-                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
                 const existing = existingDataMap.get(contact.id)
 
                 // Always include updatedAt
@@ -4274,18 +4313,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             for (const mapping of mappings) {
                                                 const { pn, lid } = mapping
                                                 
-                                                // Update contact with LID in MongoDB
-                                                await withConnection(async () =>
-                                                    collections.contacts.updateOne(
-                                                        { instanceId, id: pn },
-                                                        {
-                                                            $set: {
-                                                                lid,
-                                                                updatedAt: new Date()
-                                                            }
-                                                        }
-                                                    )
-                                                )
+                                                // Update contact with LID in MongoDB (safe against duplicate key)
+                                                await safeSetLid(pn, lid)
                                                 
                                                 // Also store in LidHandler for cache
                                                 if (lidHandler) {
@@ -4337,18 +4366,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                                         if (result && result.length > 0 && result[0].exists && result[0].lid) {
                                             lid = result[0].lid
-                                            // Update contact with LID
-                                            await withConnection(async () =>
-                                                collections.contacts.updateOne(
-                                                    { instanceId, id: contactId },
-                                                    {
-                                                        $set: {
-                                                            lid,
-                                                            updatedAt: new Date()
-                                                        }
-                                                    }
-                                                )
-                                            )
+                                            // Update contact with LID (safe against duplicate key)
+                                            await safeSetLid(contactId, lid)
 
                                             // Also store in LidHandler for cache
                                             if (lidHandler) {
@@ -6103,6 +6122,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     let jid = update.key.remoteJid
                     if (!jid) continue
                     
+                    // Skip delivery status updates for outgoing messages (fromMe)
+                    // Only track when the RECIPIENT received/read a message
+                    if (update.key.fromMe && update.update?.status !== undefined) {
+                        const hasNonStatusFields = !!(
+                            update.update?.message ||
+                            update.update?.starred !== undefined ||
+                            update.update?.pinInChat !== undefined ||
+                            (update.update as any)?.pollUpdates ||
+                            (update.update as any)?.reactions
+                        )
+                        if (!hasNonStatusFields) continue
+                    }
+                    
                     // Normalize JID through LID handler if available
                     if (lidHandler) {
                         jid = await lidHandler.normalizeJid(jid) || jid
@@ -6745,19 +6777,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         if (lidHandler) {
                             await lidHandler.handleLidMappingUpdate(data)
                             
-                            // Also update the contact if it exists
-                            await withConnection(async () =>
-                                collections.contacts.updateOne(
-                                    { instanceId: validatedInstanceId, id: pn },
-                                    {
-                                        $set: {
-                                            lid,
-                                            updatedAt: new Date()
-                                        }
-                                    },
-                                    { upsert: false }
-                                )
-                            )
+                            // Also update the contact if it exists (safe against duplicate key)
+                            await safeSetLid(pn, lid, validatedInstanceId)
                         }
                         
                         if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')

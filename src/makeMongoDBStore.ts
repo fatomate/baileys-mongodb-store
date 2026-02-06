@@ -848,7 +848,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 
                 if (type === 'upsert' && contacts) {
                     const bulkOps = contacts.map(contact => {
-                        const { notify, ...rest } = (contact as any) || {}
+                        const { notify, lid: _ignoredLid, ...rest } = (contact as any) || {}
                         return {
                             updateOne: {
                                 filter: { instanceId, id: contact.id },
@@ -866,7 +866,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     })
                     await collections.contacts.bulkWrite(bulkOps, { ordered: false })
                 } else if (type === 'update' && contact) {
-                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
                     await collections.contacts.updateOne(
                         { instanceId, id: contact.id },
                         {
@@ -2009,7 +2009,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Fallback to direct write
             const bulkOps = contacts.map(contact => {
-                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, ...rest } = (contact as any) || {}
+                const { notify, id: _ignoredId, instanceId: _ignoredInstanceId, lid: _ignoredLid, ...rest } = (contact as any) || {}
                 return {
                     updateOne: {
                         filter: { instanceId, id: contact.id },
@@ -3123,6 +3123,19 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
 
             ev.on('messages.update', async updates => {
                 for (const { update, key } of updates) {
+                    // Skip delivery status updates for outgoing messages (fromMe)
+                    // Only track when the RECIPIENT received/read a message
+                    if (key.fromMe && update.status !== undefined) {
+                        const hasNonStatusFields = !!(
+                            update.message ||
+                            update.starred !== undefined ||
+                            update.pinInChat !== undefined ||
+                            (update as any).pollUpdates ||
+                            (update as any).reactions
+                        )
+                        if (!hasNonStatusFields) continue
+                    }
+
                     const jid = jidNormalizedUser(key.remoteJid!)
                     await store.updateMessage(jid, key.id!, update)
                 }
