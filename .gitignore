@@ -57,9 +57,13 @@ pids
 # Yarn Integrity file
 .yarn-integrity
 
-# Claude Code
+# AI Tools
 .claude/
 CLAUDE.md
+.omd/
+AGENTS.md
+.factory/
+.kiro/
 
 # Project-specific ignores
 actualCodeImplementation.js
