@@ -9,9 +9,8 @@ import type {
     PresenceData, 
     WAMessageCursor 
 } from 'baileys'
-import type { Label } from 'baileys/lib/Types/Label.js'
-import { LabelAssociationType } from 'baileys/lib/Types/LabelAssociation.js'
-import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation.js'
+import type { Label, LabelAssociation } from './types/baileys-compat.js'
+import { LabelAssociationType } from './types/baileys-compat.js'
 import type { 
     EnhancedMongoDBStoreConfig, 
     EnhancedMongoDBStore,

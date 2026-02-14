@@ -10,8 +10,7 @@ import type {
     WAMessageCursor 
 } from 'baileys'
 import { jidNormalizedUser, updateMessageWithReceipt, updateMessageWithReaction, toNumber } from 'baileys'
-import type { Label } from 'baileys/lib/Types/Label.js'
-import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation.js'
+import type { Label, LabelAssociation } from './types/baileys-compat.js'
 import type { MongoDBStoreConfig, MongoDBStore } from './types.js'
 import NodeCache from 'node-cache'
 import PQueue from 'p-queue'

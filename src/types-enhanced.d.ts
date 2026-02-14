@@ -1,9 +1,11 @@
-type Comparable<T, K> = { key: (t: T) => K }
+type Comparable<T, K> = {
+    key: (v: T) => K
+    compare: (a: K, b: K) => number
+}
 import type { Logger } from 'pino'
 import type { proto, WASocket } from 'baileys'
 import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata, PresenceData, WAMessageCursor } from 'baileys'
-import type { Label } from 'baileys/lib/Types/Label.js'
-import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation.js'
+import type { Label, LabelAssociation } from './types/baileys-compat.js'
 import type { RedisOptions } from 'ioredis'
 import type { AuthConfig } from './utils/auth.js'
 import type { MemoryConfig } from './utils/memory.js'
