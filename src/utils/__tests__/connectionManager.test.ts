@@ -1,4 +1,4 @@
-import { ConnectionManager, getConnectionManager, getConnectionMetrics } from '../connectionManager'
+import { ConnectionManager, getConnectionManager, getConnectionMetrics } from '../connectionManager.js'
 import { MongoClient } from 'mongodb'
 
 // Mock MongoDB

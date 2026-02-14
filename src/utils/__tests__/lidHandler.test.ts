@@ -1,6 +1,6 @@
 import { MongoClient, Db } from 'mongodb'
 import { MongoMemoryServer } from 'mongodb-memory-server'
-import { LidHandler } from '../lidHandler'
+import { LidHandler } from '../lidHandler.js'
 import { proto } from 'baileys'
 
 describe('LidHandler', () => {

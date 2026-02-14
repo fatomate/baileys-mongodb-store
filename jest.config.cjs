@@ -1,17 +1,17 @@
+/** @type {import('jest').Config} */
 module.exports = {
     preset: 'ts-jest',
     testEnvironment: 'node',
     roots: ['<rootDir>/src'],
-    testMatch: [
-        '**/__tests__/**/*.test.ts',
-        '**/__tests__/**/*.spec.ts'
-    ],
+    moduleNameMapper: {
+        '^(\\.{1,2}/.*)\\.js$': '$1',
+    },
     transform: {
         '^.+\\.ts$': ['ts-jest', {
             tsconfig: {
-                // TypeScript config for tests
                 target: 'es2020',
                 module: 'commonjs',
+                moduleResolution: 'node',
                 lib: ['es2020'],
                 allowJs: true,
                 strict: true,
@@ -19,7 +19,6 @@ module.exports = {
                 skipLibCheck: true,
                 forceConsistentCasingInFileNames: true,
                 resolveJsonModule: true,
-                moduleResolution: 'node',
                 types: ['node', 'jest']
             }
         }]
@@ -32,5 +31,9 @@ module.exports = {
     coverageDirectory: 'coverage',
     coverageReporters: ['text', 'lcov', 'html'],
     moduleFileExtensions: ['ts', 'js', 'json'],
+    testMatch: [
+        '**/__tests__/**/*.test.ts',
+        '**/__tests__/**/*.spec.ts'
+    ],
     testTimeout: 10000
 }

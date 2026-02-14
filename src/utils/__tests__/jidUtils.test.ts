@@ -13,7 +13,7 @@ import {
     isGroupJid,
     isBroadcastJid,
     getJidCacheKey
-} from '../jidUtils'
+} from '../jidUtils.js'
 
 describe('JID Utilities', () => {
     describe('normalizeJidForComparison', () => {

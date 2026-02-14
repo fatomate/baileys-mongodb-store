@@ -9,16 +9,16 @@ import type {
     PresenceData, 
     WAMessageCursor 
 } from 'baileys'
-import type { Label } from 'baileys/lib/Types/Label'
-import { LabelAssociationType } from 'baileys/lib/Types/LabelAssociation'
-import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
+import type { Label } from 'baileys/lib/Types/Label.js'
+import { LabelAssociationType } from 'baileys/lib/Types/LabelAssociation.js'
+import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation.js'
 import type { 
     EnhancedMongoDBStoreConfig, 
     EnhancedMongoDBStore,
     EventStorageConfig,
     EventMetrics,
     CollectionTTLConfig
-} from './types-enhanced'
+} from './types-enhanced.js'
 import NodeCache from 'node-cache'
 import { Queue, Worker, Job } from 'bullmq'
 import Redis from 'ioredis'
@@ -32,23 +32,23 @@ import {
     createSafeErrorMessage,
     hashForLogging,
     safeNormalizeJid
-} from './utils/security'
-import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
-import { MemoryMonitor, BackpressureController } from './utils/memory'
-import { TTLMonitor } from './utils/ttl'
-import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
-import { LidHandler } from './utils/lidHandler'
-import type { LidMapping } from './utils/lidHandler'
-import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
-import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
-import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
-import { ConnectionHealthMonitor } from './utils/connectionHealth'
-import { safeDropIndex, batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
-import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
+} from './utils/security.js'
+import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth.js'
+import { MemoryMonitor, BackpressureController } from './utils/memory.js'
+import { TTLMonitor } from './utils/ttl.js'
+import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media.js'
+import { LidHandler } from './utils/lidHandler.js'
+import type { LidMapping } from './utils/lidHandler.js'
+import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils.js'
+import { ConnectionManager, getConnectionManager } from './utils/connectionManager.js'
+import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry.js'
+import { ConnectionHealthMonitor } from './utils/connectionHealth.js'
+import { safeDropIndex, batchCreateIndexes, recreateIndexes } from './utils/indexHelper.js'
+import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper.js'
 // @ts-ignore - Types are used in annotations only
-import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection'
+import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection.js'
 import { EventEmitter } from 'events'
-import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
+import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager.js'
 
 // Declare Node.js globals if not available in tsconfig
 declare global {

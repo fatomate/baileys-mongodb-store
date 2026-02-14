@@ -10,9 +10,9 @@ import type {
     WAMessageCursor 
 } from 'baileys'
 import { jidNormalizedUser, updateMessageWithReceipt, updateMessageWithReaction, toNumber } from 'baileys'
-import type { Label } from 'baileys/lib/Types/Label'
-import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
-import type { MongoDBStoreConfig, MongoDBStore } from './types'
+import type { Label } from 'baileys/lib/Types/Label.js'
+import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation.js'
+import type { MongoDBStoreConfig, MongoDBStore } from './types.js'
 import NodeCache from 'node-cache'
 import PQueue from 'p-queue'
 import { Queue, Worker, Job } from 'bullmq'
@@ -25,17 +25,17 @@ import {
     AuthorizationError,
     createSafeErrorMessage,
     hashForLogging
-} from './utils/security'
-import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth'
-import { MemoryMonitor, BackpressureController, MemoryAwareBatchProcessor, calculateOptimalBatchSize } from './utils/memory'
-import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
+} from './utils/security.js'
+import { InstanceAccessContext, DEFAULT_PERMISSIONS } from './utils/auth.js'
+import { MemoryMonitor, BackpressureController, MemoryAwareBatchProcessor, calculateOptimalBatchSize } from './utils/memory.js'
+import { ConnectionManager, getConnectionManager } from './utils/connectionManager.js'
 // @ts-ignore - Type is used in annotations
-import type { ConnectionConfig } from './types/connection'
-import { TTLMonitor } from './utils/ttl'
-import { LidHandler } from './utils/lidHandler'
-import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
-import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
-import { batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
+import type { ConnectionConfig } from './types/connection.js'
+import { TTLMonitor } from './utils/ttl.js'
+import { LidHandler } from './utils/lidHandler.js'
+import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry.js'
+import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper.js'
+import { batchCreateIndexes, recreateIndexes } from './utils/indexHelper.js'
 
 const DEFAULT_TTL_DAYS = 30
 

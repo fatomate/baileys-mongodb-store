@@ -10,7 +10,7 @@ import {
     AuthorizationError,
     DEFAULT_PERMISSIONS,
     ADMIN_PERMISSIONS
-} from '../auth'
+} from '../auth.js'
 
 describe('Authentication and Authorization', () => {
     const SECRET_KEY = 'test-secret-key-12345'

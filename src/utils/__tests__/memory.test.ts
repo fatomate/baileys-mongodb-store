@@ -5,7 +5,7 @@ import {
     calculateOptimalBatchSize,
     formatMemoryUsage,
     hassufficientMemory
-} from '../memory'
+} from '../memory.js'
 
 describe('Memory Management Utilities', () => {
     describe('MemoryMonitor', () => {

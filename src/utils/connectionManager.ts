@@ -13,7 +13,7 @@ import {
     PendingMigration,
     InstanceRegistrationResult,
     InstancePoolState
-} from '../types/connection'
+} from '../types/connection.js'
 
 /**
  * Singleton ConnectionManager for managing shared MongoDB connections

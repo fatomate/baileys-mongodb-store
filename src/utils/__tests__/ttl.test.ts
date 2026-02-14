@@ -1,5 +1,5 @@
 import { Db, Collection } from 'mongodb'
-import { TTLMonitor, createTTLCleanupJob } from '../ttl'
+import { TTLMonitor, createTTLCleanupJob } from '../ttl.js'
 
 // Mock MongoDB
 jest.mock('mongodb')

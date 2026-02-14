@@ -15,7 +15,7 @@ import {
     checkInstanceAccess,
     validatePagination,
     validateMongoQuery
-} from '../security'
+} from '../security.js'
 
 describe('Security Utilities', () => {
     describe('JID Validation', () => {

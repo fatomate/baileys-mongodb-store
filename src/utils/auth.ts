@@ -1,8 +1,8 @@
 import { createHmac, randomBytes } from 'crypto'
-import { AuthorizationError } from './security'
+import { AuthorizationError } from './security.js'
 
 // Re-export for convenience
-export { AuthorizationError } from './security'
+export { AuthorizationError } from './security.js'
 
 /**
  * Authentication and authorization utilities

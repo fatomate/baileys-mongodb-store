@@ -1,5 +1,5 @@
 import { Db } from 'mongodb'
-import { isLidFormat } from './jidUtils'
+import { isLidFormat } from './jidUtils.js'
 
 export interface BackfillOptions {
   instanceId: string

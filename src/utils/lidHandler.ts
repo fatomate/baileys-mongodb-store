@@ -8,9 +8,9 @@ import {
     isPhoneNumberFormat,
     areJidsEquivalent,
     extractLidPhonePair
-} from './jidUtils'
-import { retryWithBackoff } from './connectionRetry'
-import type { BaileysLIDMappingStore, BaileysLIDMapping } from './lidCompatibility'
+} from './jidUtils.js'
+import { retryWithBackoff } from './connectionRetry.js'
+import type { BaileysLIDMappingStore, BaileysLIDMapping } from './lidCompatibility.js'
 
 export interface LidMapping {
     instanceId: string

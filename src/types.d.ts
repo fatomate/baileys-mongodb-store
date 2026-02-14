@@ -1,15 +1,15 @@
-import type { Comparable } from '@adiwajshing/keyed-db/lib/Types'
+type Comparable<T, K> = { key: (t: T) => K }
 import type { Logger } from 'pino'
 import type { proto } from 'baileys'
 import type { BaileysEventEmitter, Chat, ConnectionState, Contact, GroupMetadata, PresenceData, WAMessageCursor } from 'baileys'
-import type { Label } from 'baileys/lib/Types/Label'
-import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation'
+import type { Label } from 'baileys/lib/Types/Label.js'
+import type { LabelAssociation } from 'baileys/lib/Types/LabelAssociation.js'
 import type { RedisOptions } from 'ioredis'
-import type { AuthConfig } from './utils/auth'
-import type { MemoryConfig } from './utils/memory'
-import type { TTLConfig } from './utils/ttl'
-import type { LidHandlerConfig } from './utils/lidHandler'
-import type { ConnectionConfig } from './types/connection'
+import type { AuthConfig } from './utils/auth.js'
+import type { MemoryConfig } from './utils/memory.js'
+import type { TTLConfig } from './utils/ttl.js'
+import type { LidHandlerConfig } from './utils/lidHandler.js'
+import type { ConnectionConfig } from './types/connection.js'
 
 export interface RedisConfig {
     /**

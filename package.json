@@ -1,13 +1,20 @@
 {
   "name": "@baileys/mongodb-store",
-  "version": "2.30.0",
+  "version": "3.0.0",
+  "type": "module",
   "description": "MongoDB store implementation for WhiskeySockets Baileys WhatsApp Web API with multi-instance support and TTL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "jest",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:security": "jest src/utils/__tests__/security.test.ts src/utils/__tests__/auth.test.ts",
@@ -36,7 +43,7 @@
     "p-queue": "^8.1.0"
   },
   "peerDependencies": {
-    "@adiwajshing/keyed-db": "*",
+    "baileys": ">=7.0.0-rc.9",
     "pino": "*"
   },
   "devDependencies": {
@@ -62,6 +69,6 @@
     "url": "https://github.com/fatomate/baileys-mongodb-store.git"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=20.0.0"
   }
 }

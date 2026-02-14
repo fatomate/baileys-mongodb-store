@@ -1,5 +1,5 @@
 import { createHash } from 'crypto'
-import { normalizeJidForComparison } from './jidUtils'
+import { normalizeJidForComparison } from './jidUtils.js'
 
 /**
  * Security utilities for input validation and sanitization

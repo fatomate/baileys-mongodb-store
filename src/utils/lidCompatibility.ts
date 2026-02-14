@@ -1,4 +1,4 @@
-import type { LidHandler } from './lidHandler'
+import type { LidHandler } from './lidHandler.js'
 
 /**
  * Baileys v7 LID Mapping type

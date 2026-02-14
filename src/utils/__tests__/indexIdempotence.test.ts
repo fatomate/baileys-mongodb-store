@@ -15,7 +15,7 @@ import {
     findMissingIndexes,
     findMissingIndexesEnhanced,
     validateIndexOptions
-} from '../collectionHelper'
+} from '../collectionHelper.js'
 
 describe('Index Creation Idempotence Property Tests', () => {
     /**

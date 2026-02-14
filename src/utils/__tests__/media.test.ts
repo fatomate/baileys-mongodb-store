@@ -5,7 +5,7 @@ import {
     cleanupOldMedia, 
     getMediaStats,
     type MediaConfig 
-} from '../media'
+} from '../media.js'
 import type { proto } from 'baileys'
 
 // Mock baileys downloadContentFromMessage
