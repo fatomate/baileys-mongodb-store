@@ -6247,6 +6247,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 const updatePayload = { ...update.update }
                                 if (!isMessageEdit && Object.prototype.hasOwnProperty.call(updatePayload, 'messageTimestamp')) {
+                                    // Non-edit updates must not change ordering; existingMessage's top-level timestamp is retained by the merge below.
                                     delete updatePayload.messageTimestamp
                                 }
 
