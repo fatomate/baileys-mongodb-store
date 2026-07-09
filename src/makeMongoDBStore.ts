@@ -35,6 +35,7 @@ import { LidHandler } from './utils/lidHandler.js'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry.js'
 import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper.js'
 import { batchCreateIndexes, recreateIndexes } from './utils/indexHelper.js'
+import { resolvePreservedMessageTimestamp } from './utils/messageTimestamp.js'
 
 const DEFAULT_TTL_DAYS = 30
 
@@ -744,14 +745,17 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                     
                     try {
+                        const filter = {
+                            instanceId,
+                            jid,
+                            'key.id': message.key?.id
+                        }
+                        const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
                         await collections.messages.replaceOne(
+                            filter,
                             {
-                                instanceId,
-                                jid,
-                                'key.id': message.key?.id
-                            },
-                            {
-                                ...message,
+                                ...timestampedMessage,
                                 instanceId,
                                 jid,
                                 updatedAt: new Date()
@@ -764,6 +768,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             log(`⚠️ [Bull Queue] Duplicate key error for message ${message.key?.id} in chat ${jid} - message already exists`)
                             // Try to update instead of replace
                             try {
+                                const timestampedMessage = await buildTimestampedMessage(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': message.key?.id
+                                    },
+                                    jid,
+                                    message
+                                )
+
                                 await collections.messages.updateOne(
                                     {
                                         instanceId,
@@ -772,7 +786,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                     },
                                     {
                                         $set: {
-                                            ...message,
+                                            ...timestampedMessage,
                                             updatedAt: new Date()
                                         }
                                     }
@@ -788,14 +802,17 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                     }
                     performanceMetrics.messagesProcessed++
                 } else if (type === 'update' && messageId && update) {
+                    const filter = {
+                        instanceId,
+                        jid,
+                        'key.id': messageId
+                    }
+                    const timestampedUpdate = await buildTimestampedUpdate(filter, update)
+
                     await collections.messages.updateOne(
+                        filter,
                         {
-                            instanceId,
-                            jid,
-                            'key.id': messageId
-                        },
-                        {
-                            $set: { ...update, updatedAt: new Date() }
+                            $set: { ...timestampedUpdate, updatedAt: new Date() }
                         }
                     )
                 } else if (type === 'delete') {
@@ -1230,20 +1247,25 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         // Message processor
         messageProcessor = new MemoryAwareBatchProcessor<proto.IWebMessageInfo & { jid: string }>(
             async (items) => {
-                const bulkOps = items.map(({ jid, ...message }) => ({
-                    replaceOne: {
-                        filter: {
-                            instanceId: validatedInstanceId,
-                            jid,
-                            'key.id': message.key?.id
-                        },
-                        replacement: {
-                            ...message,
-                            instanceId: validatedInstanceId,
-                            jid,
-                            updatedAt: new Date()
-                        },
-                        upsert: true
+                const bulkOps = await Promise.all(items.map(async ({ jid, ...message }) => {
+                    const filter = {
+                        instanceId: validatedInstanceId,
+                        jid,
+                        'key.id': message.key?.id
+                    }
+                    const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
+                    return {
+                        replaceOne: {
+                            filter,
+                            replacement: {
+                                ...timestampedMessage,
+                                instanceId: validatedInstanceId,
+                                jid,
+                                updatedAt: new Date()
+                            },
+                            upsert: true
+                        }
                     }
                 }))
                 
@@ -1318,6 +1340,80 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }
         
         return result.result as T
+    }
+
+    const getMessageEditTimestamp = async (
+        jid: string,
+        message: proto.IWebMessageInfo
+    ): Promise<unknown> => {
+        if (message.message?.protocolMessage?.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT || !message.message.protocolMessage.key?.id) {
+            return message.messageTimestamp
+        }
+
+        const editTargetKey = message.message.protocolMessage.key
+        log(`🔄 Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
+
+        const originalMessage = await withConnection(async () =>
+            collections.messages.findOne(
+                {
+                    instanceId: validatedInstanceId,
+                    jid,
+                    'key.id': editTargetKey.id
+                },
+                { projection: { messageTimestamp: 1 } }
+            )
+        ) as any
+
+        const timestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: originalMessage?.messageTimestamp,
+            incomingTimestamp: message.messageTimestamp,
+            fallbackTimestamp: originalMessage?._id
+        })
+
+        log(`⏰ Preserving normalized messageTimestamp: ${timestamp} for edited message ${editTargetKey.id}`)
+        return timestamp
+    }
+
+    const buildTimestampedMessage = async (
+        filter: Record<string, unknown>,
+        jid: string,
+        message: proto.IWebMessageInfo
+    ): Promise<proto.IWebMessageInfo & { messageTimestamp: number }> => {
+        const existingMessage = await withConnection(async () =>
+            collections.messages.findOne(filter, { projection: { messageTimestamp: 1 } })
+        ) as any
+
+        const incomingTimestamp = await getMessageEditTimestamp(jid, message)
+        const messageTimestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: existingMessage?.messageTimestamp,
+            incomingTimestamp,
+            fallbackTimestamp: existingMessage?._id
+        })
+
+        return {
+            ...message,
+            messageTimestamp
+        }
+    }
+
+    const buildTimestampedUpdate = async (
+        filter: Record<string, unknown>,
+        update: Partial<proto.IWebMessageInfo>
+    ): Promise<Partial<proto.IWebMessageInfo> & { messageTimestamp: number }> => {
+        const existingMessage = await withConnection(async () =>
+            collections.messages.findOne(filter, { projection: { messageTimestamp: 1 } })
+        ) as any
+
+        const messageTimestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: existingMessage?.messageTimestamp,
+            incomingTimestamp: update.messageTimestamp,
+            fallbackTimestamp: existingMessage?._id
+        })
+
+        return {
+            ...update,
+            messageTimestamp
+        }
     }
 
     // Batch processing functions
@@ -1433,20 +1529,25 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
         }
         
         try {
-            const bulkOps = itemsToProcess.map(({ jid, ...message }) => ({
-                replaceOne: {
-                    filter: {
-                        instanceId,
-                        jid,
-                        'key.id': message.key?.id
-                    },
-                    replacement: {
-                        ...message,
-                        instanceId,
-                        jid,
-                        updatedAt: new Date()
-                    },
-                    upsert: true
+            const bulkOps = await Promise.all(itemsToProcess.map(async ({ jid, ...message }) => {
+                const filter = {
+                    instanceId,
+                    jid,
+                    'key.id': message.key?.id
+                }
+                const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
+                return {
+                    replaceOne: {
+                        filter,
+                        replacement: {
+                            ...timestampedMessage,
+                            instanceId,
+                            jid,
+                            updatedAt: new Date()
+                        },
+                        upsert: true
+                    }
                 }
             }))
             
@@ -2329,14 +2430,17 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                 
                 await pMessageQueue.add(async () => {
                     try {
+                        const filter = {
+                            instanceId: validatedInstanceId,
+                            jid: validJid,
+                            'key.id': message.key?.id
+                        }
+                        const timestampedMessage = await buildTimestampedMessage(filter, validJid, message)
+
                         await collections.messages.replaceOne(
+                            filter,
                             {
-                                instanceId: validatedInstanceId,
-                                jid: validJid,
-                                'key.id': message.key?.id
-                            },
-                            {
-                                ...message,
+                                ...timestampedMessage,
                                 instanceId: validatedInstanceId,
                                 jid: validJid,
                                 updatedAt: new Date()
@@ -2349,6 +2453,16 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             log(`⚠️ [Direct] Duplicate key error for message ${message.key?.id} in chat ${validJid} - message already exists`)
                             // Try to update instead of replace
                             try {
+                                const timestampedMessage = await buildTimestampedMessage(
+                                    {
+                                        instanceId: validatedInstanceId,
+                                        jid: validJid,
+                                        'key.id': message.key?.id
+                                    },
+                                    validJid,
+                                    message
+                                )
+
                                 await collections.messages.updateOne(
                                     {
                                         instanceId: validatedInstanceId,
@@ -2357,7 +2471,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                     },
                                     {
                                         $set: {
-                                            ...message,
+                                            ...timestampedMessage,
                                             updatedAt: new Date()
                                         }
                                     }
@@ -2411,15 +2525,17 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
             
             // Fallback to direct update
             const processedUpdate = convertBinaryToBuffer(update)
-            
+            const filter = {
+                instanceId,
+                jid,
+                'key.id': id
+            }
+            const timestampedUpdate = await buildTimestampedUpdate(filter, processedUpdate)
+
             const result = await collections.messages.updateOne(
+                filter,
                 {
-                    instanceId,
-                    jid,
-                    'key.id': id
-                },
-                {
-                    $set: { ...processedUpdate, updatedAt: new Date() }
+                    $set: { ...timestampedUpdate, updatedAt: new Date() }
                 }
             )
             

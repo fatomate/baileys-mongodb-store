@@ -48,6 +48,7 @@ import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/co
 import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection.js'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager.js'
+import { resolvePreservedMessageTimestamp } from './utils/messageTimestamp.js'
 
 // Declare Node.js globals if not available in tsconfig
 declare global {
@@ -1198,6 +1199,60 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         return result.result as T
     }
+
+    const getMessageEditTimestamp = async (
+        jid: string,
+        message: proto.IWebMessageInfo
+    ): Promise<unknown> => {
+        if (message.message?.protocolMessage?.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT || !message.message.protocolMessage.key?.id) {
+            return message.messageTimestamp
+        }
+
+        const editTargetKey = message.message.protocolMessage.key
+        log(`🔄 Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
+
+        const originalMessage = await withConnection(async () =>
+            collections.messages.findOne(
+                {
+                    instanceId: validatedInstanceId,
+                    jid,
+                    'key.id': editTargetKey.id
+                },
+                { projection: { messageTimestamp: 1 } }
+            )
+        ) as any
+
+        const timestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: originalMessage?.messageTimestamp,
+            incomingTimestamp: message.messageTimestamp,
+            fallbackTimestamp: originalMessage?._id
+        })
+
+        log(`⏰ Preserving normalized messageTimestamp: ${timestamp} for edited message ${editTargetKey.id}`)
+        return timestamp
+    }
+
+    const buildTimestampedMessage = async (
+        filter: Record<string, unknown>,
+        jid: string,
+        message: proto.IWebMessageInfo
+    ): Promise<proto.IWebMessageInfo & { messageTimestamp: number }> => {
+        const existingMessage = await withConnection(async () =>
+            collections.messages.findOne(filter, { projection: { messageTimestamp: 1 } })
+        ) as any
+
+        const incomingTimestamp = await getMessageEditTimestamp(jid, message)
+        const messageTimestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: existingMessage?.messageTimestamp,
+            incomingTimestamp,
+            fallbackTimestamp: existingMessage?._id
+        })
+
+        return {
+            ...message,
+            messageTimestamp
+        }
+    }
     
     // Queue configuration
     const BATCH_SIZE = 100
@@ -1402,15 +1457,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 // Store the message
+                const filter = {
+                    instanceId: validatedInstanceId,
+                    jid,
+                    'key.id': message.key?.id
+                }
+                const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
                 await withConnection(async () =>
                     collections.messages.replaceOne(
+                        filter,
                         {
-                            instanceId: validatedInstanceId,
-                            jid,
-                            'key.id': message.key?.id
-                        },
-                        {
-                            ...message,
+                            ...timestampedMessage,
                             instanceId: validatedInstanceId,
                             jid,
                             updatedAt: new Date()
@@ -2222,39 +2280,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
                     
-                    // Check if this is a MESSAGE_EDIT
-                    let preservedTimestamp = null
-                    if (message.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && message.message.protocolMessage.key) {
-                        const editTargetKey = message.message.protocolMessage.key
-                        log(`🔄 [Bull Queue] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
-                        
-                        // Fetch the original message to preserve its timestamp
-                        const originalMessage = await withConnection(async () =>
-                            collections.messages.findOne({
-                                instanceId,
-                                jid,
-                                'key.id': editTargetKey.id
-                            })
-                        )
-                        
-                        if (originalMessage && originalMessage.messageTimestamp) {
-                            preservedTimestamp = originalMessage.messageTimestamp
-                            log(`⏰ [Bull Queue] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
-                        }
-                    }
-                    
                     try {
+                        const filter = {
+                            instanceId,
+                            jid,
+                            'key.id': message.key?.id
+                        }
+                        const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
                         await withConnection(async () =>
                             collections.messages.replaceOne(
+                                filter,
                                 {
-                                    instanceId,
-                                    jid,
-                                    'key.id': message.key?.id
-                                },
-                                {
-                                    ...message,
-                                    // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
-                                    ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                    ...timestampedMessage,
                                     instanceId,
                                     jid,
                                     ...(pollVoteDecrypted && { pollVoteDecrypted }),
@@ -2269,6 +2307,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`⚠️ [Bull Queue] Duplicate key error for message ${message.key?.id} in chat ${jid} - message already exists`)
                             // Try to update instead of replace
                             try {
+                                const timestampedMessage = await buildTimestampedMessage(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': message.key?.id
+                                    },
+                                    jid,
+                                    message
+                                )
+
                                 await withConnection(async () =>
                                     collections.messages.updateOne(
                                         {
@@ -2278,8 +2326,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         },
                                         {
                                             $set: {
-                                                ...message,
-                                                ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                                ...timestampedMessage,
                                                 ...(pollVoteDecrypted && { pollVoteDecrypted }),
                                                 updatedAt: new Date()
                                             }
@@ -2362,18 +2409,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (existingMsg) {
                         // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                         const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
-                        const originalTimestamp = existingMsg.messageTimestamp
-                        
                         if (isMessageEdit) {
+                            const normalizedTimestamp = resolvePreservedMessageTimestamp({
+                                existingTimestamp: existingMsg.messageTimestamp,
+                                incomingTimestamp: update.messageTimestamp,
+                                fallbackTimestamp: existingMsg._id
+                            })
                             log(`🔄 [Bull Queue Update] Detected MESSAGE_EDIT for ${messageId}`)
-                            log(`⏰ [Bull Queue Update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                            log(`⏰ [Bull Queue Update] Preserving normalized messageTimestamp: ${normalizedTimestamp}`)
                         }
                         
                         // Prepare the update object, preserving original timestamp for edits
                         const finalUpdate = { ...update }
-                        if (isMessageEdit && originalTimestamp) {
-                            finalUpdate.messageTimestamp = originalTimestamp
-                            log(`✅ [Bull Queue Update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                        if (isMessageEdit) {
+                            finalUpdate.messageTimestamp = resolvePreservedMessageTimestamp({
+                                existingTimestamp: existingMsg.messageTimestamp,
+                                incomingTimestamp: update.messageTimestamp,
+                                fallbackTimestamp: existingMsg._id
+                            })
+                            log(`✅ [Bull Queue Update] Preserved normalized messageTimestamp: ${finalUpdate.messageTimestamp}`)
                         }
                         
                         if (existingMsg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
@@ -4805,40 +4859,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
-            // Check if this is a MESSAGE_EDIT
-            let preservedTimestamp = null
-            if (clonedMessage.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && clonedMessage.message.protocolMessage.key) {
-                const editTargetKey = clonedMessage.message.protocolMessage.key
-                log(`🔄 [Direct] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
-                
-                // Fetch the original message to preserve its timestamp
-                const originalMessage = await withConnection(async () =>
-                    collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        'key.id': editTargetKey.id
-                    })
-                )
-                
-                if (originalMessage && originalMessage.messageTimestamp) {
-                    preservedTimestamp = originalMessage.messageTimestamp
-                    log(`⏰ [Direct] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
-                }
-            }
-            
             // Fallback to direct database operation
             try {
+                const filter = {
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
+                    'key.id': clonedMessage.key?.id
+                }
+                const timestampedMessage = await buildTimestampedMessage(filter, validJid, clonedMessage)
+
                 await withConnection(async () =>
                     collections.messages.replaceOne(
+                        filter,
                         {
-                            instanceId: validatedInstanceId,
-                            jid: validJid,
-                            'key.id': clonedMessage.key?.id
-                        },
-                        {
-                            ...clonedMessage,
-                            // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
-                            ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                            ...timestampedMessage,
                             instanceId: validatedInstanceId,
                             jid: validJid,
                             ...(pollVoteDecrypted && { pollVoteDecrypted }),
@@ -4853,6 +4887,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`⚠️ [Direct] Duplicate key error for message ${clonedMessage.key?.id} in chat ${validJid} - message already exists`)
                     // Try to update instead of replace
                     try {
+                        const timestampedMessage = await buildTimestampedMessage(
+                            {
+                                instanceId: validatedInstanceId,
+                                jid: validJid,
+                                'key.id': clonedMessage.key?.id
+                            },
+                            validJid,
+                            clonedMessage
+                        )
+
                         await withConnection(async () =>
                             collections.messages.updateOne(
                                 {
@@ -4862,8 +4906,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 },
                                 {
                                     $set: {
-                                        ...clonedMessage,
-                                        ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                        ...timestampedMessage,
                                         ...(pollVoteDecrypted && { pollVoteDecrypted }),
                                         updatedAt: new Date()
                                     }
@@ -5047,23 +5090,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (existingMsg) {
                 // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                 const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
-                const originalTimestamp = existingMsg.messageTimestamp
+                const normalizedTimestamp = isMessageEdit
+                    ? resolvePreservedMessageTimestamp({
+                        existingTimestamp: existingMsg.messageTimestamp,
+                        incomingTimestamp: update.messageTimestamp,
+                        fallbackTimestamp: existingMsg._id
+                    })
+                    : null
                 
                 if (isMessageEdit) {
                     if (shouldLogOnce(`um_det_${id}`, 5)) {
                         log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
                     }
                     if (shouldLogOnce(`um_ts_${id}`, 5)) {
-                        log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                        log(`⏰ [updateMessage] Preserving normalized messageTimestamp: ${normalizedTimestamp}`)
                     }
                 }
                 
                 // Preserve original timestamp for edits
-                if (isMessageEdit && originalTimestamp) {
+                if (isMessageEdit && normalizedTimestamp !== null) {
                     finalUpdate = { ...update }
-                    finalUpdate.messageTimestamp = originalTimestamp
+                    finalUpdate.messageTimestamp = normalizedTimestamp
                     if (shouldLogOnce(`um_pres_${id}`, 5)) {
-                        log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                        log(`✅ [updateMessage] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                     }
                 }
                 
@@ -6158,16 +6207,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             if (existingMessage) {
                                 // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                                 const isMessageEdit = !!(update.update?.message?.editedMessage || (update.update as any)?.editedMessage)
-                                
-                                // Preserve original messageTimestamp for edits
-                                const originalTimestamp = existingMessage.messageTimestamp
+                                const normalizedTimestamp = isMessageEdit
+                                    ? resolvePreservedMessageTimestamp({
+                                        existingTimestamp: existingMessage.messageTimestamp,
+                                        incomingTimestamp: update.update?.messageTimestamp
+                                    })
+                                    : null
                                 
                                 if (isMessageEdit) {
                                     if (shouldLogOnce(`mu_det_${update.key.id}`, 5)) {
                                         log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
                                     }
                                     if (shouldLogOnce(`mu_ts_${update.key.id}`, 5)) {
-                                        log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                        log(`⏰ [messages.update] Preserving normalized messageTimestamp: ${normalizedTimestamp}`)
                                     }
                                 }
                                 
@@ -6182,10 +6234,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                                 
                                 // CRITICAL: Preserve original messageTimestamp for MESSAGE_EDIT
-                                if (isMessageEdit && originalTimestamp) {
-                                    mergedUpdate.messageTimestamp = originalTimestamp
+                                if (isMessageEdit && normalizedTimestamp !== null) {
+                                    mergedUpdate.messageTimestamp = normalizedTimestamp
                                     if (shouldLogOnce(`mu_pres_${update.key.id}`, 5)) {
-                                        log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                                        log(`✅ [messages.update] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                                     }
                                 }
                                 
