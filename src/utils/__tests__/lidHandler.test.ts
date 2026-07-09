@@ -142,6 +142,36 @@ describe('LidHandler', () => {
             await expect(contacts.findOne({ instanceId: 'test-instance', id: newPhone })).resolves.toBeNull()
         })
 
+        it('keeps pushName without caching LID when duplicate-key retry has no matching contact', async () => {
+            const lid = '114194640801953@lid'
+            const existingPhone = '60196953307@s.whatsapp.net'
+            const newPhone = '60111111111@s.whatsapp.net'
+            const contacts = db.collection('test_contacts')
+
+            await contacts.createIndex(
+                { instanceId: 1, lid: 1 },
+                { unique: true, partialFilterExpression: { lid: { $type: 'string' } } }
+            )
+            await contacts.insertOne({
+                instanceId: 'test-instance',
+                id: existingPhone,
+                lid,
+                updatedAt: new Date()
+            })
+
+            await expect(lidHandler.storeLidMapping(lid, newPhone, 'New User')).resolves.toBe(false)
+
+            await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBe(existingPhone)
+            const rejectedContact = await contacts.findOne({ instanceId: 'test-instance', id: newPhone })
+            expect(rejectedContact).toEqual(
+                expect.objectContaining({
+                    id: newPhone,
+                    pushName: 'New User'
+                })
+            )
+            expect(rejectedContact).not.toHaveProperty('lid')
+        })
+
         it('reports discovered mapping rejection when the LID belongs to another contact', async () => {
             const lid = '114194640801953@lid'
             const existingPhone = '60196953307@s.whatsapp.net'
@@ -327,6 +357,28 @@ describe('LidHandler', () => {
             })
 
             await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBe(authoritativePhone)
+        })
+
+        it('does not use duplicate-marked messages as reverse lookup fallback', async () => {
+            const lid = '114194640801953@lid'
+            const rejectedPhone = '60111111111@s.whatsapp.net'
+
+            await db.collection('test_messages').insertOne({
+                instanceId: 'test-instance',
+                key: {
+                    id: 'msg-rejected',
+                    fromMe: false,
+                    remoteJid: rejectedPhone,
+                    senderLid: lid,
+                    senderPn: rejectedPhone
+                },
+                lidMapping: {
+                    duplicateOf: 'canonical-id',
+                    duplicateTargetJid: '60196953307@s.whatsapp.net'
+                }
+            })
+
+            await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBeNull()
         })
     })
 

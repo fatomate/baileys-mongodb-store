@@ -1490,12 +1490,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     )
                 ) as any
                 const finalUpdate = { ...update }
-                if (Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')) {
+                const hasIncomingTimestamp = Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')
+                const isMessageEdit = !!(finalUpdate.message?.editedMessage || (finalUpdate as any).editedMessage)
+                if (existingMsg && isMessageEdit) {
                     finalUpdate.messageTimestamp = resolvePreservedMessageTimestamp({
-                        existingTimestamp: existingMsg?.messageTimestamp,
+                        existingTimestamp: existingMsg.messageTimestamp,
                         incomingTimestamp: finalUpdate.messageTimestamp,
-                        fallbackTimestamp: existingMsg?._id
+                        fallbackTimestamp: existingMsg._id
                     })
+                } else if (hasIncomingTimestamp) {
+                    delete finalUpdate.messageTimestamp
                 }
 
                 await withConnection(async () =>
@@ -2446,6 +2450,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 fallbackTimestamp: existingMsg._id
                             })
                             log(`✅ [Bull Queue Update] Preserved normalized messageTimestamp: ${finalUpdate.messageTimestamp}`)
+                        } else if (Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')) {
+                            delete finalUpdate.messageTimestamp
                         }
                         
                         if (existingMsg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
@@ -5089,7 +5095,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 })
             ) as any
             
-            let finalUpdate = update
+            let finalUpdate = { ...update }
+            const hasIncomingTimestamp = Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')
             
             if (existingMsg) {
                 // Check if this is a MESSAGE_EDIT by looking for editedMessage field
@@ -5113,11 +5120,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Preserve original timestamp for edits
                 if (isMessageEdit && normalizedTimestamp !== null) {
-                    finalUpdate = { ...update }
                     finalUpdate.messageTimestamp = normalizedTimestamp
                     if (shouldLogOnce(`um_pres_${id}`, 5)) {
                         log(`✅ [updateMessage] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                     }
+                } else if (hasIncomingTimestamp) {
+                    delete finalUpdate.messageTimestamp
                 }
                 
                 // If existing message has quoted message and update has message content, preserve quoted structure
@@ -5143,6 +5151,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         message: mergedMessage
                     }
                 }
+            } else if (hasIncomingTimestamp) {
+                delete finalUpdate.messageTimestamp
             }
             
             const result = await withConnection(async () =>
@@ -6251,6 +6261,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     if (shouldLogOnce(`mu_pres_${update.key.id}`, 5)) {
                                         log(`✅ [messages.update] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                                     }
+                                } else {
+                                    mergedUpdate.messageTimestamp = existingMessage.messageTimestamp
                                 }
                                 
                                 // Preserve quoted message structure if it exists

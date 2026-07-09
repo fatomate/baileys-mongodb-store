@@ -1399,21 +1399,26 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
     const buildTimestampedUpdate = async (
         filter: Record<string, unknown>,
         update: Partial<proto.IWebMessageInfo>
-    ): Promise<Partial<proto.IWebMessageInfo> & { messageTimestamp: number }> => {
+    ): Promise<Partial<proto.IWebMessageInfo>> => {
         const existingMessage = await withConnection(async () =>
             collections.messages.findOne(filter, { projection: { messageTimestamp: 1 } })
         ) as any
 
-        const messageTimestamp = resolvePreservedMessageTimestamp({
-            existingTimestamp: existingMessage?.messageTimestamp,
-            incomingTimestamp: update.messageTimestamp,
-            fallbackTimestamp: existingMessage?._id
-        })
+        const finalUpdate = { ...update }
+        const hasIncomingTimestamp = Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')
+        const isMessageEdit = finalUpdate.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT
 
-        return {
-            ...update,
-            messageTimestamp
+        if (isMessageEdit && existingMessage) {
+            finalUpdate.messageTimestamp = resolvePreservedMessageTimestamp({
+                existingTimestamp: existingMessage.messageTimestamp,
+                incomingTimestamp: finalUpdate.messageTimestamp,
+                fallbackTimestamp: existingMessage._id
+            })
+        } else if (hasIncomingTimestamp) {
+            delete finalUpdate.messageTimestamp
         }
+
+        return finalUpdate
     }
 
     // Batch processing functions

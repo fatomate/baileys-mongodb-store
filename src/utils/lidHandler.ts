@@ -591,27 +591,6 @@ export class LidHandler {
                 )
             } catch (e: any) {
                 if (e?.code === 11000) {
-                    // Retry without upsert; don't override existing pushName if set
-                    const retryResult = await this.contactsCollection.updateOne(
-                        { 
-                            instanceId: this.instanceId,
-                            id: normalizedPhone
-                        },
-                        {
-                            $set: {
-                                ...(shouldSetLid ? { lid: normalizedLid } : {}),
-                                updatedAt: now
-                            }
-                        },
-                        { upsert: false }
-                    )
-                    if (retryResult.matchedCount === 0) {
-                        console.debug(
-                            `[LidHandler] Existing mapping for ${normalizedLid} belongs to another contact; ` +
-                            `skipping new phone ${normalizedPhone}`
-                        )
-                        return false
-                    }
                     if (shouldSetPushName) {
                         await this.contactsCollection.updateOne(
                             {
@@ -619,9 +598,67 @@ export class LidHandler {
                                 id: normalizedPhone,
                                 $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ]
                             },
-                            { $set: { pushName: cleanedPushName, pushNameUpdatedAt: now, updatedAt: now } },
+                            {
+                                $set: { pushName: cleanedPushName, pushNameUpdatedAt: now, updatedAt: now },
+                                $setOnInsert: {
+                                    instanceId: this.instanceId,
+                                    id: normalizedPhone,
+                                    lidFirstSeen: now
+                                }
+                            },
+                            { upsert: true }
+                        )
+                    }
+                    let retryResult
+                    try {
+                        // Retry without upsert; don't override existing pushName if set
+                        retryResult = await this.contactsCollection.updateOne(
+                            {
+                                instanceId: this.instanceId,
+                                id: normalizedPhone
+                            },
+                            {
+                                $set: {
+                                    ...(shouldSetLid ? { lid: normalizedLid } : {}),
+                                    updatedAt: now
+                                }
+                            },
                             { upsert: false }
                         )
+                    } catch (retryError: any) {
+                        if (retryError?.code === 11000) {
+                            console.debug(
+                                `[LidHandler] Existing mapping for ${normalizedLid} belongs to another contact; ` +
+                                `skipping new phone ${normalizedPhone}`
+                            )
+                            return false
+                        }
+                        throw retryError
+                    }
+                    if (retryResult.matchedCount === 0) {
+                        if (shouldSetPushName) {
+                            await this.contactsCollection.updateOne(
+                                {
+                                    instanceId: this.instanceId,
+                                    id: normalizedPhone,
+                                    $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ]
+                                },
+                                {
+                                    $set: { pushName: cleanedPushName, pushNameUpdatedAt: now, updatedAt: now },
+                                    $setOnInsert: {
+                                        instanceId: this.instanceId,
+                                        id: normalizedPhone,
+                                        lidFirstSeen: now
+                                    }
+                                },
+                                { upsert: true }
+                            )
+                        }
+                        console.debug(
+                            `[LidHandler] Existing mapping for ${normalizedLid} belongs to another contact; ` +
+                            `skipping new phone ${normalizedPhone}`
+                        )
+                        return false
                     }
                 } else {
                     throw e
@@ -1027,6 +1064,7 @@ export class LidHandler {
                 const receivedMessage = await this.messagesCollection.findOne({
                     instanceId: this.instanceId,
                     'key.fromMe': false,
+                    'lidMapping.duplicateOf': { $exists: false },
                     $or: [
                         // Legacy format: senderLid
                         { 'key.senderLid': normalizedLid },
@@ -1106,6 +1144,7 @@ export class LidHandler {
                 // Add projection to only fetch needed fields for performance
                 const message = await this.messagesCollection.findOne({
                     instanceId: this.instanceId,
+                    'lidMapping.duplicateOf': { $exists: false },
                     $or: [
                         // LEGACY Case 1: LID in senderLid with phone in senderPn
                         { 
