@@ -1479,7 +1479,25 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 return { success: true, type: 'upsert' }
             } else if (type === 'update' && update) {
-                // Update message
+                const existingMsg = await withConnection(async () =>
+                    collections.messages.findOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid,
+                            'key.id': messageId
+                        },
+                        { projection: { messageTimestamp: 1 } }
+                    )
+                ) as any
+                const finalUpdate = { ...update }
+                if (Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')) {
+                    finalUpdate.messageTimestamp = resolvePreservedMessageTimestamp({
+                        existingTimestamp: existingMsg?.messageTimestamp,
+                        incomingTimestamp: finalUpdate.messageTimestamp,
+                        fallbackTimestamp: existingMsg?._id
+                    })
+                }
+
                 await withConnection(async () =>
                     collections.messages.updateOne(
                         {
@@ -1487,7 +1505,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             jid,
                             'key.id': messageId
                         },
-                        { $set: { ...update, updatedAt: new Date() } }
+                        { $set: { ...finalUpdate, updatedAt: new Date() } }
                     )
                 )
                 return { success: true, type: 'update' }
@@ -3744,7 +3762,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         return totalLabelAssociationsUpdated
     }
     // Safe LID setter - handles E11000 duplicate key conflicts on contacts_lid_lookup
-    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<void> => {
+    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<boolean> => {
         const inst = targetInstanceId || instanceId
         try {
             await withConnection(async () =>
@@ -3753,32 +3771,38 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     { $set: { lid, updatedAt: new Date() } }
                 )
             )
+            return true
         } catch (e: any) {
             if (e?.code === 11000 && e?.keyPattern?.lid) {
-                log(`[LID] Conflict: LID ${lid} already assigned, reassigning to ${contactId}`)
-                await withConnection(async () =>
-                    collections.contacts.updateOne(
-                        { instanceId: inst, lid, id: { $ne: contactId } },
-                        { $unset: { lid: 1 }, $set: { updatedAt: new Date() } }
-                    )
-                )
-                try {
-                    await withConnection(async () =>
-                        collections.contacts.updateOne(
-                            { instanceId: inst, id: contactId },
-                            { $set: { lid, updatedAt: new Date() } }
-                        )
-                    )
-                } catch (retryError: any) {
-                    if (retryError?.code === 11000) {
-                        log(`[LID] Failed to assign LID ${lid} to ${contactId} after retry`)
-                    } else {
-                        throw retryError
-                    }
-                }
+                log(`[LID] Conflict: LID ${lid} already assigned; skipping reassignment to ${contactId}`)
+                return false
             } else {
                 throw e
             }
+        }
+    }
+
+    const safeUpdateExistingMessages = async (lid: string, phoneNumber: string, context: string): Promise<void> => {
+        if (!lidHandler) return
+        try {
+            await lidHandler.updateExistingMessages(lid, phoneNumber)
+        } catch (error: any) {
+            log(`[LID] Message migration skipped during ${context}: ${error?.message || error}`)
+        }
+    }
+
+    const safeStoreLidMapping = async (
+        lid: string,
+        phoneNumber: string,
+        pushName: string | undefined,
+        context: string
+    ): Promise<boolean> => {
+        if (!lidHandler) return false
+        try {
+            return await lidHandler.storeLidMapping(lid, phoneNumber, pushName)
+        } catch (error: any) {
+            log(`[LID] Mapping store skipped during ${context}: ${error?.message || error}`)
+            return false
         }
     }
 
@@ -4367,10 +4391,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                 const { pn, lid } = mapping
                                                 
                                                 // Update contact with LID in MongoDB (safe against duplicate key)
-                                                await safeSetLid(pn, lid)
+                                                const lidSet = await safeSetLid(pn, lid)
                                                 
                                                 // Also store in LidHandler for cache
-                                                if (lidHandler) {
+                                                if (lidSet && lidHandler) {
                                                     try {
                                                         await lidHandler.storeLidMapping(lid, pn)
                                                     } catch {
@@ -4378,7 +4402,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                     }
                                                 }
                                                 
-                                                log(`✅ [Contacts] Updated LID for ${pn} via v7 API`)
+                                                log(lidSet
+                                                    ? `✅ [Contacts] Updated LID for ${pn} via v7 API`
+                                                    : `⚠️ [Contacts] Skipped conflicting LID ${lid} for ${pn} via v7 API`
+                                                )
                                             }
                                         }
                                     } catch (batchError: any) {
@@ -4420,10 +4447,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         if (result && result.length > 0 && result[0].exists && result[0].lid) {
                                             lid = result[0].lid
                                             // Update contact with LID (safe against duplicate key)
-                                            await safeSetLid(contactId, lid)
+                                            const lidSet = await safeSetLid(contactId, lid)
 
                                             // Also store in LidHandler for cache
-                                            if (lidHandler) {
+                                            if (lidSet && lidHandler) {
                                                 try {
                                                     await lidHandler.storeLidMapping(lid, contactId)
                                                 } catch {
@@ -4431,7 +4458,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                 }
                                             }
 
-                                            log(`✅ [Contacts] Updated LID for ${contactId}`)
+                                            log(lidSet
+                                                ? `✅ [Contacts] Updated LID for ${contactId}`
+                                                : `⚠️ [Contacts] Skipped conflicting LID ${lid} for ${contactId}`
+                                            )
                                             break
                                         }
                                     } catch (error: any) {
@@ -4621,33 +4651,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         const phoneJid = lidHandler.isLidFormat(foundJid) ? validJid : foundJid
                                         
                                         log(`Updating existing messages from LID ${lidJid} to phone ${phoneJid}`)
-                                        
-                                        // Update messages that have the LID as remoteJid
-                                        // Only update remoteJid and jid fields, leave senderPn and senderLid as-is
-                                        try {
-                                            const updateResult = await withConnection(async () =>
-                                                collections.messages.updateMany(
-                                                    {
-                                                        instanceId: validatedInstanceId,
-                                                        'key.remoteJid': lidJid
-                                                    },
-                                                    {
-                                                        $set: {
-                                                            'key.remoteJid': phoneJid,
-                                                            jid: phoneJid,
-                                                            'lidMapping.resolved': true,
-                                                            'lidMapping.resolvedAt': new Date()
-                                                        }
-                                                    }
-                                                )
-                                            )
-                                            
-                                            if (updateResult.modifiedCount > 0) {
-                                                log(`Updated ${updateResult.modifiedCount} messages from LID to phone number format`)
-                                            }
-                                        } catch (updateError) {
-                                            logError(`Failed to update messages with new LID mapping:`, updateError)
-                                        }
+                                        await safeUpdateExistingMessages(lidJid, phoneJid, 'getMessage read repair')
                                         
                                         // Read-repair for the current message document
                                         try {
@@ -5855,11 +5859,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
                                     
                                     // Store the mapping (lid -> phone)
-                                    await lidHandler.storeLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    const mappingStored = await safeStoreLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern A')
                                     
                                     // jid is already the phone number, no change needed
                                     // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJidAlt, remoteJid)
+                                    if (mappingStored) {
+                                        await safeUpdateExistingMessages(remoteJidAlt, remoteJid, 'messages.upsert Pattern A')
+                                    }
                                 }
                                 // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
                                 // remoteJid is LID, remoteJidAlt is phone number
@@ -5869,14 +5875,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     
                                     // Store the mapping (lid -> phone)
                                     // Outgoing message: do not persist pushName (it's our own)
-                                    await lidHandler.storeLidMapping(remoteJid, remoteJidAlt)
-                                    
-                                    // Update message to use phone number
-                                    msg.key.remoteJid = remoteJidAlt
-                                    jid = remoteJidAlt
-                                    
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJid, remoteJidAlt)
+                                    const mappingStored = await safeStoreLidMapping(remoteJid, remoteJidAlt, undefined, 'messages.upsert Pattern B')
+                                    if (mappingStored) {
+                                        // Update message to use phone number
+                                        msg.key.remoteJid = remoteJidAlt
+                                        jid = remoteJidAlt
+
+                                        // Update existing messages with this LID
+                                        await safeUpdateExistingMessages(remoteJid, remoteJidAlt, 'messages.upsert Pattern B')
+                                    }
                                 }
                                 // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
                                 else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
@@ -5884,14 +5891,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
                                     
                                     // Store the mapping
-                                    await lidHandler.storeLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName)
-                                    
-                                    // Update message to use phone number
-                                    msg.key.remoteJid = senderPn
-                                    jid = senderPn
-                                    
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJid, senderPn)
+                                    const mappingStored = await safeStoreLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName, 'messages.upsert legacy Pattern 1')
+                                    if (mappingStored) {
+                                        // Update message to use phone number
+                                        msg.key.remoteJid = senderPn
+                                        jid = senderPn
+
+                                        // Update existing messages with this LID
+                                        await safeUpdateExistingMessages(remoteJid, senderPn, 'messages.upsert legacy Pattern 1')
+                                    }
                                 }
                                 // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
                                 else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
@@ -5908,8 +5916,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         if (phoneNumber) {
                                             log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
                                             // Outgoing message: do not persist pushName (it's our own)
-                                            await lidHandler.storeLidMapping(remoteJid, phoneNumber)
-                                            await lidHandler.updateExistingMessages(remoteJid, phoneNumber)
+                                            const mappingStored = await safeStoreLidMapping(remoteJid, phoneNumber, undefined, 'messages.upsert legacy Pattern 2')
+                                            if (mappingStored) {
+                                                await safeUpdateExistingMessages(remoteJid, phoneNumber, 'messages.upsert legacy Pattern 2')
+                                            } else {
+                                                phoneNumber = null
+                                            }
                                         }
                                     }
                                     
@@ -5926,7 +5938,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 // Proactively store mapping with pushName
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
                                     log(`[LID] Pattern X: FromMe=false, senderLid with phone remoteJid`)
-                                    await lidHandler.storeLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    await safeStoreLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern X')
                                 }
                                 // Pattern 3: FromMe=false with only senderLid (no phone yet)
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && !senderPn) {
@@ -6826,10 +6838,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         
                         // Store the mapping in MongoDB via LidHandler
                         if (lidHandler) {
-                            await lidHandler.handleLidMappingUpdate(data)
+                            const mappingStored = await lidHandler.handleLidMappingUpdate(data)
                             
                             // Also update the contact if it exists (safe against duplicate key)
-                            await safeSetLid(pn, lid, validatedInstanceId)
+                            if (mappingStored) {
+                                await safeSetLid(pn, lid, validatedInstanceId)
+                            }
                         }
                         
                         if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')
