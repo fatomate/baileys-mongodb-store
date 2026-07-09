@@ -636,24 +636,6 @@ export class LidHandler {
                         throw retryError
                     }
                     if (retryResult.matchedCount === 0) {
-                        if (shouldSetPushName) {
-                            await this.contactsCollection.updateOne(
-                                {
-                                    instanceId: this.instanceId,
-                                    id: normalizedPhone,
-                                    $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ]
-                                },
-                                {
-                                    $set: { pushName: cleanedPushName, pushNameUpdatedAt: now, updatedAt: now },
-                                    $setOnInsert: {
-                                        instanceId: this.instanceId,
-                                        id: normalizedPhone,
-                                        lidFirstSeen: now
-                                    }
-                                },
-                                { upsert: true }
-                            )
-                        }
                         console.debug(
                             `[LidHandler] Existing mapping for ${normalizedLid} belongs to another contact; ` +
                             `skipping new phone ${normalizedPhone}`

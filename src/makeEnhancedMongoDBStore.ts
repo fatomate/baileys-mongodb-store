@@ -6261,8 +6261,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     if (shouldLogOnce(`mu_pres_${update.key.id}`, 5)) {
                                         log(`✅ [messages.update] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                                     }
-                                } else {
+                                } else if (Object.prototype.hasOwnProperty.call(existingMessage, 'messageTimestamp') && existingMessage.messageTimestamp !== undefined) {
                                     mergedUpdate.messageTimestamp = existingMessage.messageTimestamp
+                                } else {
+                                    delete mergedUpdate.messageTimestamp
                                 }
                                 
                                 // Preserve quoted message structure if it exists
