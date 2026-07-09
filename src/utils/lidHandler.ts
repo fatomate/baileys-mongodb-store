@@ -279,6 +279,12 @@ export class LidHandler {
         }
     }
 
+    private isDuplicateKeyError(error: any): boolean {
+        return error?.code === 11000
+            || error?.codeName === 'DuplicateKey'
+            || String(error?.message || '').includes('E11000 duplicate key')
+    }
+
     /**
      * Create MongoDB indexes for efficient lookups with retry logic
      */
@@ -490,7 +496,7 @@ export class LidHandler {
     /**
      * Store or update a LID to phone number mapping
      */
-    async storeLidMapping(lid: string, phoneNumber: string, pushName?: string): Promise<void> {
+    async storeLidMapping(lid: string, phoneNumber: string, pushName?: string): Promise<boolean> {
         if (!this.isConnected()) {
             console.debug('[LidHandler] Cannot store LID mapping - database not connected')
             // Still update cache if enabled
@@ -502,12 +508,12 @@ export class LidHandler {
                     this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
                 }
             }
-            return
+            return false
         }
         
         if (!this.contactsCollection) {
             console.warn('LidHandler not initialized with contacts collection')
-            return
+            return false
         }
         
         // Normalize JIDs for storage
@@ -515,20 +521,20 @@ export class LidHandler {
         const normalizedPhone = normalizeJidForStorage(phoneNumber)
         
         // Validate inputs
-        if (!normalizedLid || !normalizedPhone) return
-        if (!this.isLidFormat(normalizedLid)) return
-        if (!isPhoneNumberFormat(normalizedPhone)) return
+        if (!normalizedLid || !normalizedPhone) return false
+        if (!this.isLidFormat(normalizedLid)) return false
+        if (!isPhoneNumberFormat(normalizedPhone)) return false
         
         // Prevent storing LID->LID mappings (this is invalid)
         if (normalizedLid === normalizedPhone) {
             console.warn(`[LidHandler] Attempted to store invalid LID->LID mapping: ${normalizedLid} -> ${normalizedPhone}`)
-            return
+            return false
         }
         
         // Additional check: both shouldn't be LID format
         if (this.isLidFormat(normalizedPhone)) {
             console.warn(`[LidHandler] Attempted to store LID as phone number: ${normalizedLid} -> ${normalizedPhone}`)
-            return
+            return false
         }
         
         const now = new Date()
@@ -585,22 +591,57 @@ export class LidHandler {
                 )
             } catch (e: any) {
                 if (e?.code === 11000) {
-                    // Retry without upsert; don't override existing pushName if set
-                    await this.contactsCollection.updateOne(
-                        { 
-                            instanceId: this.instanceId, 
-                            id: normalizedPhone,
-                            ...(shouldSetPushName ? { $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ] } : {})
-                        } as any,
-                        {
-                            $set: {
-                                ...(shouldSetLid ? { lid: normalizedLid } : {}),
-                                updatedAt: now,
-                                ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
-                            }
-                        },
-                        { upsert: false }
-                    )
+                    if (shouldSetPushName) {
+                        await this.contactsCollection.updateOne(
+                            {
+                                instanceId: this.instanceId,
+                                id: normalizedPhone,
+                                $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ]
+                            },
+                            {
+                                $set: { pushName: cleanedPushName, pushNameUpdatedAt: now, updatedAt: now },
+                                $setOnInsert: {
+                                    instanceId: this.instanceId,
+                                    id: normalizedPhone,
+                                    lidFirstSeen: now
+                                }
+                            },
+                            { upsert: true }
+                        )
+                    }
+                    let retryResult
+                    try {
+                        // Retry without upsert; don't override existing pushName if set
+                        retryResult = await this.contactsCollection.updateOne(
+                            {
+                                instanceId: this.instanceId,
+                                id: normalizedPhone
+                            },
+                            {
+                                $set: {
+                                    ...(shouldSetLid ? { lid: normalizedLid } : {}),
+                                    updatedAt: now
+                                }
+                            },
+                            { upsert: false }
+                        )
+                    } catch (retryError: any) {
+                        if (retryError?.code === 11000) {
+                            console.debug(
+                                `[LidHandler] Existing mapping for ${normalizedLid} belongs to another contact; ` +
+                                `skipping new phone ${normalizedPhone}`
+                            )
+                            return false
+                        }
+                        throw retryError
+                    }
+                    if (retryResult.matchedCount === 0) {
+                        console.debug(
+                            `[LidHandler] Existing mapping for ${normalizedLid} belongs to another contact; ` +
+                            `skipping new phone ${normalizedPhone}`
+                        )
+                        return false
+                    }
                 } else {
                     throw e
                 }
@@ -609,8 +650,8 @@ export class LidHandler {
             // Update cache if enabled (use normalized JIDs for cache keys)
             if (this.config.enableCache) {
                 // Cache both directions
-                this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, normalizedPhone)
-                this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
+                await this.cacheSet(this.getRedisKey('lid', normalizedLid), normalizedPhone, this.config.cacheTTLSeconds)
+                await this.cacheSet(this.getRedisKey('phone', normalizedPhone), normalizedLid, this.config.cacheTTLSeconds)
             }
 
             if (this.lidMappingsCollection) {
@@ -647,8 +688,10 @@ export class LidHandler {
             }
             
             console.log(`[LidHandler] Stored mapping in contacts: ${normalizedLid} -> ${normalizedPhone}`)
+            return true
         } catch (error) {
             console.error('[LidHandler] Failed to store LID mapping:', error)
+            return false
         }
     }
 
@@ -680,13 +723,14 @@ export class LidHandler {
 
                     let phoneNumber: string | null = null
                     let foundInContacts = false
+                    let reverseCandidate: string | null = null
 
-                    // 0) Quick reverse lookup from messages first (optional, fast path)
+                    // 0) Reverse lookup from messages is a fallback only; contacts remain authoritative.
                     if (this.config.preferReverseLookupFirst) {
                         try {
                             const reverse = await this.reversePhoneLookupFromMessages(normalizedLid)
                             if (reverse) {
-                                phoneNumber = normalizeJidForStorage(reverse)
+                                reverseCandidate = normalizeJidForStorage(reverse)
                             }
                         } catch (_err) {
                             // Ignore errors during reverse lookup fallback
@@ -714,7 +758,7 @@ export class LidHandler {
                         }
                     }
 
-                    if (!phoneNumber && this.contactsCollection && this.config.lookupsEnabled) {
+                    if (this.contactsCollection && this.config.lookupsEnabled) {
                         const query = { instanceId: this.instanceId, lid: normalizedLid }
                         try {
                             const contact = await this.contactsCollection.findOne(
@@ -736,6 +780,10 @@ export class LidHandler {
                                 console.debug('[LidHandler] Contacts lookup failed:', err?.message)
                             }
                         }
+                    }
+
+                    if (!phoneNumber && reverseCandidate) {
+                        phoneNumber = reverseCandidate
                     }
 
                     if (phoneNumber && this.lidMappingsCollection && foundInContacts) {
@@ -973,8 +1021,7 @@ export class LidHandler {
         }
         
         console.log(`[LidHandler] Successfully extracted mapping: ${pair.lid} <-> ${pair.phoneNumber}`)
-        await this.storeLidMapping(pair.lid, pair.phoneNumber)
-        return true
+        return await this.storeLidMapping(pair.lid, pair.phoneNumber)
     }
 
     /**
@@ -999,6 +1046,7 @@ export class LidHandler {
                 const receivedMessage = await this.messagesCollection.findOne({
                     instanceId: this.instanceId,
                     'key.fromMe': false,
+                    'lidMapping.duplicateOf': { $exists: false },
                     $or: [
                         // Legacy format: senderLid
                         { 'key.senderLid': normalizedLid },
@@ -1078,6 +1126,7 @@ export class LidHandler {
                 // Add projection to only fetch needed fields for performance
                 const message = await this.messagesCollection.findOne({
                     instanceId: this.instanceId,
+                    'lidMapping.duplicateOf': { $exists: false },
                     $or: [
                         // LEGACY Case 1: LID in senderLid with phone in senderPn
                         { 
@@ -1160,24 +1209,69 @@ export class LidHandler {
                     return
                 }
                 
-                // Update messages where remoteJid is the LID
-                const result = await this.messagesCollection.updateMany(
+                const lidMessages = await this.messagesCollection.find(
                     {
                         instanceId: this.instanceId,
-                        'key.remoteJid': lid
+                        'key.remoteJid': lid,
+                        'lidMapping.duplicateOf': { $exists: false }
                     },
-                    {
-                        $set: {
-                            'key.remoteJid': phoneNumber,
-                            jid: phoneNumber,
-                            'lidMapping.resolved': true,
-                            'lidMapping.resolvedAt': new Date()
+                    { projection: { _id: 1, key: 1 } }
+                ).toArray()
+
+                let migrated = 0
+                let duplicatesMarked = 0
+
+                for (const message of lidMessages) {
+                    try {
+                        const result = await this.messagesCollection.updateOne(
+                            { _id: message._id },
+                            {
+                                $set: {
+                                    'key.remoteJid': phoneNumber,
+                                    jid: phoneNumber,
+                                    'lidMapping.resolved': true,
+                                    'lidMapping.resolvedAt': new Date()
+                                }
+                            }
+                        )
+                        migrated += result.modifiedCount || 0
+                    } catch (error: any) {
+                        if (!this.isDuplicateKeyError(error)) {
+                            throw error
                         }
+
+                        const canonical = await this.messagesCollection.findOne(
+                            {
+                                instanceId: this.instanceId,
+                                jid: phoneNumber,
+                                'key.id': message.key?.id
+                            },
+                            { projection: { _id: 1 } }
+                        )
+
+                        if (!canonical) {
+                            throw error
+                        }
+
+                        const markResult = await this.messagesCollection.updateOne(
+                            { _id: message._id },
+                            {
+                                $set: {
+                                    'lidMapping.resolved': false,
+                                    'lidMapping.duplicateOf': canonical._id,
+                                    'lidMapping.duplicateTargetJid': phoneNumber,
+                                    'lidMapping.duplicateDetectedAt': new Date()
+                                }
+                            }
+                        )
+                        duplicatesMarked += markResult.modifiedCount || 0
                     }
-                )
+                }
                 
-                if (result.modifiedCount > 0) {
-                    console.log(`[LidHandler] Updated ${result.modifiedCount} messages from LID ${lid} to ${phoneNumber}`)
+                if (migrated > 0 || duplicatesMarked > 0) {
+                    console.debug(
+                        `[LidHandler] LID message migration ${lid} -> ${phoneNumber}: migrated=${migrated} duplicatesMarked=${duplicatesMarked}`
+                    )
                 }
             },
             undefined,
@@ -1214,10 +1308,9 @@ export class LidHandler {
             if (discoveredPhone) {
                 console.log(`[LidHandler] Reverse lookup successful: ${lidInfo.lid} -> ${discoveredPhone}`)
                 lidInfo.phoneNumber = discoveredPhone
-                normalizedJid = discoveredPhone
                 // Outgoing message: do not persist pushName (it's our own display)
-                await this.storeLidMapping(lidInfo.lid, discoveredPhone)
-                mappingStored = true
+                mappingStored = await this.storeLidMapping(lidInfo.lid, discoveredPhone)
+                normalizedJid = mappingStored ? discoveredPhone : lidInfo.lid
             } else {
                 // Try existing mapping as fallback
                 const existingPhone = await this.getPhoneNumberFromLid(lidInfo.lid)
@@ -1245,9 +1338,10 @@ export class LidHandler {
                 console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
                 const fromMe = !!message.key?.fromMe
                 const pushName = !fromMe ? ((message as any)?.pushName || (message as any)?.verifiedBizName) : undefined
-                await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber, pushName)
-                mappingStored = true
-                normalizedJid = lidInfo.phoneNumber
+                mappingStored = await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber, pushName)
+                if (mappingStored) {
+                    normalizedJid = lidInfo.phoneNumber
+                }
             }
         } 
         // If we only have LID, try to get phone number from database
@@ -1522,18 +1616,18 @@ export class LidHandler {
      * 
      * @param data - Event data containing lid and pn
      */
-    async handleLidMappingUpdate(data: { lid: string; pn: string }): Promise<void> {
+    async handleLidMappingUpdate(data: { lid: string; pn: string }): Promise<boolean> {
         const { lid, pn } = data
         
         if (!lid || !pn) {
             console.debug('[LidHandler] Invalid lid-mapping.update data:', data)
-            return
+            return false
         }
 
         console.log(`[LidHandler] Received lid-mapping.update: ${lid} -> ${pn}`)
         
         // Store in MongoDB
-        await this.storeLidMapping(lid, pn)
+        return await this.storeLidMapping(lid, pn)
     }
 
     /**

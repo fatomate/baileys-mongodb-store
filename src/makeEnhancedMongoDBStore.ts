@@ -48,6 +48,7 @@ import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/co
 import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection.js'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager.js'
+import { resolvePreservedMessageTimestamp } from './utils/messageTimestamp.js'
 
 // Declare Node.js globals if not available in tsconfig
 declare global {
@@ -1198,6 +1199,60 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         return result.result as T
     }
+
+    const getMessageEditTimestamp = async (
+        jid: string,
+        message: proto.IWebMessageInfo
+    ): Promise<unknown> => {
+        if (message.message?.protocolMessage?.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT || !message.message.protocolMessage.key?.id) {
+            return message.messageTimestamp
+        }
+
+        const editTargetKey = message.message.protocolMessage.key
+        log(`🔄 Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
+
+        const originalMessage = await withConnection(async () =>
+            collections.messages.findOne(
+                {
+                    instanceId: validatedInstanceId,
+                    jid,
+                    'key.id': editTargetKey.id
+                },
+                { projection: { messageTimestamp: 1 } }
+            )
+        ) as any
+
+        const timestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: originalMessage?.messageTimestamp,
+            incomingTimestamp: message.messageTimestamp,
+            fallbackTimestamp: originalMessage?._id
+        })
+
+        log(`⏰ Preserving normalized messageTimestamp: ${timestamp} for edited message ${editTargetKey.id}`)
+        return timestamp
+    }
+
+    const buildTimestampedMessage = async (
+        filter: Record<string, unknown>,
+        jid: string,
+        message: proto.IWebMessageInfo
+    ): Promise<proto.IWebMessageInfo & { messageTimestamp: number }> => {
+        const existingMessage = await withConnection(async () =>
+            collections.messages.findOne(filter, { projection: { messageTimestamp: 1 } })
+        ) as any
+
+        const incomingTimestamp = await getMessageEditTimestamp(jid, message)
+        const messageTimestamp = resolvePreservedMessageTimestamp({
+            existingTimestamp: existingMessage?.messageTimestamp,
+            incomingTimestamp,
+            fallbackTimestamp: existingMessage?._id
+        })
+
+        return {
+            ...message,
+            messageTimestamp
+        }
+    }
     
     // Queue configuration
     const BATCH_SIZE = 100
@@ -1402,15 +1457,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 // Store the message
+                const filter = {
+                    instanceId: validatedInstanceId,
+                    jid,
+                    'key.id': message.key?.id
+                }
+                const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
                 await withConnection(async () =>
                     collections.messages.replaceOne(
+                        filter,
                         {
-                            instanceId: validatedInstanceId,
-                            jid,
-                            'key.id': message.key?.id
-                        },
-                        {
-                            ...message,
+                            ...timestampedMessage,
                             instanceId: validatedInstanceId,
                             jid,
                             updatedAt: new Date()
@@ -1421,7 +1479,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 return { success: true, type: 'upsert' }
             } else if (type === 'update' && update) {
-                // Update message
+                const existingMsg = await withConnection(async () =>
+                    collections.messages.findOne(
+                        {
+                            instanceId: validatedInstanceId,
+                            jid,
+                            'key.id': messageId
+                        },
+                        { projection: { messageTimestamp: 1 } }
+                    )
+                ) as any
+                const finalUpdate = { ...update }
+                const hasIncomingTimestamp = Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')
+                const isMessageEdit = !!(finalUpdate.message?.editedMessage || (finalUpdate as any).editedMessage)
+                if (existingMsg && isMessageEdit) {
+                    finalUpdate.messageTimestamp = resolvePreservedMessageTimestamp({
+                        existingTimestamp: existingMsg.messageTimestamp,
+                        incomingTimestamp: finalUpdate.messageTimestamp,
+                        fallbackTimestamp: existingMsg._id
+                    })
+                } else if (hasIncomingTimestamp) {
+                    delete finalUpdate.messageTimestamp
+                }
+
                 await withConnection(async () =>
                     collections.messages.updateOne(
                         {
@@ -1429,7 +1509,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             jid,
                             'key.id': messageId
                         },
-                        { $set: { ...update, updatedAt: new Date() } }
+                        { $set: { ...finalUpdate, updatedAt: new Date() } }
                     )
                 )
                 return { success: true, type: 'update' }
@@ -2222,39 +2302,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         }
                     }
                     
-                    // Check if this is a MESSAGE_EDIT
-                    let preservedTimestamp = null
-                    if (message.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && message.message.protocolMessage.key) {
-                        const editTargetKey = message.message.protocolMessage.key
-                        log(`🔄 [Bull Queue] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
-                        
-                        // Fetch the original message to preserve its timestamp
-                        const originalMessage = await withConnection(async () =>
-                            collections.messages.findOne({
-                                instanceId,
-                                jid,
-                                'key.id': editTargetKey.id
-                            })
-                        )
-                        
-                        if (originalMessage && originalMessage.messageTimestamp) {
-                            preservedTimestamp = originalMessage.messageTimestamp
-                            log(`⏰ [Bull Queue] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
-                        }
-                    }
-                    
                     try {
+                        const filter = {
+                            instanceId,
+                            jid,
+                            'key.id': message.key?.id
+                        }
+                        const timestampedMessage = await buildTimestampedMessage(filter, jid, message)
+
                         await withConnection(async () =>
                             collections.messages.replaceOne(
+                                filter,
                                 {
-                                    instanceId,
-                                    jid,
-                                    'key.id': message.key?.id
-                                },
-                                {
-                                    ...message,
-                                    // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
-                                    ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                    ...timestampedMessage,
                                     instanceId,
                                     jid,
                                     ...(pollVoteDecrypted && { pollVoteDecrypted }),
@@ -2269,6 +2329,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             log(`⚠️ [Bull Queue] Duplicate key error for message ${message.key?.id} in chat ${jid} - message already exists`)
                             // Try to update instead of replace
                             try {
+                                const timestampedMessage = await buildTimestampedMessage(
+                                    {
+                                        instanceId,
+                                        jid,
+                                        'key.id': message.key?.id
+                                    },
+                                    jid,
+                                    message
+                                )
+
                                 await withConnection(async () =>
                                     collections.messages.updateOne(
                                         {
@@ -2278,8 +2348,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         },
                                         {
                                             $set: {
-                                                ...message,
-                                                ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                                ...timestampedMessage,
                                                 ...(pollVoteDecrypted && { pollVoteDecrypted }),
                                                 updatedAt: new Date()
                                             }
@@ -2362,18 +2431,27 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (existingMsg) {
                         // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                         const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
-                        const originalTimestamp = existingMsg.messageTimestamp
-                        
                         if (isMessageEdit) {
+                            const normalizedTimestamp = resolvePreservedMessageTimestamp({
+                                existingTimestamp: existingMsg.messageTimestamp,
+                                incomingTimestamp: update.messageTimestamp,
+                                fallbackTimestamp: existingMsg._id
+                            })
                             log(`🔄 [Bull Queue Update] Detected MESSAGE_EDIT for ${messageId}`)
-                            log(`⏰ [Bull Queue Update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                            log(`⏰ [Bull Queue Update] Preserving normalized messageTimestamp: ${normalizedTimestamp}`)
                         }
                         
                         // Prepare the update object, preserving original timestamp for edits
                         const finalUpdate = { ...update }
-                        if (isMessageEdit && originalTimestamp) {
-                            finalUpdate.messageTimestamp = originalTimestamp
-                            log(`✅ [Bull Queue Update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                        if (isMessageEdit) {
+                            finalUpdate.messageTimestamp = resolvePreservedMessageTimestamp({
+                                existingTimestamp: existingMsg.messageTimestamp,
+                                incomingTimestamp: update.messageTimestamp,
+                                fallbackTimestamp: existingMsg._id
+                            })
+                            log(`✅ [Bull Queue Update] Preserved normalized messageTimestamp: ${finalUpdate.messageTimestamp}`)
+                        } else if (Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')) {
+                            delete finalUpdate.messageTimestamp
                         }
                         
                         if (existingMsg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
@@ -3690,7 +3768,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         return totalLabelAssociationsUpdated
     }
     // Safe LID setter - handles E11000 duplicate key conflicts on contacts_lid_lookup
-    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<void> => {
+    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<boolean> => {
         const inst = targetInstanceId || instanceId
         try {
             await withConnection(async () =>
@@ -3699,32 +3777,38 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     { $set: { lid, updatedAt: new Date() } }
                 )
             )
+            return true
         } catch (e: any) {
             if (e?.code === 11000 && e?.keyPattern?.lid) {
-                log(`[LID] Conflict: LID ${lid} already assigned, reassigning to ${contactId}`)
-                await withConnection(async () =>
-                    collections.contacts.updateOne(
-                        { instanceId: inst, lid, id: { $ne: contactId } },
-                        { $unset: { lid: 1 }, $set: { updatedAt: new Date() } }
-                    )
-                )
-                try {
-                    await withConnection(async () =>
-                        collections.contacts.updateOne(
-                            { instanceId: inst, id: contactId },
-                            { $set: { lid, updatedAt: new Date() } }
-                        )
-                    )
-                } catch (retryError: any) {
-                    if (retryError?.code === 11000) {
-                        log(`[LID] Failed to assign LID ${lid} to ${contactId} after retry`)
-                    } else {
-                        throw retryError
-                    }
-                }
+                log(`[LID] Conflict: LID ${lid} already assigned; skipping reassignment to ${contactId}`)
+                return false
             } else {
                 throw e
             }
+        }
+    }
+
+    const safeUpdateExistingMessages = async (lid: string, phoneNumber: string, context: string): Promise<void> => {
+        if (!lidHandler) return
+        try {
+            await lidHandler.updateExistingMessages(lid, phoneNumber)
+        } catch (error: any) {
+            log(`[LID] Message migration skipped during ${context}: ${error?.message || error}`)
+        }
+    }
+
+    const safeStoreLidMapping = async (
+        lid: string,
+        phoneNumber: string,
+        pushName: string | undefined,
+        context: string
+    ): Promise<boolean> => {
+        if (!lidHandler) return false
+        try {
+            return await lidHandler.storeLidMapping(lid, phoneNumber, pushName)
+        } catch (error: any) {
+            log(`[LID] Mapping store skipped during ${context}: ${error?.message || error}`)
+            return false
         }
     }
 
@@ -4313,10 +4397,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                 const { pn, lid } = mapping
                                                 
                                                 // Update contact with LID in MongoDB (safe against duplicate key)
-                                                await safeSetLid(pn, lid)
+                                                const lidSet = await safeSetLid(pn, lid)
                                                 
                                                 // Also store in LidHandler for cache
-                                                if (lidHandler) {
+                                                if (lidSet && lidHandler) {
                                                     try {
                                                         await lidHandler.storeLidMapping(lid, pn)
                                                     } catch {
@@ -4324,7 +4408,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                     }
                                                 }
                                                 
-                                                log(`✅ [Contacts] Updated LID for ${pn} via v7 API`)
+                                                log(lidSet
+                                                    ? `✅ [Contacts] Updated LID for ${pn} via v7 API`
+                                                    : `⚠️ [Contacts] Skipped conflicting LID ${lid} for ${pn} via v7 API`
+                                                )
                                             }
                                         }
                                     } catch (batchError: any) {
@@ -4366,10 +4453,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         if (result && result.length > 0 && result[0].exists && result[0].lid) {
                                             lid = result[0].lid
                                             // Update contact with LID (safe against duplicate key)
-                                            await safeSetLid(contactId, lid)
+                                            const lidSet = await safeSetLid(contactId, lid)
 
                                             // Also store in LidHandler for cache
-                                            if (lidHandler) {
+                                            if (lidSet && lidHandler) {
                                                 try {
                                                     await lidHandler.storeLidMapping(lid, contactId)
                                                 } catch {
@@ -4377,7 +4464,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                 }
                                             }
 
-                                            log(`✅ [Contacts] Updated LID for ${contactId}`)
+                                            log(lidSet
+                                                ? `✅ [Contacts] Updated LID for ${contactId}`
+                                                : `⚠️ [Contacts] Skipped conflicting LID ${lid} for ${contactId}`
+                                            )
                                             break
                                         }
                                     } catch (error: any) {
@@ -4567,33 +4657,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         const phoneJid = lidHandler.isLidFormat(foundJid) ? validJid : foundJid
                                         
                                         log(`Updating existing messages from LID ${lidJid} to phone ${phoneJid}`)
-                                        
-                                        // Update messages that have the LID as remoteJid
-                                        // Only update remoteJid and jid fields, leave senderPn and senderLid as-is
-                                        try {
-                                            const updateResult = await withConnection(async () =>
-                                                collections.messages.updateMany(
-                                                    {
-                                                        instanceId: validatedInstanceId,
-                                                        'key.remoteJid': lidJid
-                                                    },
-                                                    {
-                                                        $set: {
-                                                            'key.remoteJid': phoneJid,
-                                                            jid: phoneJid,
-                                                            'lidMapping.resolved': true,
-                                                            'lidMapping.resolvedAt': new Date()
-                                                        }
-                                                    }
-                                                )
-                                            )
-                                            
-                                            if (updateResult.modifiedCount > 0) {
-                                                log(`Updated ${updateResult.modifiedCount} messages from LID to phone number format`)
-                                            }
-                                        } catch (updateError) {
-                                            logError(`Failed to update messages with new LID mapping:`, updateError)
-                                        }
+                                        await safeUpdateExistingMessages(lidJid, phoneJid, 'getMessage read repair')
                                         
                                         // Read-repair for the current message document
                                         try {
@@ -4805,40 +4869,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
-            // Check if this is a MESSAGE_EDIT
-            let preservedTimestamp = null
-            if (clonedMessage.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && clonedMessage.message.protocolMessage.key) {
-                const editTargetKey = clonedMessage.message.protocolMessage.key
-                log(`🔄 [Direct] Detected MESSAGE_EDIT for message ${editTargetKey.id}`)
-                
-                // Fetch the original message to preserve its timestamp
-                const originalMessage = await withConnection(async () =>
-                    collections.messages.findOne({
-                        instanceId: validatedInstanceId,
-                        jid: validJid,
-                        'key.id': editTargetKey.id
-                    })
-                )
-                
-                if (originalMessage && originalMessage.messageTimestamp) {
-                    preservedTimestamp = originalMessage.messageTimestamp
-                    log(`⏰ [Direct] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
-                }
-            }
-            
             // Fallback to direct database operation
             try {
+                const filter = {
+                    instanceId: validatedInstanceId,
+                    jid: validJid,
+                    'key.id': clonedMessage.key?.id
+                }
+                const timestampedMessage = await buildTimestampedMessage(filter, validJid, clonedMessage)
+
                 await withConnection(async () =>
                     collections.messages.replaceOne(
+                        filter,
                         {
-                            instanceId: validatedInstanceId,
-                            jid: validJid,
-                            'key.id': clonedMessage.key?.id
-                        },
-                        {
-                            ...clonedMessage,
-                            // Preserve original timestamp for MESSAGE_EDIT, otherwise use the message's timestamp
-                            ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                            ...timestampedMessage,
                             instanceId: validatedInstanceId,
                             jid: validJid,
                             ...(pollVoteDecrypted && { pollVoteDecrypted }),
@@ -4853,6 +4897,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`⚠️ [Direct] Duplicate key error for message ${clonedMessage.key?.id} in chat ${validJid} - message already exists`)
                     // Try to update instead of replace
                     try {
+                        const timestampedMessage = await buildTimestampedMessage(
+                            {
+                                instanceId: validatedInstanceId,
+                                jid: validJid,
+                                'key.id': clonedMessage.key?.id
+                            },
+                            validJid,
+                            clonedMessage
+                        )
+
                         await withConnection(async () =>
                             collections.messages.updateOne(
                                 {
@@ -4862,8 +4916,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 },
                                 {
                                     $set: {
-                                        ...clonedMessage,
-                                        ...(preservedTimestamp && { messageTimestamp: preservedTimestamp }),
+                                        ...timestampedMessage,
                                         ...(pollVoteDecrypted && { pollVoteDecrypted }),
                                         updatedAt: new Date()
                                     }
@@ -5042,29 +5095,37 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 })
             ) as any
             
-            let finalUpdate = update
+            let finalUpdate = { ...update }
+            const hasIncomingTimestamp = Object.prototype.hasOwnProperty.call(finalUpdate, 'messageTimestamp')
             
             if (existingMsg) {
                 // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                 const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
-                const originalTimestamp = existingMsg.messageTimestamp
+                const normalizedTimestamp = isMessageEdit
+                    ? resolvePreservedMessageTimestamp({
+                        existingTimestamp: existingMsg.messageTimestamp,
+                        incomingTimestamp: update.messageTimestamp,
+                        fallbackTimestamp: existingMsg._id
+                    })
+                    : null
                 
                 if (isMessageEdit) {
                     if (shouldLogOnce(`um_det_${id}`, 5)) {
                         log(`🔄 [updateMessage] Detected MESSAGE_EDIT for ${id}`)
                     }
                     if (shouldLogOnce(`um_ts_${id}`, 5)) {
-                        log(`⏰ [updateMessage] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.messageTimestamp}`)
+                        log(`⏰ [updateMessage] Preserving normalized messageTimestamp: ${normalizedTimestamp}`)
                     }
                 }
                 
                 // Preserve original timestamp for edits
-                if (isMessageEdit && originalTimestamp) {
-                    finalUpdate = { ...update }
-                    finalUpdate.messageTimestamp = originalTimestamp
+                if (isMessageEdit && normalizedTimestamp !== null) {
+                    finalUpdate.messageTimestamp = normalizedTimestamp
                     if (shouldLogOnce(`um_pres_${id}`, 5)) {
-                        log(`✅ [updateMessage] Preserved original messageTimestamp: ${originalTimestamp}`)
+                        log(`✅ [updateMessage] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                     }
+                } else if (hasIncomingTimestamp) {
+                    delete finalUpdate.messageTimestamp
                 }
                 
                 // If existing message has quoted message and update has message content, preserve quoted structure
@@ -5090,6 +5151,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         message: mergedMessage
                     }
                 }
+            } else if (hasIncomingTimestamp) {
+                delete finalUpdate.messageTimestamp
             }
             
             const result = await withConnection(async () =>
@@ -5806,11 +5869,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
                                     
                                     // Store the mapping (lid -> phone)
-                                    await lidHandler.storeLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    const mappingStored = await safeStoreLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern A')
                                     
                                     // jid is already the phone number, no change needed
                                     // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJidAlt, remoteJid)
+                                    if (mappingStored) {
+                                        await safeUpdateExistingMessages(remoteJidAlt, remoteJid, 'messages.upsert Pattern A')
+                                    }
                                 }
                                 // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
                                 // remoteJid is LID, remoteJidAlt is phone number
@@ -5820,14 +5885,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     
                                     // Store the mapping (lid -> phone)
                                     // Outgoing message: do not persist pushName (it's our own)
-                                    await lidHandler.storeLidMapping(remoteJid, remoteJidAlt)
-                                    
-                                    // Update message to use phone number
-                                    msg.key.remoteJid = remoteJidAlt
-                                    jid = remoteJidAlt
-                                    
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJid, remoteJidAlt)
+                                    const mappingStored = await safeStoreLidMapping(remoteJid, remoteJidAlt, undefined, 'messages.upsert Pattern B')
+                                    if (mappingStored) {
+                                        // Update message to use phone number
+                                        msg.key.remoteJid = remoteJidAlt
+                                        jid = remoteJidAlt
+
+                                        // Update existing messages with this LID
+                                        await safeUpdateExistingMessages(remoteJid, remoteJidAlt, 'messages.upsert Pattern B')
+                                    }
                                 }
                                 // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
                                 else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
@@ -5835,14 +5901,15 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
                                     
                                     // Store the mapping
-                                    await lidHandler.storeLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName)
-                                    
-                                    // Update message to use phone number
-                                    msg.key.remoteJid = senderPn
-                                    jid = senderPn
-                                    
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJid, senderPn)
+                                    const mappingStored = await safeStoreLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName, 'messages.upsert legacy Pattern 1')
+                                    if (mappingStored) {
+                                        // Update message to use phone number
+                                        msg.key.remoteJid = senderPn
+                                        jid = senderPn
+
+                                        // Update existing messages with this LID
+                                        await safeUpdateExistingMessages(remoteJid, senderPn, 'messages.upsert legacy Pattern 1')
+                                    }
                                 }
                                 // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
                                 else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
@@ -5859,8 +5926,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         if (phoneNumber) {
                                             log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
                                             // Outgoing message: do not persist pushName (it's our own)
-                                            await lidHandler.storeLidMapping(remoteJid, phoneNumber)
-                                            await lidHandler.updateExistingMessages(remoteJid, phoneNumber)
+                                            const mappingStored = await safeStoreLidMapping(remoteJid, phoneNumber, undefined, 'messages.upsert legacy Pattern 2')
+                                            if (mappingStored) {
+                                                await safeUpdateExistingMessages(remoteJid, phoneNumber, 'messages.upsert legacy Pattern 2')
+                                            } else {
+                                                phoneNumber = null
+                                            }
                                         }
                                     }
                                     
@@ -5877,7 +5948,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 // Proactively store mapping with pushName
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
                                     log(`[LID] Pattern X: FromMe=false, senderLid with phone remoteJid`)
-                                    await lidHandler.storeLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    await safeStoreLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern X')
                                 }
                                 // Pattern 3: FromMe=false with only senderLid (no phone yet)
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && !senderPn) {
@@ -6158,34 +6229,43 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             if (existingMessage) {
                                 // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                                 const isMessageEdit = !!(update.update?.message?.editedMessage || (update.update as any)?.editedMessage)
-                                
-                                // Preserve original messageTimestamp for edits
-                                const originalTimestamp = existingMessage.messageTimestamp
+                                const normalizedTimestamp = isMessageEdit
+                                    ? resolvePreservedMessageTimestamp({
+                                        existingTimestamp: existingMessage.messageTimestamp,
+                                        incomingTimestamp: update.update?.messageTimestamp
+                                    })
+                                    : null
                                 
                                 if (isMessageEdit) {
                                     if (shouldLogOnce(`mu_det_${update.key.id}`, 5)) {
                                         log(`🔄 [messages.update] Detected MESSAGE_EDIT for ${update.key.id}`)
                                     }
                                     if (shouldLogOnce(`mu_ts_${update.key.id}`, 5)) {
-                                        log(`⏰ [messages.update] Original timestamp: ${originalTimestamp}, New timestamp in update: ${update.update?.messageTimestamp}`)
+                                        log(`⏰ [messages.update] Preserving normalized messageTimestamp: ${normalizedTimestamp}`)
                                     }
                                 }
                                 
+                                const updatePayload = { ...update.update }
+                                if (!isMessageEdit && Object.prototype.hasOwnProperty.call(updatePayload, 'messageTimestamp')) {
+                                    // Non-edit updates must not change ordering; existingMessage's top-level timestamp is retained by the merge below.
+                                    delete updatePayload.messageTimestamp
+                                }
+
                                 // Deep merge the update with existing message to preserve quoted messages
                                 const mergedUpdate = {
                                     ...existingMessage,
-                                    ...update.update,
+                                    ...updatePayload,
                                     message: {
                                         ...existingMessage.message,
-                                        ...update.update?.message
+                                        ...updatePayload.message
                                     }
                                 }
                                 
                                 // CRITICAL: Preserve original messageTimestamp for MESSAGE_EDIT
-                                if (isMessageEdit && originalTimestamp) {
-                                    mergedUpdate.messageTimestamp = originalTimestamp
+                                if (isMessageEdit && normalizedTimestamp !== null) {
+                                    mergedUpdate.messageTimestamp = normalizedTimestamp
                                     if (shouldLogOnce(`mu_pres_${update.key.id}`, 5)) {
-                                        log(`✅ [messages.update] Preserved original messageTimestamp: ${originalTimestamp}`)
+                                        log(`✅ [messages.update] Preserved normalized messageTimestamp: ${normalizedTimestamp}`)
                                     }
                                 }
                                 
@@ -6774,10 +6854,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         
                         // Store the mapping in MongoDB via LidHandler
                         if (lidHandler) {
-                            await lidHandler.handleLidMappingUpdate(data)
+                            const mappingStored = await lidHandler.handleLidMappingUpdate(data)
                             
                             // Also update the contact if it exists (safe against duplicate key)
-                            await safeSetLid(pn, lid, validatedInstanceId)
+                            if (mappingStored) {
+                                await safeSetLid(pn, lid, validatedInstanceId)
+                            }
                         }
                         
                         if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')

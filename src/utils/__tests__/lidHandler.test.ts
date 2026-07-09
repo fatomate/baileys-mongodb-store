@@ -28,6 +28,7 @@ describe('LidHandler', () => {
     beforeEach(async () => {
         // Clear any existing data first
         await db.collection('test_lidMappings').deleteMany({})
+        await db.collection('test_contacts').deleteMany({})
         await db.collection('test_messages').deleteMany({})
         
         // Create new LID handler for each test
@@ -118,6 +119,176 @@ describe('LidHandler', () => {
             expect(count).toBe(0)
         })
 
+        it('does not cache a new phone when the LID already belongs to another contact', async () => {
+            const lid = '114194640801953@lid'
+            const existingPhone = '60196953307@s.whatsapp.net'
+            const newPhone = '60111111111@s.whatsapp.net'
+            const contacts = db.collection('test_contacts')
+
+            await contacts.createIndex(
+                { instanceId: 1, lid: 1 },
+                { unique: true, partialFilterExpression: { lid: { $type: 'string' } } }
+            )
+            await contacts.insertOne({
+                instanceId: 'test-instance',
+                id: existingPhone,
+                lid,
+                updatedAt: new Date()
+            })
+
+            await expect(lidHandler.storeLidMapping(lid, newPhone)).resolves.toBe(false)
+
+            await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBe(existingPhone)
+            await expect(contacts.findOne({ instanceId: 'test-instance', id: newPhone })).resolves.toBeNull()
+        })
+
+        it('keeps pushName without caching LID when duplicate-key retry has no matching contact', async () => {
+            const lid = '114194640801953@lid'
+            const existingPhone = '60196953307@s.whatsapp.net'
+            const newPhone = '60111111111@s.whatsapp.net'
+            const contacts = db.collection('test_contacts')
+
+            await contacts.createIndex(
+                { instanceId: 1, lid: 1 },
+                { unique: true, partialFilterExpression: { lid: { $type: 'string' } } }
+            )
+            await contacts.insertOne({
+                instanceId: 'test-instance',
+                id: existingPhone,
+                lid,
+                updatedAt: new Date()
+            })
+
+            await expect(lidHandler.storeLidMapping(lid, newPhone, 'New User')).resolves.toBe(false)
+
+            await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBe(existingPhone)
+            const rejectedContact = await contacts.findOne({ instanceId: 'test-instance', id: newPhone })
+            expect(rejectedContact).toEqual(
+                expect.objectContaining({
+                    id: newPhone,
+                    pushName: 'New User'
+                })
+            )
+            expect(rejectedContact).not.toHaveProperty('lid')
+        })
+
+        it('reports discovered mapping rejection when the LID belongs to another contact', async () => {
+            const lid = '114194640801953@lid'
+            const existingPhone = '60196953307@s.whatsapp.net'
+            const newPhone = '60111111111@s.whatsapp.net'
+            const contacts = db.collection('test_contacts')
+
+            await contacts.createIndex(
+                { instanceId: 1, lid: 1 },
+                { unique: true, partialFilterExpression: { lid: { $type: 'string' } } }
+            )
+            await contacts.insertOne({
+                instanceId: 'test-instance',
+                id: existingPhone,
+                lid,
+                updatedAt: new Date()
+            })
+
+            await expect(lidHandler.storeDiscoveredMapping(lid, newPhone)).resolves.toBe(false)
+        })
+
+        it('accepts duplicate retry when the phone contact already has a pushName', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+            const contacts = db.collection('test_contacts')
+
+            await contacts.createIndex(
+                { instanceId: 1, id: 1 },
+                { unique: true }
+            )
+            await contacts.insertOne({
+                instanceId: 'test-instance',
+                id: phoneNumber,
+                pushName: 'Existing Name',
+                updatedAt: new Date()
+            })
+            const originalUpdateOne = contacts.updateOne.bind(contacts)
+            jest.spyOn(contacts, 'updateOne')
+                .mockRejectedValueOnce({ code: 11000 })
+                .mockImplementation((filter: any, update: any, options?: any) =>
+                    originalUpdateOne(filter, update, options)
+                )
+
+            await expect(lidHandler.storeLidMapping(lid, phoneNumber, 'New Name')).resolves.toBe(true)
+
+            await expect(contacts.findOne({ instanceId: 'test-instance', id: phoneNumber })).resolves.toEqual(
+                expect.objectContaining({
+                    id: phoneNumber,
+                    lid
+                })
+            )
+        })
+
+    })
+
+    describe('updateExistingMessages', () => {
+        beforeEach(async () => {
+            await db.collection('test_messages').createIndex(
+                { instanceId: 1, jid: 1, 'key.id': 1 },
+                { unique: true }
+            )
+        })
+
+        it('marks duplicate LID-keyed message without deleting it when canonical phone-keyed message already exists', async () => {
+            const lid = '114194640801953@lid'
+            const phoneNumber = '60196953307@s.whatsapp.net'
+            const messageId = 'message-1'
+            const messages = db.collection('test_messages')
+
+            await messages.insertOne({
+                instanceId: 'test-instance',
+                jid: lid,
+                key: { id: messageId, remoteJid: lid },
+                messageTimestamp: 1700000000,
+                message: { conversation: 'lid copy' }
+            })
+            await messages.insertOne({
+                instanceId: 'test-instance',
+                jid: phoneNumber,
+                key: { id: messageId, remoteJid: phoneNumber },
+                messageTimestamp: 1700000000,
+                message: { conversation: 'canonical phone copy' }
+            })
+
+            await expect(lidHandler.updateExistingMessages(lid, phoneNumber)).resolves.toBeUndefined()
+
+            await expect(messages.find({
+                instanceId: 'test-instance',
+                'key.id': messageId
+            }).sort({ jid: 1 }).toArray()).resolves.toEqual([
+                expect.objectContaining({
+                    jid: lid,
+                    key: expect.objectContaining({ remoteJid: lid }),
+                    message: { conversation: 'lid copy' },
+                    lidMapping: expect.objectContaining({
+                        resolved: false,
+                        duplicateTargetJid: phoneNumber
+                    })
+                }),
+                expect.objectContaining({
+                    jid: phoneNumber,
+                    key: expect.objectContaining({ remoteJid: phoneNumber }),
+                    message: { conversation: 'canonical phone copy' }
+                })
+            ])
+
+            const markedDuplicate = await messages.findOne({
+                instanceId: 'test-instance',
+                jid: lid,
+                'key.id': messageId
+            })
+            await expect(lidHandler.updateExistingMessages(lid, phoneNumber)).resolves.toBeUndefined()
+            await expect(messages.findOne({
+                instanceId: 'test-instance',
+                jid: lid,
+                'key.id': messageId
+            })).resolves.toEqual(markedDuplicate)
+        })
     })
 
     describe('getPhoneNumberFromLid', () => {
@@ -161,6 +332,53 @@ describe('LidHandler', () => {
             // Second retrieval should still work (from cache)
             const retrieved2 = await lidHandler.getPhoneNumberFromLid(lid)
             expect(retrieved2).toBe(phoneNumber)
+        })
+
+        it('prefers authoritative contacts mapping over reverse message lookup', async () => {
+            const lid = '114194640801953@lid'
+            const authoritativePhone = '60196953307@s.whatsapp.net'
+            const rejectedPhone = '60111111111@s.whatsapp.net'
+
+            await db.collection('test_contacts').insertOne({
+                instanceId: 'test-instance',
+                id: authoritativePhone,
+                lid,
+                updatedAt: new Date()
+            })
+            await db.collection('test_messages').insertOne({
+                instanceId: 'test-instance',
+                key: {
+                    id: 'msg-rejected',
+                    fromMe: false,
+                    remoteJid: rejectedPhone,
+                    senderLid: lid,
+                    senderPn: rejectedPhone
+                }
+            })
+
+            await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBe(authoritativePhone)
+        })
+
+        it('does not use duplicate-marked messages as reverse lookup fallback', async () => {
+            const lid = '114194640801953@lid'
+            const rejectedPhone = '60111111111@s.whatsapp.net'
+
+            await db.collection('test_messages').insertOne({
+                instanceId: 'test-instance',
+                key: {
+                    id: 'msg-rejected',
+                    fromMe: false,
+                    remoteJid: rejectedPhone,
+                    senderLid: lid,
+                    senderPn: rejectedPhone
+                },
+                lidMapping: {
+                    duplicateOf: 'canonical-id',
+                    duplicateTargetJid: '60196953307@s.whatsapp.net'
+                }
+            })
+
+            await expect(lidHandler.getPhoneNumberFromLid(lid)).resolves.toBeNull()
         })
     })
 
@@ -257,7 +475,7 @@ describe('LidHandler', () => {
             
             expect(result.normalizedJid).toBe(phoneNumber)
             expect(result.lidInfo.lid).toBe(lid)
-            expect(result.lidInfo.phoneNumber).toBeUndefined()
+            expect(result.lidInfo.phoneNumber).toBe(phoneNumber)
             expect(result.lidInfo.mappingStored).toBe(false)
         })
 
@@ -569,6 +787,7 @@ describe('LidHandler', () => {
 
             // Delete from DB
             await db.collection('test_lidMappings').deleteMany({})
+            await db.collection('test_contacts').deleteMany({})
 
             // Should not find in cache anymore
             const retrieved = await lidHandler.getPhoneNumberFromLid(lid)
