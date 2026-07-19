@@ -1,0 +1,369 @@
+jest.mock('baileys', () => ({
+    proto: {
+        Message: {
+            ProtocolMessage: {
+                Type: {
+                    REVOKE: 0,
+                    MESSAGE_EDIT: 14,
+                    HISTORY_SYNC_NOTIFICATION: 5,
+                    APP_STATE_SYNC_KEY_SHARE: 6,
+                    INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC: 9,
+                    APP_STATE_SYNC_KEY_REQUEST: 10
+                }
+            }
+        }
+    },
+    getAggregateVotesInPollMessage: jest.fn(() => []),
+    updateMessageWithReceipt: jest.fn(),
+    updateMessageWithReaction: jest.fn()
+}))
+
+jest.mock('../../types/baileys-compat.js', () => ({
+    LabelAssociationType: {
+        Chat: 'label_jid',
+        Message: 'label_message'
+    }
+}))
+
+import { MongoClient } from 'mongodb'
+import { MongoMemoryServer } from 'mongodb-memory-server'
+import { makeEnhancedMongoDBStore } from '../../makeEnhancedMongoDBStore.js'
+import type { EnhancedMongoDBStore } from '../../types-enhanced.js'
+import { LidHandler } from '../lidHandler.js'
+
+type AsyncListener = (data: any) => void | Promise<void>
+
+class TestEventEmitter {
+    private listeners = new Map<string, AsyncListener[]>()
+
+    on(event: string, listener: AsyncListener): void {
+        const listeners = this.listeners.get(event) || []
+        listeners.push(listener)
+        this.listeners.set(event, listeners)
+    }
+
+    off(event: string, listener: AsyncListener): void {
+        const listeners = this.listeners.get(event) || []
+        this.listeners.set(event, listeners.filter(candidate => candidate !== listener))
+    }
+
+    removeAllListeners(event: string): void {
+        this.listeners.delete(event)
+    }
+
+    emit(event: string, data: any): boolean {
+        const listeners = this.listeners.get(event) || []
+        for (const listener of listeners) {
+            void listener(data)
+        }
+        return listeners.length > 0
+    }
+
+    async emitAsync(event: string, data: any): Promise<void> {
+        const listeners = this.listeners.get(event) || []
+        await Promise.all(listeners.map(listener => listener(data)))
+    }
+}
+
+describe('messages.upsert LID write-path hardening', () => {
+    jest.setTimeout(60_000)
+
+    let mongoServer: MongoMemoryServer
+    let inspectionClient: MongoClient
+    let databaseName: string
+    let store: EnhancedMongoDBStore | null
+    let emitter: TestEventEmitter
+    let collectionPrefix: string
+    let instanceCounter = 0
+
+    beforeAll(async () => {
+        mongoServer = await MongoMemoryServer.create()
+        inspectionClient = new MongoClient(mongoServer.getUri())
+        await inspectionClient.connect()
+        databaseName = 'messages-upsert-lid-hardening'
+    })
+
+    afterAll(async () => {
+        await inspectionClient.close()
+        await mongoServer.stop()
+    })
+
+    afterEach(async () => {
+        jest.restoreAllMocks()
+        if (store) {
+            await store.close()
+            store = null
+        }
+    })
+
+    const createStore = async (
+        hooks: {
+            beforeStore?: (eventType: string, data: any) => boolean | Promise<boolean>
+            afterStore?: (eventType: string, data: any) => void | Promise<void>
+        } = {}
+    ): Promise<EnhancedMongoDBStore> => {
+        instanceCounter++
+        collectionPrefix = `wab259_${instanceCounter}_`
+        emitter = new TestEventEmitter()
+        store = await makeEnhancedMongoDBStore({
+            uri: mongoServer.getUri(),
+            database: databaseName,
+            instanceId: `wab259-instance-${instanceCounter}`,
+            collectionPrefix,
+            useSharedConnections: false,
+            enableMetrics: true,
+            logLevel: 'warn',
+            hooks,
+            lidHandler: {
+                enableCache: false,
+                skipIndexCreation: true,
+                lookupsEnabled: false
+            },
+            indexManagement: {
+                enableIndexHealthLogging: false
+            }
+        })
+        store.bind(emitter as any)
+        return store
+    }
+
+    it('stores a private message snapshot when the source is mutated during an awaited filter', async () => {
+        let releaseFilter!: () => void
+        let signalFilterEntered!: () => void
+        const filterEntered = new Promise<void>(resolve => {
+            signalFilterEntered = resolve
+        })
+        const filterRelease = new Promise<void>(resolve => {
+            releaseFilter = resolve
+        })
+        let filteredMessage: any
+
+        await createStore({
+            beforeStore: async (eventType, message) => {
+                if (eventType === 'messages.upsert') {
+                    filteredMessage = message
+                    signalFilterEntered()
+                    await filterRelease
+                }
+                return true
+            }
+        })
+
+        const originalJid = '60111111111@s.whatsapp.net'
+        const sourceThumbnail = Buffer.from([1, 2, 3, 4])
+        const sourceMessage: any = {
+            key: {
+                id: 'snapshot-message',
+                remoteJid: originalJid,
+                fromMe: false
+            },
+            messageTimestamp: 1_700_000_000,
+            message: {
+                imageMessage: {
+                    caption: 'original caption',
+                    jpegThumbnail: sourceThumbnail
+                }
+            }
+        }
+
+        const processing = emitter.emitAsync('messages.upsert', {
+            messages: [sourceMessage],
+            type: 'notify'
+        })
+
+        await filterEntered
+        sourceMessage.key.remoteJid = '60999999999@s.whatsapp.net'
+        sourceMessage.message.imageMessage.caption = 'mutated caption'
+        sourceThumbnail[0] = 9
+        releaseFilter()
+        await processing
+
+        expect(filteredMessage).not.toBe(sourceMessage)
+        expect(filteredMessage.key).not.toBe(sourceMessage.key)
+        expect(filteredMessage.message.imageMessage.jpegThumbnail).not.toBe(sourceThumbnail)
+        expect(Buffer.from(filteredMessage.message.imageMessage.jpegThumbnail)).toEqual(Buffer.from([1, 2, 3, 4]))
+
+        await expect(store!.getMessage(originalJid, 'snapshot-message')).resolves.toEqual(
+            expect.objectContaining({
+                key: expect.objectContaining({ remoteJid: originalJid }),
+                message: expect.objectContaining({
+                    imageMessage: expect.objectContaining({
+                        caption: 'original caption',
+                        jpegThumbnail: Buffer.from([1, 2, 3, 4])
+                    })
+                })
+            })
+        )
+        await expect(
+            inspectionClient.db(databaseName).collection(`${collectionPrefix}messages`).countDocuments({
+                jid: '60999999999@s.whatsapp.net',
+                'key.id': 'snapshot-message'
+            })
+        ).resolves.toBe(0)
+    })
+
+    it('clones circular auxiliary message properties without rejecting the batch', async () => {
+        const auxiliary = Symbol('auxiliary')
+        let filteredMessage: any
+
+        await createStore({
+            beforeStore: (eventType, message) => {
+                if (eventType === 'messages.upsert') {
+                    filteredMessage = message
+                }
+                return true
+            }
+        })
+
+        const jid = '60111111112@s.whatsapp.net'
+        const sourceMessage: any = {
+            key: {
+                id: 'circular-auxiliary-message',
+                remoteJid: jid,
+                fromMe: false
+            },
+            messageTimestamp: 1_700_000_000,
+            message: { conversation: 'circular auxiliary data' }
+        }
+        sourceMessage[auxiliary] = sourceMessage
+
+        await expect(emitter.emitAsync('messages.upsert', {
+            messages: [sourceMessage],
+            type: 'notify'
+        })).resolves.toBeUndefined()
+
+        expect(filteredMessage).not.toBe(sourceMessage)
+        expect(filteredMessage[auxiliary]).toBe(filteredMessage)
+        await expect(store!.getMessage(jid, 'circular-auxiliary-message')).resolves.toEqual(
+            expect.objectContaining({
+                key: expect.objectContaining({ remoteJid: jid }),
+                message: { conversation: 'circular auxiliary data' }
+            })
+        )
+    })
+
+    it('normalizes a trusted phone remoteJidAlt even when mapping persistence fails', async () => {
+        jest.spyOn(LidHandler.prototype, 'storeLidMapping').mockResolvedValue(false)
+        await createStore()
+
+        const lid = '114194640801953@lid'
+        const phone = '60196953307@s.whatsapp.net'
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: 'mapping-failure-message',
+                    remoteJid: lid,
+                    remoteJidAlt: phone,
+                    addressingMode: 'lid',
+                    fromMe: true
+                },
+                messageTimestamp: 1_700_000_000,
+                message: { conversation: 'outgoing' }
+            }],
+            type: 'notify'
+        })
+
+        await expect(store!.getMessage(phone, 'mapping-failure-message')).resolves.toEqual(
+            expect.objectContaining({
+                key: expect.objectContaining({ remoteJid: phone })
+            })
+        )
+        await expect(
+            inspectionClient.db(databaseName).collection(`${collectionPrefix}messages`).countDocuments({
+                jid: lid,
+                'key.id': 'mapping-failure-message'
+            })
+        ).resolves.toBe(0)
+    })
+
+    it('keeps malformed remoteJidAlt unresolved and records bounded redacted observability', async () => {
+        const storeMapping = jest.spyOn(LidHandler.prototype, 'storeLidMapping').mockResolvedValue(true)
+        const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
+        await createStore()
+
+        const lid = '114194640801954@lid'
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: 'malformed-alt-message',
+                    remoteJid: lid,
+                    remoteJidAlt: 'not-a-phone-jid',
+                    addressingMode: 'lid',
+                    fromMe: true
+                },
+                messageTimestamp: 1_700_000_000,
+                message: { conversation: 'outgoing' }
+            }],
+            type: 'notify'
+        })
+
+        expect(storeMapping).not.toHaveBeenCalled()
+        await expect(store!.getMessage(lid, 'malformed-alt-message')).resolves.toEqual(
+            expect.objectContaining({
+                key: expect.objectContaining({ remoteJid: lid })
+            })
+        )
+        expect(store!.getLidResolutionMetrics('messages.upsert.unresolved-lid')).toEqual(
+            expect.objectContaining({
+                totalErrors: 1
+            })
+        )
+
+        const warnings = warn.mock.calls.flat().map(String)
+        expect(warnings.some(message => message.includes('Unresolved top-level LID'))).toBe(true)
+        expect(warnings.join(' ')).not.toContain(lid)
+
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: 'malformed-alt-message-2',
+                    remoteJid: lid,
+                    remoteJidAlt: 'still-not-a-phone-jid',
+                    addressingMode: 'lid',
+                    fromMe: true
+                },
+                messageTimestamp: 1_700_000_001,
+                message: { conversation: 'outgoing again' }
+            }],
+            type: 'notify'
+        })
+
+        expect(warn.mock.calls.flat().map(String).filter(message => message.includes('Unresolved top-level LID'))).toHaveLength(1)
+    })
+
+    it('does not invoke historical message repair from messages.upsert', async () => {
+        const historicalRepair = jest.spyOn(LidHandler.prototype, 'updateExistingMessages')
+            .mockResolvedValue(undefined)
+        await createStore()
+
+        await emitter.emitAsync('messages.upsert', {
+            messages: [
+                {
+                    key: {
+                        id: 'pattern-a-message',
+                        remoteJid: '60111111111@s.whatsapp.net',
+                        remoteJidAlt: '111111111111111@lid',
+                        addressingMode: 'pn',
+                        fromMe: false
+                    },
+                    messageTimestamp: 1_700_000_000,
+                    message: { conversation: 'incoming' }
+                },
+                {
+                    key: {
+                        id: 'pattern-b-message',
+                        remoteJid: '222222222222222@lid',
+                        remoteJidAlt: '60222222222@s.whatsapp.net',
+                        addressingMode: 'lid',
+                        fromMe: true
+                    },
+                    messageTimestamp: 1_700_000_001,
+                    message: { conversation: 'outgoing' }
+                }
+            ],
+            type: 'notify'
+        })
+
+        expect(historicalRepair).not.toHaveBeenCalled()
+    })
+})

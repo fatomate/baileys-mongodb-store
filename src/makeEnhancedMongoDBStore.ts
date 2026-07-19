@@ -38,7 +38,7 @@ import { TTLMonitor } from './utils/ttl.js'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media.js'
 import { LidHandler } from './utils/lidHandler.js'
 import type { LidMapping } from './utils/lidHandler.js'
-import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils.js'
+import { areJidsEquivalent, isLidAndPhonePair, isPhoneNumberFormat } from './utils/jidUtils.js'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager.js'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry.js'
 import { ConnectionHealthMonitor } from './utils/connectionHealth.js'
@@ -196,6 +196,50 @@ const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
     }
     logThrottleCache.set(key, true, ttlSeconds)
     return true
+}
+
+const cloneMessageForListener = <T>(message: T): T => {
+    const seen = new WeakMap<object, unknown>()
+
+    const cloneValue = (value: unknown): unknown => {
+        if (Buffer.isBuffer(value)) {
+            return Buffer.from(value)
+        }
+        if (value instanceof Uint8Array) {
+            return new Uint8Array(value)
+        }
+        if (value instanceof Date) {
+            return new Date(value.getTime())
+        }
+        if (Array.isArray(value)) {
+            const existing = seen.get(value)
+            if (existing) {
+                return existing
+            }
+            const clone: unknown[] = []
+            seen.set(value, clone)
+            for (const item of value) {
+                clone.push(cloneValue(item))
+            }
+            return clone
+        }
+        if (value && typeof value === 'object') {
+            const existing = seen.get(value)
+            if (existing) {
+                return existing
+            }
+            const source = value as Record<PropertyKey, unknown>
+            const clone = Object.create(Object.getPrototypeOf(value)) as Record<PropertyKey, unknown>
+            seen.set(value, clone)
+            for (const key of Reflect.ownKeys(source)) {
+                clone[key] = cloneValue(source[key])
+            }
+            return clone
+        }
+        return value
+    }
+
+    return cloneValue(message) as T
 }
 
 // Helper function to convert MongoDB Binary objects to Buffers
@@ -5761,7 +5805,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             const messagesUpsertHandler = async ({ messages }: any) => {
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
                 
-                for (const msg of messages) {
+                for (const sourceMessage of messages) {
+                    const msg = cloneMessageForListener(sourceMessage)
                     let jid = msg.key.remoteJid
                     if (!jid) continue
                     
@@ -5869,31 +5914,19 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
                                     
                                     // Store the mapping (lid -> phone)
-                                    const mappingStored = await safeStoreLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern A')
-                                    
-                                    // jid is already the phone number, no change needed
-                                    // Update existing messages with this LID
-                                    if (mappingStored) {
-                                        await safeUpdateExistingMessages(remoteJidAlt, remoteJid, 'messages.upsert Pattern A')
-                                    }
+                                    await safeStoreLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern A')
                                 }
                                 // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
                                 // remoteJid is LID, remoteJidAlt is phone number
-                                else if (addressingMode === 'lid' && remoteJidAlt && !lidHandler.isLidFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                else if (addressingMode === 'lid' && remoteJidAlt && isPhoneNumberFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
                                     log(`[LID] New Pattern B: addressingMode=lid, remoteJid=lid, remoteJidAlt=phone`)
                                     log(`[LID] Discovering: ${remoteJid} -> ${remoteJidAlt}`)
                                     
                                     // Store the mapping (lid -> phone)
                                     // Outgoing message: do not persist pushName (it's our own)
-                                    const mappingStored = await safeStoreLidMapping(remoteJid, remoteJidAlt, undefined, 'messages.upsert Pattern B')
-                                    if (mappingStored) {
-                                        // Update message to use phone number
-                                        msg.key.remoteJid = remoteJidAlt
-                                        jid = remoteJidAlt
-
-                                        // Update existing messages with this LID
-                                        await safeUpdateExistingMessages(remoteJid, remoteJidAlt, 'messages.upsert Pattern B')
-                                    }
+                                    await safeStoreLidMapping(remoteJid, remoteJidAlt, undefined, 'messages.upsert Pattern B')
+                                    msg.key.remoteJid = remoteJidAlt
+                                    jid = remoteJidAlt
                                 }
                                 // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
                                 else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
@@ -5906,9 +5939,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         // Update message to use phone number
                                         msg.key.remoteJid = senderPn
                                         jid = senderPn
-
-                                        // Update existing messages with this LID
-                                        await safeUpdateExistingMessages(remoteJid, senderPn, 'messages.upsert legacy Pattern 1')
                                     }
                                 }
                                 // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
@@ -5927,9 +5957,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
                                             // Outgoing message: do not persist pushName (it's our own)
                                             const mappingStored = await safeStoreLidMapping(remoteJid, phoneNumber, undefined, 'messages.upsert legacy Pattern 2')
-                                            if (mappingStored) {
-                                                await safeUpdateExistingMessages(remoteJid, phoneNumber, 'messages.upsert legacy Pattern 2')
-                                            } else {
+                                            if (!mappingStored) {
                                                 phoneNumber = null
                                             }
                                         }
@@ -5989,7 +6017,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     }
                                 }
                             }
-                            
+
                             // Resolve quoted message before storing if present
                             if (msg.message?.extendedTextMessage?.contextInfo?.stanzaId && 
                                 (!msg.message.extendedTextMessage.contextInfo.quotedMessage || 
@@ -6069,6 +6097,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                             } catch (err) {
                                 logWarn(`⚠️ [Contacts] Failed to persist pushName for ${jid}: ${String(err)}`)
+                            }
+
+                            const finalRemoteJid = msg.key?.remoteJid
+                            if (lidHandler?.isLidFormat(finalRemoteJid)) {
+                                updateLidResolutionMetrics('messages.upsert.unresolved-lid', 'error')
+                                const warningKey = `messages-upsert-unresolved-lid-${hashForLogging(finalRemoteJid)}`
+                                if (shouldLogOnce(warningKey, 300)) {
+                                    logWarn(
+                                        `[LID] Unresolved top-level LID before persistence ` +
+                                        `(jidHash=${hashForLogging(finalRemoteJid)}, messageIdHash=${hashForLogging(msg.key?.id || '')})`
+                                    )
+                                }
                             }
 
                             // Store the message with normalized JID
