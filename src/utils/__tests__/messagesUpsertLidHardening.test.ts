@@ -27,7 +27,7 @@ jest.mock('../../types/baileys-compat.js', () => ({
 
 import { MongoClient } from 'mongodb'
 import { MongoMemoryServer } from 'mongodb-memory-server'
-import { makeEnhancedMongoDBStore } from '../../makeEnhancedMongoDBStore.js'
+import { BoundedThrottle, makeEnhancedMongoDBStore } from '../../makeEnhancedMongoDBStore.js'
 import type { EnhancedMongoDBStore } from '../../types-enhanced.js'
 import { LidHandler } from '../lidHandler.js'
 
@@ -124,6 +124,7 @@ describe('messages.upsert LID write-path hardening', () => {
             }
         })
         store.bind(emitter as any)
+        store.resetLidResolutionMetrics()
         return store
     }
 
@@ -274,6 +275,192 @@ describe('messages.upsert LID write-path hardening', () => {
                 'key.id': 'mapping-failure-message'
             })
         ).resolves.toBe(0)
+    })
+
+    it.each([
+        ['returns false', jest.fn().mockResolvedValue(false)],
+        ['throws', jest.fn().mockRejectedValue(new Error('mapping unavailable'))]
+    ])('normalizes trusted legacy senderPn when persistence %s', async (_label, implementation) => {
+        jest.spyOn(LidHandler.prototype, 'storeLidMapping').mockImplementation(implementation)
+        await createStore()
+
+        const lid = '114194640801955@lid'
+        const phone = '60196953308:17@c.us'
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: `trusted-sender-pn-${_label}`,
+                    remoteJid: lid,
+                    senderPn: phone,
+                    fromMe: false
+                },
+                messageTimestamp: 1_700_000_000,
+                message: { conversation: 'incoming' }
+            }],
+            type: 'notify'
+        })
+
+        const normalizedPhone = '60196953308@c.us'
+        await expect(store!.getMessage(normalizedPhone, `trusted-sender-pn-${_label}`)).resolves.toEqual(
+            expect.objectContaining({
+                key: expect.objectContaining({ remoteJid: normalizedPhone })
+            })
+        )
+    })
+
+    it('keeps malformed non-fromMe senderPn unresolved', async () => {
+        const storeMapping = jest.spyOn(LidHandler.prototype, 'storeLidMapping')
+        await createStore()
+
+        const lid = '114194640801956@lid'
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: 'malformed-sender-pn',
+                    remoteJid: lid,
+                    senderPn: 'not-a-phone-jid',
+                    fromMe: false
+                },
+                messageTimestamp: 1_700_000_000,
+                message: { conversation: 'incoming' }
+            }],
+            type: 'notify'
+        })
+
+        expect(storeMapping).not.toHaveBeenCalled()
+        await expect(store!.getMessage(lid, 'malformed-sender-pn')).resolves.toEqual(
+            expect.objectContaining({ key: expect.objectContaining({ remoteJid: lid }) })
+        )
+    })
+
+    it('normalizes a validated reverse candidate only after conflict-aware persistence succeeds', async () => {
+        jest.spyOn(LidHandler.prototype, 'getPhoneNumberFromLid').mockResolvedValue(null)
+        jest.spyOn(LidHandler.prototype, 'reversePhoneLookupFromMessages')
+            .mockResolvedValue('60196953309:22@s.whatsapp.net')
+        const storeMapping = jest.spyOn(LidHandler.prototype, 'storeLidMapping').mockResolvedValue(false)
+        await createStore()
+
+        const lid = '114194640801957@lid'
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: 'reverse-conflict-message',
+                    remoteJid: lid,
+                    senderPn: lid,
+                    fromMe: true
+                },
+                messageTimestamp: 1_700_000_000,
+                message: { conversation: 'outgoing' }
+            }],
+            type: 'notify'
+        })
+
+        expect(storeMapping).toHaveBeenCalledWith(lid, '60196953309@s.whatsapp.net', undefined)
+        await expect(store!.getMessage(lid, 'reverse-conflict-message')).resolves.toEqual(
+            expect.objectContaining({ key: expect.objectContaining({ remoteJid: lid }) })
+        )
+    })
+
+    it('rejects a malformed reverse lookup candidate', async () => {
+        jest.spyOn(LidHandler.prototype, 'getPhoneNumberFromLid').mockResolvedValue(null)
+        jest.spyOn(LidHandler.prototype, 'reversePhoneLookupFromMessages').mockResolvedValue('customer@example.com')
+        const storeMapping = jest.spyOn(LidHandler.prototype, 'storeLidMapping')
+        await createStore()
+
+        const lid = '114194640801958@lid'
+        await emitter.emitAsync('messages.upsert', {
+            messages: [{
+                key: {
+                    id: 'malformed-reverse-message',
+                    remoteJid: lid,
+                    senderPn: lid,
+                    fromMe: true
+                },
+                messageTimestamp: 1_700_000_000,
+                message: { conversation: 'outgoing' }
+            }],
+            type: 'notify'
+        })
+
+        expect(storeMapping).not.toHaveBeenCalled()
+        await expect(store!.getMessage(lid, 'malformed-reverse-message')).resolves.toBeTruthy()
+    })
+
+    it('fails closed on contradictory historical pn evidence with a LID remoteJid', async () => {
+        await createStore()
+
+        const lid = '114194640801959@lid'
+        await inspectionClient.db(databaseName).collection(`${collectionPrefix}messages`).insertOne({
+            instanceId: `wab259-instance-${instanceCounter}`,
+            jid: lid,
+            key: {
+                id: 'contradictory-history-message',
+                remoteJid: lid,
+                remoteJidAlt: lid,
+                addressingMode: 'pn',
+                senderPn: '60196953310@s.whatsapp.net',
+                fromMe: false
+            }
+        })
+
+        const handler = new LidHandler(`wab259-instance-${instanceCounter}`, {
+            enableCache: false,
+            skipIndexCreation: true,
+            lookupsEnabled: false
+        })
+        await handler.initialize(inspectionClient.db(databaseName), collectionPrefix)
+
+        await expect(handler.reversePhoneLookupFromMessages(lid)).resolves.toBeNull()
+    })
+
+    it('preserves Long-like values and own property descriptors in the write-path snapshot', async () => {
+        let filteredMessage: any
+        await createStore({
+            beforeStore: (_eventType, message) => {
+                filteredMessage = message
+                return true
+            }
+        })
+
+        const longLike = Object.create({ toString: () => '1700000000' })
+        Object.defineProperty(longLike, 'low', {
+            value: 1_700_000_000,
+            enumerable: false,
+            writable: false,
+            configurable: false
+        })
+        const sourceMessage: any = {
+            key: {
+                id: 'long-descriptor-message',
+                remoteJid: '60111111113@s.whatsapp.net',
+                fromMe: false
+            },
+            messageTimestamp: longLike,
+            message: { conversation: 'descriptor' }
+        }
+
+        await emitter.emitAsync('messages.upsert', { messages: [sourceMessage], type: 'notify' })
+
+        expect(filteredMessage.messageTimestamp).not.toBe(longLike)
+        expect(Object.getPrototypeOf(filteredMessage.messageTimestamp)).toBe(Object.getPrototypeOf(longLike))
+        expect(Object.getOwnPropertyDescriptor(filteredMessage.messageTimestamp, 'low')).toEqual(
+            Object.getOwnPropertyDescriptor(longLike, 'low')
+        )
+    })
+
+    it('bounds and time-prunes unresolved LID throttle entries without full-cache scans', () => {
+        const throttle = new BoundedThrottle(3, 300)
+
+        expect(throttle.shouldRun('a', 0)).toBe(true)
+        expect(throttle.shouldRun('b', 1)).toBe(true)
+        expect(throttle.shouldRun('c', 2)).toBe(true)
+        expect(throttle.shouldRun('d', 3)).toBe(true)
+        expect(throttle.size).toBe(3)
+        expect(throttle.shouldRun('a', 4)).toBe(true)
+        expect(throttle.size).toBe(3)
+        expect(throttle.shouldRun('a', 5)).toBe(false)
+        expect(throttle.shouldRun('expired', 306)).toBe(true)
+        expect(throttle.size).toBeLessThanOrEqual(3)
     })
 
     it('keeps malformed remoteJidAlt unresolved and records bounded redacted observability', async () => {

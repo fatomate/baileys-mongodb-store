@@ -1173,22 +1173,26 @@ export class LidHandler {
                 if (message?.key) {
                     const addressingMode = (message.key as any)?.addressingMode
                     const remoteJidAlt = (message.key as any)?.remoteJidAlt
+                    let candidate: string | null = null
                     
                     // NEW FORMAT: Check based on addressingMode
-                    if (addressingMode === 'pn' && message.key.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
-                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=pn): ${normalizedLid} -> ${message.key.remoteJid}`)
-                        return message.key.remoteJid
+                    if (addressingMode === 'pn' && message.key.remoteJid) {
+                        candidate = message.key.remoteJid
                     }
-                    if (addressingMode === 'lid' && remoteJidAlt && !this.isLidFormat(remoteJidAlt)) {
-                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=lid): ${normalizedLid} -> ${remoteJidAlt}`)
-                        return remoteJidAlt
+                    if (!candidate && addressingMode === 'lid' && remoteJidAlt) {
+                        candidate = remoteJidAlt
                     }
                     
                     // LEGACY: Check senderPn
                     const senderPn = (message.key as any)?.senderPn
-                    if (senderPn && !this.isLidFormat(senderPn)) {
-                        console.log(`[LidHandler] Reverse lookup found (legacy): ${normalizedLid} -> ${senderPn}`)
-                        return senderPn
+                    if (!candidate && senderPn) {
+                        candidate = senderPn
+                    }
+
+                    const normalizedCandidate = normalizeJidForStorage(candidate)
+                    if (isPhoneNumberFormat(normalizedCandidate)) {
+                        console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${normalizedCandidate}`)
+                        return normalizedCandidate
                     }
                 }
                 
