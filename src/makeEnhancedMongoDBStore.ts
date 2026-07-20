@@ -5845,9 +5845,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Messages upsert - CRITICAL for storing messages including polls
             const messagesUpsertHandler = async ({ messages }: any) => {
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
+                const messageSnapshots = messages.map(cloneMessageForListener)
                 
-                for (const sourceMessage of messages) {
-                    const msg = cloneMessageForListener(sourceMessage)
+                for (const msg of messageSnapshots) {
                     let jid = msg.key.remoteJid
                     if (!jid) continue
                     

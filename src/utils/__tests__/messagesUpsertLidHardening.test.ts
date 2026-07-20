@@ -203,6 +203,71 @@ describe('messages.upsert LID write-path hardening', () => {
         ).resolves.toBe(0)
     })
 
+    it('snapshots the entire upsert batch before awaiting the first message filter', async () => {
+        let releaseFirstFilter!: () => void
+        let signalFirstFilterEntered!: () => void
+        const firstFilterEntered = new Promise<void>(resolve => {
+            signalFirstFilterEntered = resolve
+        })
+        const firstFilterRelease = new Promise<void>(resolve => {
+            releaseFirstFilter = resolve
+        })
+
+        await createStore({
+            beforeStore: async (eventType, message) => {
+                if (eventType === 'messages.upsert' && message.key.id === 'batch-snapshot-first') {
+                    signalFirstFilterEntered()
+                    await firstFilterRelease
+                }
+                return true
+            }
+        })
+
+        const secondJid = '60111111115@s.whatsapp.net'
+        const secondMessage: any = {
+            key: {
+                id: 'batch-snapshot-second',
+                remoteJid: secondJid,
+                fromMe: false
+            },
+            messageTimestamp: 1_700_000_001,
+            message: { conversation: 'original second content' }
+        }
+        const processing = emitter.emitAsync('messages.upsert', {
+            messages: [
+                {
+                    key: {
+                        id: 'batch-snapshot-first',
+                        remoteJid: '60111111114@s.whatsapp.net',
+                        fromMe: false
+                    },
+                    messageTimestamp: 1_700_000_000,
+                    message: { conversation: 'first content' }
+                },
+                secondMessage
+            ],
+            type: 'notify'
+        })
+
+        await firstFilterEntered
+        secondMessage.key.id = 'mutated-second-id'
+        secondMessage.key.remoteJid = '60999999998@s.whatsapp.net'
+        secondMessage.message.conversation = 'mutated second content'
+        releaseFirstFilter()
+        await processing
+
+        await expect(store!.getMessage(secondJid, 'batch-snapshot-second')).resolves.toEqual(
+            expect.objectContaining({
+                key: expect.objectContaining({
+                    id: 'batch-snapshot-second',
+                    remoteJid: secondJid
+                }),
+                message: { conversation: 'original second content' }
+            })
+        )
+        await expect(store!.getMessage('60999999998@s.whatsapp.net', 'mutated-second-id')).resolves.toBeNull()
+    })
+
     it('clones circular auxiliary message properties without rejecting the batch', async () => {
         const auxiliary = Symbol('auxiliary')
         let filteredMessage: any
@@ -438,10 +503,14 @@ describe('messages.upsert LID write-path hardening', () => {
         await handler.initialize(inspectionClient.db(databaseName), collectionPrefix)
         const log = jest.spyOn(console, 'log').mockImplementation(() => {})
 
-        await expect(handler.reversePhoneLookupFromMessages(lid)).resolves.toBe(phone)
-        const output = log.mock.calls.flat().join(' ')
-        expect(output).not.toContain(lid)
-        expect(output).not.toContain(phone)
+        try {
+            await expect(handler.reversePhoneLookupFromMessages(lid)).resolves.toBe(phone)
+            const output = log.mock.calls.flat().join(' ')
+            expect(output).not.toContain(lid)
+            expect(output).not.toContain(phone)
+        } finally {
+            log.mockRestore()
+        }
     })
 
     it('preserves Long-like values and own property descriptors in the write-path snapshot', async () => {
