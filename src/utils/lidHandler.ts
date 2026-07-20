@@ -1114,7 +1114,7 @@ export class LidHandler {
      */
     async reversePhoneLookupFromMessages(lid: string): Promise<string | null> {
         const normalizedLid = normalizeJidForStorage(lid)
-        console.log(`[LidHandler] Attempting reverse lookup for LID: ${normalizedLid}`)
+        console.log('[LidHandler] Attempting reverse LID lookup')
         
         return await this.withConnectionCheck(
             async () => {
@@ -1191,7 +1191,7 @@ export class LidHandler {
 
                     const normalizedCandidate = normalizeJidForStorage(candidate)
                     if (isPhoneNumberFormat(normalizedCandidate)) {
-                        console.log(`[LidHandler] Reverse lookup found: ${normalizedLid} -> ${normalizedCandidate}`)
+                        console.log('[LidHandler] Reverse lookup found a validated phone candidate')
                         return normalizedCandidate
                     }
                 }

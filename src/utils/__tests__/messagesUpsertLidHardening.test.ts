@@ -413,6 +413,37 @@ describe('messages.upsert LID write-path hardening', () => {
         await expect(handler.reversePhoneLookupFromMessages(lid)).resolves.toBeNull()
     })
 
+    it('redacts reverse lookup identifiers from logs', async () => {
+        await createStore()
+
+        const lid = '114194640801960@lid'
+        const phone = '60196953311@s.whatsapp.net'
+        await inspectionClient.db(databaseName).collection(`${collectionPrefix}messages`).insertOne({
+            instanceId: `wab259-instance-${instanceCounter}`,
+            jid: phone,
+            key: {
+                id: 'validated-history-message',
+                remoteJid: phone,
+                remoteJidAlt: lid,
+                addressingMode: 'pn',
+                fromMe: false
+            }
+        })
+
+        const handler = new LidHandler(`wab259-instance-${instanceCounter}`, {
+            enableCache: false,
+            skipIndexCreation: true,
+            lookupsEnabled: false
+        })
+        await handler.initialize(inspectionClient.db(databaseName), collectionPrefix)
+        const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+
+        await expect(handler.reversePhoneLookupFromMessages(lid)).resolves.toBe(phone)
+        const output = log.mock.calls.flat().join(' ')
+        expect(output).not.toContain(lid)
+        expect(output).not.toContain(phone)
+    })
+
     it('preserves Long-like values and own property descriptors in the write-path snapshot', async () => {
         let filteredMessage: any
         await createStore({
