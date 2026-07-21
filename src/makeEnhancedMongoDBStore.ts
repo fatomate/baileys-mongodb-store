@@ -38,7 +38,7 @@ import { TTLMonitor } from './utils/ttl.js'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media.js'
 import { LidHandler } from './utils/lidHandler.js'
 import type { LidMapping } from './utils/lidHandler.js'
-import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils.js'
+import { areJidsEquivalent, isLidAndPhonePair, isPhoneNumberFormat, normalizeJidForStorage } from './utils/jidUtils.js'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager.js'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry.js'
 import { ConnectionHealthMonitor } from './utils/connectionHealth.js'
@@ -189,6 +189,42 @@ const notFoundCache = new NodeCache({ stdTTL: 60, checkperiod: 30, useClones: fa
 const processedEditCache = new NodeCache({ stdTTL: 10, checkperiod: 30 })
 const logThrottleCache = new NodeCache({ stdTTL: 2, checkperiod: 5 })
 
+export class BoundedThrottle {
+    private readonly entries = new Map<string, number>()
+
+    constructor(
+        private readonly maxEntries: number,
+        private readonly intervalMs: number
+    ) {}
+
+    get size(): number {
+        return this.entries.size
+    }
+
+    shouldRun(key: string, now: number = Date.now()): boolean {
+        const previous = this.entries.get(key)
+        if (previous !== undefined && now - previous < this.intervalMs) {
+            return false
+        }
+        if (previous !== undefined) {
+            this.entries.delete(key)
+        }
+
+        while (this.entries.size > 0) {
+            const oldest = this.entries.entries().next().value as [string, number] | undefined
+            if (!oldest || (this.entries.size < this.maxEntries && now - oldest[1] < this.intervalMs)) {
+                break
+            }
+            this.entries.delete(oldest[0])
+        }
+
+        this.entries.set(key, now)
+        return true
+    }
+}
+
+const unresolvedLidThrottle = new BoundedThrottle(10_000, 300_000)
+
 // Helper to rate-limit repeated logs for the same key
 const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
     if (logThrottleCache.get(key)) {
@@ -196,6 +232,55 @@ const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
     }
     logThrottleCache.set(key, true, ttlSeconds)
     return true
+}
+
+const cloneMessageForListener = <T>(message: T): T => {
+    const seen = new WeakMap<object, unknown>()
+
+    const cloneValue = (value: unknown): unknown => {
+        if (Buffer.isBuffer(value)) {
+            return Buffer.from(value)
+        }
+        if (value instanceof Uint8Array) {
+            return new Uint8Array(value)
+        }
+        if (value instanceof Date) {
+            return new Date(value.getTime())
+        }
+        if (Array.isArray(value)) {
+            const existing = seen.get(value)
+            if (existing) {
+                return existing
+            }
+            const clone: unknown[] = []
+            seen.set(value, clone)
+            for (const item of value) {
+                clone.push(cloneValue(item))
+            }
+            return clone
+        }
+        if (value && typeof value === 'object') {
+            const existing = seen.get(value)
+            if (existing) {
+                return existing
+            }
+            const source = value as Record<PropertyKey, unknown>
+            const clone = Object.create(Object.getPrototypeOf(value)) as Record<PropertyKey, unknown>
+            seen.set(value, clone)
+            for (const key of Reflect.ownKeys(source)) {
+                const descriptor = Object.getOwnPropertyDescriptor(source, key)
+                if (!descriptor) continue
+                Object.defineProperty(clone, key, {
+                    ...descriptor,
+                    ...('value' in descriptor ? { value: cloneValue(descriptor.value) } : {})
+                })
+            }
+            return clone
+        }
+        return value
+    }
+
+    return cloneValue(message) as T
 }
 
 // Helper function to convert MongoDB Binary objects to Buffers
@@ -5760,8 +5845,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Messages upsert - CRITICAL for storing messages including polls
             const messagesUpsertHandler = async ({ messages }: any) => {
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
+                const messageSnapshots = messages.map(cloneMessageForListener)
                 
-                for (const msg of messages) {
+                for (const msg of messageSnapshots) {
                     let jid = msg.key.remoteJid
                     if (!jid) continue
                     
@@ -5864,52 +5950,40 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 
                                 // NEW PATTERN A: addressingMode='pn' - Incoming message (customer to bot)
                                 // remoteJid is phone number, remoteJidAlt is LID
-                                if (addressingMode === 'pn' && remoteJidAlt && lidHandler.isLidFormat(remoteJidAlt) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
+                                if (addressingMode === 'pn' && remoteJidAlt && lidHandler.isLidFormat(remoteJidAlt) && remoteJid && isPhoneNumberFormat(remoteJid)) {
+                                    const normalizedPhone = normalizeJidForStorage(remoteJid)
                                     log(`[LID] New Pattern A: addressingMode=pn, remoteJid=phone, remoteJidAlt=lid`)
-                                    log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
+                                    log(`[LID] Discovering: ${remoteJidAlt} -> ${normalizedPhone}`)
                                     
                                     // Store the mapping (lid -> phone)
-                                    const mappingStored = await safeStoreLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern A')
-                                    
-                                    // jid is already the phone number, no change needed
-                                    // Update existing messages with this LID
-                                    if (mappingStored) {
-                                        await safeUpdateExistingMessages(remoteJidAlt, remoteJid, 'messages.upsert Pattern A')
-                                    }
+                                    await safeStoreLidMapping(remoteJidAlt, normalizedPhone, msg.pushName || msg.verifiedBizName, 'messages.upsert Pattern A')
+                                    msg.key.remoteJid = normalizedPhone
+                                    jid = normalizedPhone
                                 }
                                 // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
                                 // remoteJid is LID, remoteJidAlt is phone number
-                                else if (addressingMode === 'lid' && remoteJidAlt && !lidHandler.isLidFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                else if (addressingMode === 'lid' && remoteJidAlt && isPhoneNumberFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
+                                    const normalizedPhone = normalizeJidForStorage(remoteJidAlt)
                                     log(`[LID] New Pattern B: addressingMode=lid, remoteJid=lid, remoteJidAlt=phone`)
                                     log(`[LID] Discovering: ${remoteJid} -> ${remoteJidAlt}`)
                                     
                                     // Store the mapping (lid -> phone)
                                     // Outgoing message: do not persist pushName (it's our own)
-                                    const mappingStored = await safeStoreLidMapping(remoteJid, remoteJidAlt, undefined, 'messages.upsert Pattern B')
-                                    if (mappingStored) {
-                                        // Update message to use phone number
-                                        msg.key.remoteJid = remoteJidAlt
-                                        jid = remoteJidAlt
-
-                                        // Update existing messages with this LID
-                                        await safeUpdateExistingMessages(remoteJid, remoteJidAlt, 'messages.upsert Pattern B')
-                                    }
+                                    await safeStoreLidMapping(remoteJid, normalizedPhone, undefined, 'messages.upsert Pattern B')
+                                    msg.key.remoteJid = normalizedPhone
+                                    jid = normalizedPhone
                                 }
                                 // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
-                                else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
+                                else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && isPhoneNumberFormat(senderPn)) {
+                                    const normalizedPhone = normalizeJidForStorage(senderPn)
                                     log(`[LID] Legacy Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
                                     log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
                                     
                                     // Store the mapping
-                                    const mappingStored = await safeStoreLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName, 'messages.upsert legacy Pattern 1')
-                                    if (mappingStored) {
-                                        // Update message to use phone number
-                                        msg.key.remoteJid = senderPn
-                                        jid = senderPn
-
-                                        // Update existing messages with this LID
-                                        await safeUpdateExistingMessages(remoteJid, senderPn, 'messages.upsert legacy Pattern 1')
-                                    }
+                                    await safeStoreLidMapping(remoteJid, normalizedPhone, msg.pushName || msg.verifiedBizName, 'messages.upsert legacy Pattern 1')
+                                    // senderPn is direct message evidence; persistence is best-effort.
+                                    msg.key.remoteJid = normalizedPhone
+                                    jid = normalizedPhone
                                 }
                                 // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
                                 else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
@@ -5923,15 +5997,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                         log(`[LID] No cached mapping, attempting reverse lookup for ${remoteJid}`)
                                         phoneNumber = await lidHandler.reversePhoneLookupFromMessages(remoteJid)
                                         
-                                        if (phoneNumber) {
+                                        if (phoneNumber && isPhoneNumberFormat(phoneNumber)) {
+                                            phoneNumber = normalizeJidForStorage(phoneNumber)
                                             log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
-                                            // Outgoing message: do not persist pushName (it's our own)
+                                            // Historical message evidence is weaker than fields on the
+                                            // current message, so only normalize after conflict-aware
+                                            // persistence accepts the candidate.
                                             const mappingStored = await safeStoreLidMapping(remoteJid, phoneNumber, undefined, 'messages.upsert legacy Pattern 2')
-                                            if (mappingStored) {
-                                                await safeUpdateExistingMessages(remoteJid, phoneNumber, 'messages.upsert legacy Pattern 2')
-                                            } else {
+                                            if (!mappingStored) {
                                                 phoneNumber = null
                                             }
+                                        } else {
+                                            phoneNumber = null
                                         }
                                     }
                                     
@@ -5989,7 +6066,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     }
                                 }
                             }
-                            
+
                             // Resolve quoted message before storing if present
                             if (msg.message?.extendedTextMessage?.contextInfo?.stanzaId && 
                                 (!msg.message.extendedTextMessage.contextInfo.quotedMessage || 
@@ -6069,6 +6146,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 }
                             } catch (err) {
                                 logWarn(`⚠️ [Contacts] Failed to persist pushName for ${jid}: ${String(err)}`)
+                            }
+
+                            const finalRemoteJid = msg.key?.remoteJid
+                            if (lidHandler?.isLidFormat(finalRemoteJid)) {
+                                updateLidResolutionMetrics('messages.upsert.unresolved-lid', 'error')
+                                const warningKey = `messages-upsert-unresolved-lid-${hashForLogging(finalRemoteJid)}`
+                                if (unresolvedLidThrottle.shouldRun(warningKey)) {
+                                    logWarn(
+                                        `[LID] Unresolved top-level LID before persistence ` +
+                                        `(jidHash=${hashForLogging(finalRemoteJid)}, messageIdHash=${hashForLogging(msg.key?.id || '')})`
+                                    )
+                                }
                             }
 
                             // Store the message with normalized JID
