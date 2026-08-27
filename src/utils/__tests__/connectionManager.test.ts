@@ -115,6 +115,7 @@ describe('ConnectionManager', () => {
                 uri: 'mongodb://localhost:27017',
                 database: 'testdb'
             })
+            // Registration records the initial activity before explicit operations.
             
             // Record some activity
             manager.recordActivity('test-001', 50)

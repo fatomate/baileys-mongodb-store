@@ -21,7 +21,11 @@ jobs:
 
     steps:
       - name: Verify branch
-        run: test "$GITHUB_REF" = "refs/heads/main"
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Publishing is only allowed from main, got $GITHUB_REF"
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
         with:
@@ -46,7 +50,7 @@ jobs:
 
       - name: Pack and verify package
         run: |
-          npm pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/pack.json"
+          npm pack --json --silent --ignore-scripts --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/pack.json"
           node -e '
             const [pack] = require(process.env.RUNNER_TEMP + "/pack.json")
             if (pack.name !== "@fatomate/baileys-mongodb-store" || pack.version !== process.env.REQUESTED_VERSION) process.exit(1)

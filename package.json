@@ -37,7 +37,8 @@
   },
   "peerDependencies": {
     "@adiwajshing/keyed-db": "*",
-    "pino": "*"
+    "pino": "*",
+    "baileys": ">=7.0.0-rc.9 <8"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",

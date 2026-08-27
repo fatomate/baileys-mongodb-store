@@ -16,6 +16,7 @@ describe('TTL Monitoring Utilities', () => {
             estimatedDocumentCount: jest.fn(),
             countDocuments: jest.fn(),
             findOne: jest.fn(),
+            find: jest.fn(),
             createIndex: jest.fn(),
             dropIndex: jest.fn(),
             deleteMany: jest.fn()
@@ -163,6 +164,39 @@ describe('TTL Monitoring Utilities', () => {
             expect(result.ttlIndexExists).toBe(true)
             expect(result.ttlWorking).toBe(false) // Has expired docs
             expect(result.oldestDocument).toBeUndefined()
+        })
+
+        test('should report the oldest document when lookup is enabled', async () => {
+            const updatedAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000)
+            const cursor = {
+                sort: jest.fn().mockReturnThis(),
+                limit: jest.fn().mockReturnThis(),
+                hint: jest.fn().mockReturnThis(),
+                next: jest.fn().mockResolvedValue({ _id: 'old-doc', updatedAt })
+            }
+            mockCollection.indexes.mockResolvedValue([{
+                key: { updatedAt: 1 },
+                name: 'updatedAt_1',
+                expireAfterSeconds: 2592000
+            }])
+            mockCollection.estimatedDocumentCount.mockResolvedValue(100)
+            mockCollection.countDocuments.mockResolvedValue(5)
+            mockCollection.find.mockReturnValue(cursor as any)
+            ttlMonitor = new TTLMonitor(mockDb, {
+                days: 30,
+                enableMonitoring: true,
+                checkIntervalMinutes: 60,
+                alertThresholdDays: 1,
+                enableOldestDocumentLookup: true
+            })
+
+            const result = await ttlMonitor.checkExpiredDocuments('test_collection')
+
+            expect(result.oldestDocument).toEqual({
+                id: 'old-doc',
+                age: 40,
+                updatedAt
+            })
         })
         
         test('should report TTL working when no expired documents', async () => {
