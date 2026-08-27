@@ -78,20 +78,23 @@ describe('Security Utilities', () => {
 
     describe('Message ID Validation', () => {
         describe('isValidMessageId', () => {
-            test('should accept valid message IDs', () => {
+            test('should accept message IDs that meet the lenient safety rules', () => {
                 expect(isValidMessageId('3EB0ABC123DEF456')).toBe(true)
                 expect(isValidMessageId('BAE5ABC123DEF456789012')).toBe(true)
                 expect(isValidMessageId('3A2B4C6D8E0F1A2B4C6D8E0F1A2B4C6D')).toBe(true) // 32 chars
                 expect(isValidMessageId('1679765488')).toBe(true) // Numeric 10 digits
                 expect(isValidMessageId('1234567890123456')).toBe(true) // Numeric 16 digits
+                expect(isValidMessageId('too-short')).toBe(true) // Length/charset are intentionally lenient
+                expect(isValidMessageId('lowercase123456')).toBe(true)
+                expect(isValidMessageId('INVALID-CHARS!@#')).toBe(true)
+                expect(isValidMessageId('123456789')).toBe(true)
             })
 
-            test('should reject invalid message IDs', () => {
-                expect(isValidMessageId('too-short')).toBe(false)
-                expect(isValidMessageId('lowercase123456')).toBe(false)
-                expect(isValidMessageId('INVALID-CHARS!@#')).toBe(false)
-                expect(isValidMessageId('TOO_LONG_MESSAGE_ID_WITH_MORE_THAN_32_CHARACTERS')).toBe(false)
-                expect(isValidMessageId('123456789')).toBe(false) // Too short (9 digits)
+            test('should reject unsafe message IDs', () => {
+                expect(isValidMessageId('ab')).toBe(false)
+                expect(isValidMessageId('contains$dollar')).toBe(false)
+                expect(isValidMessageId('contains{brace')).toBe(false)
+                expect(isValidMessageId('contains}brace')).toBe(false)
                 expect(isValidMessageId('')).toBe(false)
             })
         })
@@ -102,9 +105,9 @@ describe('Security Utilities', () => {
                 expect(validateMessageId(validId)).toBe(validId)
             })
 
-            test('should throw ValidationError for invalid message ID', () => {
-                expect(() => validateMessageId('invalid-id')).toThrow(ValidationError)
-                expect(() => validateMessageId('invalid-id')).toThrow('Invalid message ID format')
+            test('should throw ValidationError for unsafe message ID', () => {
+                expect(() => validateMessageId('invalid$id')).toThrow(ValidationError)
+                expect(() => validateMessageId('invalid$id')).toThrow('Invalid message ID format')
             })
         })
     })

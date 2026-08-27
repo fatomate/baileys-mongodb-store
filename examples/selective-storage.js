@@ -5,7 +5,7 @@
 
 const makeWASocket = require('@whiskeysockets/baileys').default
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const { makeEnhancedMongoDBStore } = require('@baileys/mongodb-store')
+const { makeEnhancedMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 
 async function connectWithSelectiveStorage() {
     // Create store with selective event storage

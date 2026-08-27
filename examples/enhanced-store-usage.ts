@@ -2,7 +2,7 @@
  * Example usage of the Enhanced MongoDB Store with selective event storage and custom TTL
  */
 
-import { makeEnhancedMongoDBStore, EnhancedMongoDBStoreConfig } from '@baileys/mongodb-store'
+import { makeEnhancedMongoDBStore, EnhancedMongoDBStoreConfig } from '@fatomate/baileys-mongodb-store'
 import makeWASocket, { DisconnectReason, useMultiFileAuthState } from 'baileys'
 
 async function main() {

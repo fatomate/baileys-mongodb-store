@@ -1,4 +1,4 @@
-const { makeEnhancedMongoDBStore } = require('@baileys/mongodb-store')
+const { makeEnhancedMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 const makeWASocket = require('baileys').default
 const { useMultiFileAuthState } = require('baileys')
 const path = require('path')
