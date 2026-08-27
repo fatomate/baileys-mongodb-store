@@ -65,21 +65,16 @@ Indexes:
 
 ## Installation
 
-Add to your `package.json`:
-
-```json
-"dependencies": {
-    "@baileys/mongodb-store": "github:fatomate/baileys-mongodb-store",
-    "mongodb": "^6.3.0"
-}
-```
-
-Then install:
+This private package is published through GitHub Packages. Authenticate once with a classic GitHub token that has `read:packages` access:
 
 ```bash
-npm install
-# or
-yarn install
+npm login --scope=@fatomate --auth-type=legacy --registry=https://npm.pkg.github.com
+```
+
+Use your GitHub username and the token as the password, then install:
+
+```bash
+npm install @fatomate/baileys-mongodb-store@2.30.0
 ```
 
 ## Quick Start
@@ -87,7 +82,7 @@ yarn install
 ```javascript
 const makeWASocket = require('@whiskeysockets/baileys').default
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const { makeEnhancedMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
+const { makeEnhancedMongoDBStore, cleanupMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 
 async function connectToWhatsApp() {
     // Create MongoDB store with your configuration
@@ -223,7 +218,7 @@ interface EnhancedMongoDBStoreConfig extends MongoDBStoreConfig {
 Run multiple WhatsApp accounts simultaneously with isolated data:
 
 ```javascript
-const { makeMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
+const { makeMongoDBStore, cleanupMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 
 // Instance 1 - Customer Support
 const supportStore = await makeMongoDBStore({
@@ -473,7 +468,7 @@ Optimizations:
 ## Error Handling & Cleanup
 
 ```javascript
-const { makeMongoDBStore, cleanupMongoDBStore } = require('@baileys/mongodb-store')
+const { makeMongoDBStore, cleanupMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 
 try {
     const store = await makeMongoDBStore({
@@ -605,7 +600,7 @@ ev.on('messaging-history.set', async ({ messages }) => {
 ### Example 1: Minimal Storage (Cost Optimization)
 
 ```javascript
-const { makeEnhancedMongoDBStore } = require('@baileys/mongodb-store')
+const { makeEnhancedMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 
 const store = await makeEnhancedMongoDBStore({
     uri: 'mongodb://localhost:27017',
@@ -730,7 +725,7 @@ import { makeInMemoryStore } from '@whiskeysockets/baileys'
 const store = makeInMemoryStore({})
 
 // After (MongoDB store)
-const { makeMongoDBStore } = require('@baileys/mongodb-store')
+const { makeMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 const store = await makeMongoDBStore({
     uri: 'mongodb://localhost:27017',
     database: 'whatsapp_bot',

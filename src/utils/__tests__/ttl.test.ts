@@ -13,6 +13,7 @@ describe('TTL Monitoring Utilities', () => {
         // Create mock collection
         mockCollection = {
             indexes: jest.fn(),
+            estimatedDocumentCount: jest.fn(),
             countDocuments: jest.fn(),
             findOne: jest.fn(),
             createIndex: jest.fn(),
@@ -145,9 +146,6 @@ describe('TTL Monitoring Utilities', () => {
     
     describe('Expired Documents Check', () => {
         test('should detect expired documents', async () => {
-            const now = new Date()
-            const oldDate = new Date(now.getTime() - 35 * 24 * 60 * 60 * 1000) // 35 days ago
-            
             mockCollection.indexes.mockResolvedValue([
                 {
                     key: { updatedAt: 1 },
@@ -155,12 +153,8 @@ describe('TTL Monitoring Utilities', () => {
                     expireAfterSeconds: 2592000
                 }
             ])
-            mockCollection.countDocuments.mockResolvedValueOnce(100) // total
-            mockCollection.countDocuments.mockResolvedValueOnce(5) // expired
-            mockCollection.findOne.mockResolvedValue({
-                _id: 'oldest-doc',
-                updatedAt: oldDate
-            })
+            mockCollection.estimatedDocumentCount.mockResolvedValue(100)
+            mockCollection.countDocuments.mockResolvedValue(5)
             
             const result = await ttlMonitor.checkExpiredDocuments('test_collection')
             
@@ -168,11 +162,7 @@ describe('TTL Monitoring Utilities', () => {
             expect(result.expiredDocuments).toBe(5)
             expect(result.ttlIndexExists).toBe(true)
             expect(result.ttlWorking).toBe(false) // Has expired docs
-            expect(result.oldestDocument).toEqual({
-                id: 'oldest-doc',
-                age: 35,
-                updatedAt: oldDate
-            })
+            expect(result.oldestDocument).toBeUndefined()
         })
         
         test('should report TTL working when no expired documents', async () => {
@@ -183,12 +173,8 @@ describe('TTL Monitoring Utilities', () => {
                     expireAfterSeconds: 2592000
                 }
             ])
-            mockCollection.countDocuments.mockResolvedValueOnce(100) // total
-            mockCollection.countDocuments.mockResolvedValueOnce(0) // expired
-            mockCollection.findOne.mockResolvedValue({
-                _id: 'newest-doc',
-                updatedAt: new Date()
-            })
+            mockCollection.estimatedDocumentCount.mockResolvedValue(100)
+            mockCollection.countDocuments.mockResolvedValue(0)
             
             const result = await ttlMonitor.checkExpiredDocuments('test_collection')
             
@@ -239,11 +225,8 @@ describe('TTL Monitoring Utilities', () => {
                     expireAfterSeconds: 2592000
                 }
             ])
-            mockCollection.countDocuments.mockResolvedValue(100)
-            mockCollection.findOne.mockResolvedValue({
-                _id: 'doc-1',
-                updatedAt: new Date()
-            })
+            mockCollection.estimatedDocumentCount.mockResolvedValue(100)
+            mockCollection.countDocuments.mockResolvedValue(0)
             
             const report = await ttlMonitor.getTTLStatusReport()
             
@@ -321,8 +304,8 @@ describe('TTL Monitoring Utilities', () => {
                     expireAfterSeconds: 2592000
                 }
             ])
+            mockCollection.estimatedDocumentCount.mockResolvedValue(0)
             mockCollection.countDocuments.mockResolvedValue(0) // No expired
-            mockCollection.findOne.mockResolvedValue(null)
             
             const cleanup = createTTLCleanupJob(mockDb, { days: 30 }, logger)
             

@@ -2,12 +2,12 @@
  * Example: Proper GroupMetadata Handling with MongoDB Store
  * 
  * This example demonstrates how to properly capture and store group metadata
- * using the @baileys/mongodb-store package.
+ * using the @fatomate/baileys-mongodb-store package.
  */
 
 const makeWASocket = require('baileys').default
 const { useMultiFileAuthState } = require('baileys')
-const { makeMongoDBStore } = require('@baileys/mongodb-store')
+const { makeMongoDBStore } = require('@fatomate/baileys-mongodb-store')
 
 async function connectToWhatsApp() {
     // MongoDB store configuration

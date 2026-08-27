@@ -29,6 +29,7 @@ describe('LidHandler', () => {
         // Clear any existing data first
         await db.collection('test_lidMappings').deleteMany({})
         await db.collection('test_messages').deleteMany({})
+        await db.collection('test_contacts').deleteMany({})
         
         // Create new LID handler for each test
         lidHandler = new LidHandler('test-instance', {
@@ -257,7 +258,7 @@ describe('LidHandler', () => {
             
             expect(result.normalizedJid).toBe(phoneNumber)
             expect(result.lidInfo.lid).toBe(lid)
-            expect(result.lidInfo.phoneNumber).toBeUndefined()
+            expect(result.lidInfo.phoneNumber).toBe(phoneNumber)
             expect(result.lidInfo.mappingStored).toBe(false)
         })
 
@@ -569,6 +570,7 @@ describe('LidHandler', () => {
 
             // Delete from DB
             await db.collection('test_lidMappings').deleteMany({})
+            await db.collection('test_contacts').deleteMany({})
 
             // Should not find in cache anymore
             const retrieved = await lidHandler.getPhoneNumberFromLid(lid)
