@@ -78,7 +78,7 @@ describe('Security Utilities', () => {
 
     describe('Message ID Validation', () => {
         describe('isValidMessageId', () => {
-            test('should accept valid message IDs', () => {
+            test('should accept message IDs that meet the lenient safety rules', () => {
                 expect(isValidMessageId('3EB0ABC123DEF456')).toBe(true)
                 expect(isValidMessageId('BAE5ABC123DEF456789012')).toBe(true)
                 expect(isValidMessageId('3A2B4C6D8E0F1A2B4C6D8E0F1A2B4C6D')).toBe(true) // 32 chars
