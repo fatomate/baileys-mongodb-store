@@ -49,6 +49,7 @@ import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/co
 import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
+import { normalizeMessageTimestamp, wrapMessageWrites } from './utils/messageTimestamp'
 
 // Declare Node.js globals if not available in tsconfig
 declare global {
@@ -857,7 +858,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         return {
             chats: db.collection(`${collectionPrefix}chats`),
             contacts: db.collection(`${collectionPrefix}contacts`),
-            messages: db.collection(`${collectionPrefix}messages`),
+            // WAB-654: every messages write stores an Int32 seconds messageTimestamp.
+            messages: wrapMessageWrites(db.collection(`${collectionPrefix}messages`), (context, raw) => {
+                if (shouldLogOnce(`invalid-ts-${validatedInstanceId}-${context}`, 60)) {
+                    logWarn(`[${instanceId}] Unconvertible messageTimestamp in ${context} (type ${raw === null ? 'null' : typeof raw}); ${context === 'update' ? 'kept stored value' : 'stored receipt time'}`)
+                }
+            }),
             groupMetadata: db.collection(`${collectionPrefix}groupMetadata`),
             state: db.collection(`${collectionPrefix}state`),
             presences: db.collection(`${collectionPrefix}presences`),
@@ -2239,7 +2245,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         )
                         
                         if (originalMessage && originalMessage.messageTimestamp) {
-                            preservedTimestamp = originalMessage.messageTimestamp
+                            preservedTimestamp = normalizeMessageTimestamp(originalMessage.messageTimestamp) ?? null
                             log(`⏰ [Bull Queue] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
                         }
                     }
@@ -2363,7 +2369,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (existingMsg) {
                         // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                         const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
-                        const originalTimestamp = existingMsg.messageTimestamp
+                        const originalTimestamp = normalizeMessageTimestamp(existingMsg.messageTimestamp)
                         
                         if (isMessageEdit) {
                             log(`🔄 [Bull Queue Update] Detected MESSAGE_EDIT for ${messageId}`)
@@ -4822,7 +4828,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 )
                 
                 if (originalMessage && originalMessage.messageTimestamp) {
-                    preservedTimestamp = originalMessage.messageTimestamp
+                    preservedTimestamp = normalizeMessageTimestamp(originalMessage.messageTimestamp) ?? null
                     log(`⏰ [Direct] Preserving original messageTimestamp: ${preservedTimestamp} for edited message ${editTargetKey.id}`)
                 }
             }
@@ -5048,7 +5054,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             if (existingMsg) {
                 // Check if this is a MESSAGE_EDIT by looking for editedMessage field
                 const isMessageEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
-                const originalTimestamp = existingMsg.messageTimestamp
+                const originalTimestamp = normalizeMessageTimestamp(existingMsg.messageTimestamp)
                 
                 if (isMessageEdit) {
                     if (shouldLogOnce(`um_det_${id}`, 5)) {
