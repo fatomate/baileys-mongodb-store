@@ -108,8 +108,9 @@ describe('upsertMessage', () => {
 })
 
 describe('updateMessage', () => {
+    // WAB-859: a non-edit update never changes an existing valid time, so the Long fills a missing one.
     it('stores a Long timestamp as Int32 seconds', async () => {
-        await seedMessage(h, 'upd1', S)
+        await seedMessage(h, 'upd1', undefined)
         await store.updateMessage(JID, 'upd1', { messageTimestamp: Long.fromNumber(S + 3) })
         expect(await storedTimestamp(h, 'upd1')).toMatchObject({ type: 'int', value: S + 3 })
     })

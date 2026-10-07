@@ -7,7 +7,8 @@ import {
     isLidFormat as isLidFormatUtil,
     isPhoneNumberFormat,
     areJidsEquivalent,
-    extractLidPhonePair
+    extractLidPhonePair,
+    canonicalPhoneJid
 } from './jidUtils'
 import { retryWithBackoff } from './connectionRetry'
 import type { BaileysLIDMappingStore, BaileysLIDMapping } from './lidCompatibility'
@@ -249,7 +250,7 @@ export class LidHandler {
             }
             
             // For other errors, log and re-throw
-            console.error(`[LidHandler] ${operationName} failed:`, error)
+            console.error(`[LidHandler] ${operationName} failed:`, ((error as any)?.codeName || (error as any)?.name || 'Error'))
             throw error
         }
     }
@@ -339,7 +340,7 @@ export class LidHandler {
                 console.log('[LidHandler] All indexes created successfully')
             }
         } catch (error) {
-            console.error('[LidHandler] Some indexes failed to create, but continuing:', error)
+            console.error('[LidHandler] Some indexes failed to create, but continuing:', ((error as any)?.codeName || (error as any)?.name || 'Error'))
             // Don't throw - indexes are optimization, not critical
         }
     }
@@ -521,13 +522,13 @@ export class LidHandler {
         
         // Prevent storing LID->LID mappings (this is invalid)
         if (normalizedLid === normalizedPhone) {
-            console.warn(`[LidHandler] Attempted to store invalid LID->LID mapping: ${normalizedLid} -> ${normalizedPhone}`)
+            console.warn(`[LidHandler] Attempted to store invalid LID->LID mapping: [redacted] -> [redacted]`)
             return
         }
         
         // Additional check: both shouldn't be LID format
         if (this.isLidFormat(normalizedPhone)) {
-            console.warn(`[LidHandler] Attempted to store LID as phone number: ${normalizedLid} -> ${normalizedPhone}`)
+            console.warn(`[LidHandler] Attempted to store LID as phone number: [redacted] -> [redacted]`)
             return
         }
         
@@ -646,9 +647,9 @@ export class LidHandler {
                 }
             }
             
-            console.log(`[LidHandler] Stored mapping in contacts: ${normalizedLid} -> ${normalizedPhone}`)
+            console.log(`[LidHandler] Stored mapping in contacts: [redacted] -> [redacted]`)
         } catch (error) {
-            console.error('[LidHandler] Failed to store LID mapping:', error)
+            console.error('[LidHandler] Failed to store LID mapping:', ((error as any)?.codeName || (error as any)?.name || 'Error'))
         }
     }
 
@@ -956,11 +957,11 @@ export class LidHandler {
      * This is called when we find a message with mismatched JIDs that form a LID-phone pair
      */
     async storeDiscoveredMapping(jid1: string, jid2: string): Promise<boolean> {
-        console.log(`[LidHandler] storeDiscoveredMapping called with: jid1="${jid1}", jid2="${jid2}"`)
+        console.log(`[LidHandler] storeDiscoveredMapping called with: jid1="[redacted]", jid2="[redacted]"`)
         
         const pair = extractLidPhonePair(jid1, jid2)
         if (!pair) {
-            console.log(`[LidHandler] Failed to extract LID-phone pair from: "${jid1}" and "${jid2}"`)
+            console.log(`[LidHandler] Failed to extract LID-phone pair from: "[redacted]" and "[redacted]"`)
             
             // Additional debugging to understand why it failed
             if (process.env.DEBUG_LID === 'true') {
@@ -972,7 +973,7 @@ export class LidHandler {
             return false
         }
         
-        console.log(`[LidHandler] Successfully extracted mapping: ${pair.lid} <-> ${pair.phoneNumber}`)
+        console.log(`[LidHandler] Successfully extracted mapping: [redacted] <-> [redacted]`)
         await this.storeLidMapping(pair.lid, pair.phoneNumber)
         return true
     }
@@ -984,7 +985,7 @@ export class LidHandler {
      */
     async discoverPhoneFromSentMessage(lid: string): Promise<string | null> {
         const normalizedLid = normalizeJidForStorage(lid)
-        console.log(`[LidHandler] Searching for phone number from sent message with LID: ${normalizedLid}`)
+        console.log(`[LidHandler] Searching for phone number from sent message with LID: [redacted]`)
         
         return await this.withConnectionCheck(
             async () => {
@@ -1017,32 +1018,32 @@ export class LidHandler {
                     const addressingMode = (receivedMessage.key as any)?.addressingMode
                     if (addressingMode === 'pn' && receivedMessage.key?.remoteJid && !this.isLidFormat(receivedMessage.key.remoteJid)) {
                         phoneNumber = receivedMessage.key.remoteJid
-                        console.log(`[LidHandler] Found phone number in remoteJid (addressingMode=pn): ${phoneNumber}`)
+                        console.log(`[LidHandler] Found phone number in remoteJid (addressingMode=pn): [redacted]`)
                     }
                     // LEGACY: First try senderPn
                     else if ((receivedMessage.key as any)?.senderPn && !this.isLidFormat((receivedMessage.key as any).senderPn)) {
                         phoneNumber = (receivedMessage.key as any).senderPn
-                        console.log(`[LidHandler] Found phone number in senderPn: ${phoneNumber}`)
+                        console.log(`[LidHandler] Found phone number in senderPn: [redacted]`)
                     }
                     // Then try remoteJid if it's not a LID
                     else if (receivedMessage.key?.remoteJid && !this.isLidFormat(receivedMessage.key.remoteJid)) {
                         phoneNumber = receivedMessage.key.remoteJid
-                        console.log(`[LidHandler] Found phone number in remoteJid: ${phoneNumber}`)
+                        console.log(`[LidHandler] Found phone number in remoteJid: [redacted]`)
                     }
                     // Also check participant field
                     else if (receivedMessage.key?.participant && !this.isLidFormat(receivedMessage.key.participant)) {
                         phoneNumber = receivedMessage.key.participant
-                        console.log(`[LidHandler] Found phone number in participant: ${phoneNumber}`)
+                        console.log(`[LidHandler] Found phone number in participant: [redacted]`)
                     }
                     
                     if (phoneNumber && isPhoneNumberFormat(phoneNumber)) {
                         // Store the discovered mapping
-                        console.log(`[LidHandler] Discovered phone number ${phoneNumber} for LID ${normalizedLid} via reverse lookup`)
+                        console.log(`[LidHandler] Discovered phone number [redacted] for LID [redacted] via reverse lookup`)
                         await this.storeLidMapping(normalizedLid, phoneNumber)
                         return phoneNumber
                     }
                 } else {
-                    console.log(`[LidHandler] No received messages found with senderLid/remoteJidAlt: ${normalizedLid}`)
+                    console.log(`[LidHandler] No received messages found with senderLid/remoteJidAlt: [redacted]`)
                 }
                 
                 return null
@@ -1066,7 +1067,7 @@ export class LidHandler {
      */
     async reversePhoneLookupFromMessages(lid: string): Promise<string | null> {
         const normalizedLid = normalizeJidForStorage(lid)
-        console.log(`[LidHandler] Attempting reverse lookup for LID: ${normalizedLid}`)
+        console.log(`[LidHandler] Attempting reverse lookup for LID: [redacted]`)
         
         return await this.withConnectionCheck(
             async () => {
@@ -1127,18 +1128,18 @@ export class LidHandler {
                     
                     // NEW FORMAT: Check based on addressingMode
                     if (addressingMode === 'pn' && message.key.remoteJid && !this.isLidFormat(message.key.remoteJid)) {
-                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=pn): ${normalizedLid} -> ${message.key.remoteJid}`)
+                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=pn): [redacted] -> [redacted]`)
                         return message.key.remoteJid
                     }
                     if (addressingMode === 'lid' && remoteJidAlt && !this.isLidFormat(remoteJidAlt)) {
-                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=lid): ${normalizedLid} -> ${remoteJidAlt}`)
+                        console.log(`[LidHandler] Reverse lookup found (new format, addressingMode=lid): [redacted] -> [redacted]`)
                         return remoteJidAlt
                     }
                     
                     // LEGACY: Check senderPn
                     const senderPn = (message.key as any)?.senderPn
                     if (senderPn && !this.isLidFormat(senderPn)) {
-                        console.log(`[LidHandler] Reverse lookup found (legacy): ${normalizedLid} -> ${senderPn}`)
+                        console.log(`[LidHandler] Reverse lookup found (legacy): [redacted] -> [redacted]`)
                         return senderPn
                     }
                 }
@@ -1151,38 +1152,120 @@ export class LidHandler {
     }
 
     /**
-     * Update existing messages that have a LID to use the phone number
+     * WAB-859: move older messages stored under a LID to the phone jid, bounded and best-effort.
+     *
+     * - Selects only rows whose `jid` and `key.remoteJid` are both the LID.
+     * - Each write repeats that identity and the observed `key.remoteJidAlt`, so a row that another
+     *   writer changed after the scan is left alone (counted as skipped).
+     * - A row whose `remoteJidAlt` names a different phone, or whose phone twin exists (E11000), is
+     *   skipped. Other errors propagate to the caller, which saved the new message first.
+     * - One deadline covers connection preparation, the scan and every write. When it expires, no
+     *   further write starts.
+     * - `remaining` counts scanned rows that were not processed; `complete` is false when more rows
+     *   may exist. Leftover rows stay for the WAB-259 repair CLI.
      */
-    async updateExistingMessages(lid: string, phoneNumber: string): Promise<void> {
-        await this.withConnectionCheck(
+    async updateExistingMessages(
+        lid: string,
+        phoneNumber: string,
+        budget: { maxRows?: number; maxMs?: number } = {}
+    ): Promise<{ updated: number; skipped: number; remaining: number; complete: boolean }> {
+        const counts = { updated: 0, skipped: 0, remaining: 0, complete: true }
+        const phone = canonicalPhoneJid(phoneNumber)
+        const normalizedLid = normalizeJidForStorage(lid)
+        if (!phone || !this.isLidFormat(normalizedLid)) return counts
+        const maxRows = budget.maxRows ?? 200
+        const deadline = Date.now() + (budget.maxMs ?? 2000)
+        const left = () => deadline - Date.now()
+        let expired = false
+
+        const CONNECTION_LOST = Symbol('connectionLost')
+        const work = this.withConnectionCheck<void | typeof CONNECTION_LOST>(
             async () => {
-                if (!this.messagesCollection) {
+                if (!this.messagesCollection) return
+                if (expired || left() <= 0) {
+                    counts.complete = false
                     return
                 }
-                
-                // Update messages where remoteJid is the LID
-                const result = await this.messagesCollection.updateMany(
-                    {
-                        instanceId: this.instanceId,
-                        'key.remoteJid': lid
-                    },
-                    {
-                        $set: {
-                            'key.remoteJid': phoneNumber,
-                            jid: phoneNumber,
-                            'lidMapping.resolved': true,
-                            'lidMapping.resolvedAt': new Date()
-                        }
+                const rows = await this.messagesCollection
+                    .find(
+                        { instanceId: this.instanceId, jid: normalizedLid, 'key.remoteJid': normalizedLid },
+                        { projection: { _id: 1, 'key.remoteJidAlt': 1 }, limit: maxRows + 1, maxTimeMS: Math.max(1, left()) }
+                    )
+                    .toArray()
+                if (rows.length > maxRows) {
+                    counts.complete = false
+                    rows.length = maxRows
+                }
+
+                for (let i = 0; i < rows.length; i++) {
+                    if (expired || left() <= 0) {
+                        counts.complete = false
+                        counts.remaining += rows.length - i
+                        break
                     }
-                )
-                
-                if (result.modifiedCount > 0) {
-                    console.log(`[LidHandler] Updated ${result.modifiedCount} messages from LID ${lid} to ${phoneNumber}`)
+                    const row = rows[i]
+                    const alt = (row as any).key?.remoteJidAlt
+                    if (alt !== undefined && alt !== null && alt !== normalizedLid && canonicalPhoneJid(alt) !== phone) {
+                        counts.skipped++
+                        continue
+                    }
+                    try {
+                        const result = await this.messagesCollection.updateOne(
+                            {
+                                _id: row._id,
+                                instanceId: this.instanceId,
+                                jid: normalizedLid,
+                                'key.remoteJid': normalizedLid,
+                                'key.remoteJidAlt': alt === undefined ? { $exists: false } : alt
+                            },
+                            {
+                                $set: {
+                                    jid: phone,
+                                    'key.remoteJid': phone,
+                                    'key.remoteJidAlt': normalizedLid,
+                                    'key.addressingMode': 'pn',
+                                    'lidMapping.resolved': true,
+                                    'lidMapping.resolvedAt': new Date()
+                                }
+                            },
+                            { maxTimeMS: Math.max(1, left()) }
+                        )
+                        if (result.modifiedCount === 1) counts.updated++
+                        else counts.skipped++
+                    } catch (error: any) {
+                        if (error?.code !== 11000) throw error
+                        counts.skipped++
+                    }
                 }
             },
-            undefined,
+            CONNECTION_LOST,
             'updateExistingMessages'
         )
+
+        // The deadline also bounds connection preparation and a stalled driver call. After it
+        // expires the loop above starts no further write; an in-flight guarded write may still land.
+        let timer: NodeJS.Timeout | undefined
+        const timeout = new Promise<'timeout'>((resolve) => {
+            timer = setTimeout(() => resolve('timeout'), Math.max(0, left()))
+            timer.unref?.()
+        })
+        try {
+            const outcome = await Promise.race([work, timeout])
+            if (outcome === 'timeout') {
+                expired = true
+                counts.complete = false
+                work.catch(() => {})
+            } else if (outcome === CONNECTION_LOST) {
+                counts.complete = false
+            }
+        } finally {
+            if (timer) clearTimeout(timer)
+        }
+
+        if (counts.updated || counts.skipped || !counts.complete) {
+            console.log(`[LidHandler] Re-keyed ${counts.updated} older messages; skipped ${counts.skipped}; remaining ${counts.remaining}; complete ${counts.complete}`)
+        }
+        return counts
     }
 
     /**
@@ -1204,15 +1287,15 @@ export class LidHandler {
         let normalizedJid = message.key?.remoteJid || ''
         let mappingStored = false
         
-        console.log(`[LidHandler] Processing message ${message.key?.id}: ${JSON.stringify(lidInfo)}`)
+        console.log(`[LidHandler] Processing message ${message.key?.id}: [redacted]`)
         
         // Handle fromMe messages with LID that need reverse lookup
         if (lidInfo.needsReverseLookup && lidInfo.lid) {
-            console.log(`[LidHandler] Performing reverse lookup for sent message with LID: ${lidInfo.lid}`)
+            console.log(`[LidHandler] Performing reverse lookup for sent message with LID: [redacted]`)
             const discoveredPhone = await this.discoverPhoneFromSentMessage(lidInfo.lid)
             
             if (discoveredPhone) {
-                console.log(`[LidHandler] Reverse lookup successful: ${lidInfo.lid} -> ${discoveredPhone}`)
+                console.log(`[LidHandler] Reverse lookup successful: [redacted] -> [redacted]`)
                 lidInfo.phoneNumber = discoveredPhone
                 normalizedJid = discoveredPhone
                 // Outgoing message: do not persist pushName (it's our own display)
@@ -1222,11 +1305,11 @@ export class LidHandler {
                 // Try existing mapping as fallback
                 const existingPhone = await this.getPhoneNumberFromLid(lidInfo.lid)
                 if (existingPhone) {
-                    console.log(`[LidHandler] Using existing mapping: ${lidInfo.lid} -> ${existingPhone}`)
+                    console.log(`[LidHandler] Using existing mapping: [redacted] -> [redacted]`)
                     normalizedJid = existingPhone
                     lidInfo.phoneNumber = existingPhone
                 } else {
-                    console.log(`[LidHandler] No phone number found for sent message LID: ${lidInfo.lid}`)
+                    console.log(`[LidHandler] No phone number found for sent message LID: [redacted]`)
                     // IMPORTANT: Keep the LID for now, but mark it for future update
                     // The phone number might become available later through getMessage discovery
                     normalizedJid = lidInfo.lid
@@ -1238,11 +1321,11 @@ export class LidHandler {
         else if (lidInfo.lid && lidInfo.phoneNumber) {
             // Additional validation: Don't store if both are the same or both are LIDs
             if (lidInfo.lid === lidInfo.phoneNumber) {
-                console.warn(`[LidHandler] Skipping invalid mapping where LID equals phone number: ${lidInfo.lid}`)
+                console.warn(`[LidHandler] Skipping invalid mapping where LID equals phone number: [redacted]`)
             } else if (this.isLidFormat(lidInfo.phoneNumber)) {
-                console.warn(`[LidHandler] Skipping invalid mapping where phone number is also a LID: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                console.warn(`[LidHandler] Skipping invalid mapping where phone number is also a LID: [redacted] -> [redacted]`)
             } else {
-                console.log(`[LidHandler] Storing mapping: ${lidInfo.lid} -> ${lidInfo.phoneNumber}`)
+                console.log(`[LidHandler] Storing mapping: [redacted] -> [redacted]`)
                 const fromMe = !!message.key?.fromMe
                 const pushName = !fromMe ? ((message as any)?.pushName || (message as any)?.verifiedBizName) : undefined
                 await this.storeLidMapping(lidInfo.lid, lidInfo.phoneNumber, pushName)
@@ -1252,19 +1335,19 @@ export class LidHandler {
         } 
         // If we only have LID, try to get phone number from database
         else if (lidInfo.lid) {
-            console.log(`[LidHandler] Looking up existing mapping for LID: ${lidInfo.lid}`)
+            console.log(`[LidHandler] Looking up existing mapping for LID: [redacted]`)
             const phoneNumber = await this.getPhoneNumberFromLid(lidInfo.lid)
             if (phoneNumber) {
-                console.log(`[LidHandler] Found existing mapping: ${lidInfo.lid} -> ${phoneNumber}`)
+                console.log(`[LidHandler] Found existing mapping: [redacted] -> [redacted]`)
                 normalizedJid = phoneNumber
                 lidInfo.phoneNumber = phoneNumber
             } else {
-                console.log(`[LidHandler] No existing mapping found for LID: ${lidInfo.lid}`)
+                console.log(`[LidHandler] No existing mapping found for LID: [redacted]`)
                 // Keep the LID for now, might be resolved later
                 normalizedJid = lidInfo.lid
             }
         } else {
-            console.log(`[LidHandler] No LID found in message, using original JID: ${normalizedJid}`)
+            console.log(`[LidHandler] No LID found in message, using original JID: [redacted]`)
         }
         
         return {
@@ -1400,7 +1483,7 @@ export class LidHandler {
             if (lid) {
                 // Store in MongoDB for persistence
                 await this.storeLidMapping(lid, pn)
-                console.log(`[LidHandler] Synced from Baileys store: ${lid} -> ${pn}`)
+                console.log(`[LidHandler] Synced from Baileys store: [redacted] -> [redacted]`)
                 return lid
             }
         } catch (err) {
@@ -1465,7 +1548,7 @@ export class LidHandler {
             // Use storeLIDPNMappings for batch efficiency (single item)
             if (this.baileysLidMappingStore.storeLIDPNMappings) {
                 await this.baileysLidMappingStore.storeLIDPNMappings([{ lid, pn: phoneNumber }])
-                console.log(`[LidHandler] Synced to Baileys store: ${lid} -> ${phoneNumber}`)
+                console.log(`[LidHandler] Synced to Baileys store: [redacted] -> [redacted]`)
                 return true
             }
         } catch (err) {
@@ -1530,7 +1613,7 @@ export class LidHandler {
             return
         }
 
-        console.log(`[LidHandler] Received lid-mapping.update: ${lid} -> ${pn}`)
+        console.log(`[LidHandler] Received lid-mapping.update: [redacted] -> [redacted]`)
         
         // Store in MongoDB
         await this.storeLidMapping(lid, pn)

@@ -244,3 +244,34 @@ export const isBroadcastJid = (jid: string | undefined | null): boolean => {
 export const getJidCacheKey = (jid: string): string => {
     return normalizeJidForComparison(jid).replace(/[^a-zA-Z0-9]/g, '_')
 }
+/**
+ * WAB-859: the canonical phone JID, or undefined.
+ * Accepts `<digits>@s.whatsapp.net` or `<digits>@c.us`, with an optional `:<device>` suffix,
+ * and returns `<digits>@s.whatsapp.net`. Matches the backend PHONE_JID_PATTERN, so readers that
+ * resolve trusted LID/phone pairs accept every value the store writes.
+ */
+export const canonicalPhoneJid = (jid: unknown): string | undefined => {
+    if (typeof jid !== 'string') return undefined
+    const match = /^(\d+)(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/i.exec(jid.trim())
+    return match ? `${match[1]}@s.whatsapp.net` : undefined
+}
+
+/**
+ * WAB-859: the trusted LID/phone pair carried by a message key, or null.
+ * Pattern A: addressingMode `pn`, phone remoteJid, LID remoteJidAlt.
+ * Pattern B: addressingMode `lid`, LID remoteJid, phone remoteJidAlt.
+ * Groups and keys without a valid phone return null.
+ */
+export const resolveStorageIdentity = (key: any): { lid: string; phone: string } | null => {
+    if (!key || typeof key !== 'object') return null
+    const { remoteJid, remoteJidAlt, addressingMode } = key
+    if (addressingMode === 'pn' && isLidFormat(remoteJidAlt)) {
+        const phone = canonicalPhoneJid(remoteJid)
+        return phone ? { lid: normalizeJidForStorage(remoteJidAlt), phone } : null
+    }
+    if (addressingMode === 'lid' && isLidFormat(remoteJid)) {
+        const phone = canonicalPhoneJid(remoteJidAlt)
+        return phone ? { lid: normalizeJidForStorage(remoteJid), phone } : null
+    }
+    return null
+}
