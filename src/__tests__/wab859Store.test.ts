@@ -344,6 +344,27 @@ describe('LID mapping side effects (PR review)', () => {
         expect(spy).toHaveBeenCalledTimes(1)
     })
 
+    it('a hook that saves its event message again still stores the mapping', async () => {
+        let captured: any = null
+        const hooked = await makeEnhancedMongoDBStore({
+            ...baseStoreConfig(h.uri),
+            lidHandler: { enableCache: false },
+            hooks: { afterStore: async (event: string, payload: any) => { if (event === 'messages.upsert') captured = payload } },
+        } as any)
+        const hookedEv = new EventEmitter()
+        hooked.bind(hookedEv)
+        try {
+            hookedEv.emit('messages.upsert', { type: 'notify', messages: [liveMessage('hook1', { remoteJid: PHONE, remoteJidAlt: LID, addressingMode: 'pn' })] })
+            await waitFor(async () => captured)
+            const spy = jest.spyOn(LidHandler.prototype, 'storeLidMapping')
+            await store.upsertMessage(PHONE, captured)
+            expect(spy).toHaveBeenCalledTimes(1)
+        } finally {
+            hooked.unbind()
+            await hooked.close()
+        }
+    })
+
     it('a Pattern B event payload matches the stored phone-primary key', async () => {
         ev.emit('messages.upsert', { type: 'notify', messages: [liveMessage('pbh1', { remoteJid: LID, remoteJidAlt: PHONE, addressingMode: 'lid' })] })
         const [row] = await waitFor(async () => {
