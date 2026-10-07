@@ -1152,47 +1152,71 @@ export class LidHandler {
     }
 
     /**
-     * Update existing messages that have a LID to use the phone number
-     */
-    /**
      * WAB-859: move older messages stored under a LID to the phone jid, bounded and best-effort.
-     * Rows are updated one at a time with a guard on their current identity. A row whose phone
-     * twin already exists (E11000) or whose remoteJidAlt names another phone is skipped. Rows left
-     * after the budget stay for the WAB-259 repair CLI. Callers save the new message first.
+     *
+     * - Selects only rows whose `jid` and `key.remoteJid` are both the LID.
+     * - Each write repeats that identity and the observed `key.remoteJidAlt`, so a row that another
+     *   writer changed after the scan is left alone (counted as skipped).
+     * - A row whose `remoteJidAlt` names a different phone, or whose phone twin exists (E11000), is
+     *   skipped. Other errors propagate to the caller, which saved the new message first.
+     * - One deadline covers connection preparation, the scan and every write. When it expires, no
+     *   further write starts.
+     * - `remaining` counts scanned rows that were not processed; `complete` is false when more rows
+     *   may exist. Leftover rows stay for the WAB-259 repair CLI.
      */
     async updateExistingMessages(
         lid: string,
         phoneNumber: string,
         budget: { maxRows?: number; maxMs?: number } = {}
-    ): Promise<{ updated: number; skipped: number }> {
-        const counts = { updated: 0, skipped: 0 }
+    ): Promise<{ updated: number; skipped: number; remaining: number; complete: boolean }> {
+        const counts = { updated: 0, skipped: 0, remaining: 0, complete: true }
         const phone = canonicalPhoneJid(phoneNumber)
         const normalizedLid = normalizeJidForStorage(lid)
         if (!phone || !this.isLidFormat(normalizedLid)) return counts
         const maxRows = budget.maxRows ?? 200
-        const maxMs = budget.maxMs ?? 2000
+        const deadline = Date.now() + (budget.maxMs ?? 2000)
+        const left = () => deadline - Date.now()
+        let expired = false
 
-        await this.withConnectionCheck(
+        const work = this.withConnectionCheck(
             async () => {
                 if (!this.messagesCollection) return
-                const started = Date.now()
+                if (expired || left() <= 0) {
+                    counts.complete = false
+                    return
+                }
                 const rows = await this.messagesCollection
                     .find(
-                        { instanceId: this.instanceId, 'key.remoteJid': normalizedLid },
-                        { projection: { _id: 1, jid: 1, 'key.remoteJidAlt': 1 }, limit: maxRows, maxTimeMS: maxMs }
+                        { instanceId: this.instanceId, jid: normalizedLid, 'key.remoteJid': normalizedLid },
+                        { projection: { _id: 1, 'key.remoteJidAlt': 1 }, limit: maxRows + 1, maxTimeMS: Math.max(1, left()) }
                     )
                     .toArray()
+                if (rows.length > maxRows) {
+                    counts.complete = false
+                    rows.length = maxRows
+                }
 
-                for (const row of rows) {
-                    if (Date.now() - started > maxMs) break
+                for (let i = 0; i < rows.length; i++) {
+                    if (expired || left() <= 0) {
+                        counts.complete = false
+                        counts.remaining += rows.length - i
+                        break
+                    }
+                    const row = rows[i]
                     const alt = (row as any).key?.remoteJidAlt
-                    if (alt && alt !== normalizedLid && canonicalPhoneJid(alt) !== phone) {
+                    if (alt !== undefined && alt !== null && alt !== normalizedLid && canonicalPhoneJid(alt) !== phone) {
                         counts.skipped++
                         continue
                     }
                     try {
                         const result = await this.messagesCollection.updateOne(
-                            { _id: row._id, instanceId: this.instanceId, jid: (row as any).jid, 'key.remoteJid': normalizedLid },
+                            {
+                                _id: row._id,
+                                instanceId: this.instanceId,
+                                jid: normalizedLid,
+                                'key.remoteJid': normalizedLid,
+                                'key.remoteJidAlt': alt === undefined ? { $exists: false } : alt
+                            },
                             {
                                 $set: {
                                     jid: phone,
@@ -1202,22 +1226,41 @@ export class LidHandler {
                                     'lidMapping.resolved': true,
                                     'lidMapping.resolvedAt': new Date()
                                 }
-                            }
+                            },
+                            { maxTimeMS: Math.max(1, left()) }
                         )
-                        counts.updated += result.modifiedCount
+                        if (result.modifiedCount === 1) counts.updated++
+                        else counts.skipped++
                     } catch (error: any) {
                         if (error?.code !== 11000) throw error
                         counts.skipped++
                     }
                 }
-
-                if (counts.updated || counts.skipped) {
-                    console.log(`[LidHandler] Re-keyed ${counts.updated} older messages; skipped ${counts.skipped}`)
-                }
             },
             undefined,
             'updateExistingMessages'
         )
+
+        // The deadline also bounds connection preparation and a stalled driver call. After it
+        // expires the loop above starts no further write; an in-flight guarded write may still land.
+        let timer: NodeJS.Timeout | undefined
+        const timeout = new Promise<'timeout'>((resolve) => {
+            timer = setTimeout(() => resolve('timeout'), Math.max(0, left()))
+            timer.unref?.()
+        })
+        try {
+            if ((await Promise.race([work, timeout])) === 'timeout') {
+                expired = true
+                counts.complete = false
+                work.catch(() => {})
+            }
+        } finally {
+            if (timer) clearTimeout(timer)
+        }
+
+        if (counts.updated || counts.skipped || !counts.complete) {
+            console.log(`[LidHandler] Re-keyed ${counts.updated} older messages; skipped ${counts.skipped}; remaining ${counts.remaining}; complete ${counts.complete}`)
+        }
         return counts
     }
 
