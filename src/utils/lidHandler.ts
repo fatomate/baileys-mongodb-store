@@ -1178,7 +1178,8 @@ export class LidHandler {
         const left = () => deadline - Date.now()
         let expired = false
 
-        const work = this.withConnectionCheck(
+        const CONNECTION_LOST = Symbol('connectionLost')
+        const work = this.withConnectionCheck<void | typeof CONNECTION_LOST>(
             async () => {
                 if (!this.messagesCollection) return
                 if (expired || left() <= 0) {
@@ -1237,7 +1238,7 @@ export class LidHandler {
                     }
                 }
             },
-            undefined,
+            CONNECTION_LOST,
             'updateExistingMessages'
         )
 
@@ -1249,10 +1250,13 @@ export class LidHandler {
             timer.unref?.()
         })
         try {
-            if ((await Promise.race([work, timeout])) === 'timeout') {
+            const outcome = await Promise.race([work, timeout])
+            if (outcome === 'timeout') {
                 expired = true
                 counts.complete = false
                 work.catch(() => {})
+            } else if (outcome === CONNECTION_LOST) {
+                counts.complete = false
             }
         } finally {
             if (timer) clearTimeout(timer)

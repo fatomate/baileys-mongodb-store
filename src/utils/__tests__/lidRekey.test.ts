@@ -134,6 +134,24 @@ describe('updateExistingMessages', () => {
         expect(await byId('e1')).toMatchObject({ jid: LID })
     })
 
+    it('reports an incomplete pass when the connection is lost', async () => {
+        await messages(h).insertOne(row('n1'))
+        const real = (handler as any).messagesCollection as Collection
+        ;(handler as any).messagesCollection = new Proxy(real, {
+            get(target, prop) {
+                if (prop === 'find') return () => ({
+                    toArray: async () => {
+                        throw Object.assign(new Error('Client must be connected before running operations'), { name: 'MongoNotConnectedError' })
+                    },
+                })
+                const value = Reflect.get(target, prop)
+                return typeof value === 'function' ? value.bind(target) : value
+            },
+        })
+        const result = await handler.updateExistingMessages(LID, PHONE)
+        expect(result).toMatchObject({ updated: 0, complete: false })
+    })
+
     it('reports an incomplete pass when more rows than the row budget exist', async () => {
         await messages(h).insertMany([row('b1'), row('b2'), row('b3')])
         const result = await handler.updateExistingMessages(LID, PHONE, { maxRows: 2 })

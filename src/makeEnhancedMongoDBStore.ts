@@ -199,6 +199,10 @@ const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
     return true
 }
 
+// WAB-859: messages whose LID mapping the messages.upsert handler already stored, so
+// upsertMessage does not write the same mapping a second time.
+const lidMappingStoredFor = new WeakSet<object>()
+
 // WAB-859 (port of esm a597c70): copy each messages.upsert message before the first await,
 // so other listeners that change the shared object cannot change the stored identity.
 // Keeps Buffers, typed arrays, dates, prototypes and circular references.
@@ -4774,17 +4778,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // WAB-859: a key that carries a LID and a valid phone is stored phone-primary
                 // (phone remoteJid, LID remoteJidAlt, addressingMode pn), for every caller.
+                // The mapping is stored after validation and authorization, below.
                 const identity = resolveStorageIdentity(clonedMessage.key)
                 if (identity) {
                     clonedMessage.key = { ...clonedMessage.key, remoteJid: identity.phone, remoteJidAlt: identity.lid, addressingMode: 'pn' }
                     jid = identity.phone
-                    if (lidHandler) {
-                        try {
-                            await lidHandler.storeLidMapping(identity.lid, identity.phone)
-                        } catch {
-                            logWarn(`[${instanceId}] [LID] Mapping storage failed; the message is still saved under the phone jid`)
-                        }
-                    }
                 }
 
                 // Normalize JID through LID handler if available
@@ -4805,6 +4803,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 // Check write permissions
                 accessContext.validateAccess(validatedInstanceId, 'write')
+
+                if (identity && lidHandler && !lidMappingStoredFor.has(message as object)) {
+                    try {
+                        await lidHandler.storeLidMapping(identity.lid, identity.phone)
+                    } catch {
+                        logWarn(`[${instanceId}] [LID] Mapping storage failed; the message is still saved under the phone jid`)
+                    }
+                }
                 
                 const cacheKey = `msg_${validatedInstanceId}_${hashForLogging(validJid)}_${clonedMessage.key?.id ? hashForLogging(clonedMessage.key.id) : ''}`
             binaryConversionCache.del(cacheKey)
@@ -5868,7 +5874,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 if (identity) {
                                     log(`[LID] Pattern ${addressingMode === 'pn' ? 'A' : 'B'}: trusted LID and phone pair in the message key`)
                                     await storeMappingBestEffort(identity.lid, identity.phone, isFromMe ? undefined : (msg.pushName || msg.verifiedBizName))
-                                    jid = identity.phone
+                                    lidMappingStoredFor.add(msg)
+                                    // The event payload (lidDebug, afterStore hooks) matches the stored key.
+                                    adoptPhone(identity.lid, identity.phone)
                                     rekey = identity
                                 }
                                 // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn

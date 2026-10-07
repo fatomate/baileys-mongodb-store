@@ -10,6 +10,8 @@ import { Collection } from 'mongodb'
 import { WebMessageInfo } from './helpers/baileysDouble'
 import { Harness, INSTANCE, JID, S, baseStoreConfig, messages, startMongo, storedTimestamp } from './helpers/storeHarness'
 import { makeEnhancedMongoDBStore } from '../makeEnhancedMongoDBStore'
+import { LidHandler } from '../utils/lidHandler'
+import { InstanceAccessContext } from '../utils/auth'
 
 jest.setTimeout(60000)
 
@@ -320,6 +322,36 @@ describe('upsertMessage storage jid', () => {
         expect(rows).toHaveLength(1)
         expect(rows[0].jid).toBe(PHONE)
         expect(rows[0].message).toEqual({ conversation: 'u5' })
+    })
+})
+
+describe('LID mapping side effects (PR review)', () => {
+    it('upsertMessage stores no mapping when the write is not authorized', async () => {
+        const spy = jest.spyOn(LidHandler.prototype, 'storeLidMapping')
+        jest.spyOn(InstanceAccessContext.prototype, 'validateAccess').mockImplementationOnce(() => {
+            throw new Error('Instance not in allowed list')
+        })
+        await expect(store.upsertMessage(LID, liveMessage('denied1', { remoteJid: LID, remoteJidAlt: PHONE, addressingMode: 'lid' }))).rejects.toThrow('upsertMessage')
+        expect(spy).not.toHaveBeenCalled()
+        expect(await findByKeyId('denied1')).toHaveLength(0)
+    })
+
+    it('a Pattern A event stores the mapping once', async () => {
+        const spy = jest.spyOn(LidHandler.prototype, 'storeLidMapping')
+        ev.emit('messages.upsert', { type: 'notify', messages: [liveMessage('once1', { remoteJid: PHONE, remoteJidAlt: LID, addressingMode: 'pn' })] })
+        await waitFor(async () => (await findByKeyId('once1')).length > 0)
+        await settle()
+        expect(spy).toHaveBeenCalledTimes(1)
+    })
+
+    it('a Pattern B event payload matches the stored phone-primary key', async () => {
+        ev.emit('messages.upsert', { type: 'notify', messages: [liveMessage('pbh1', { remoteJid: LID, remoteJidAlt: PHONE, addressingMode: 'lid' })] })
+        const [row] = await waitFor(async () => {
+            const rows = await findByKeyId('pbh1')
+            return rows.length ? rows : null
+        })
+        expect(row.key).toMatchObject({ remoteJid: PHONE, remoteJidAlt: LID, addressingMode: 'pn' })
+        expect(row.lidDebug).toMatchObject({ originalRemoteJid: LID, normalized: true })
     })
 })
 
