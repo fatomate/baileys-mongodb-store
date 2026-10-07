@@ -39,7 +39,7 @@ import { TTLMonitor } from './utils/ttl'
 import { downloadMedia, downloadOfficialAPIMedia, cleanupOldMedia, getMediaStats, extractMediaInfo } from './utils/media'
 import { LidHandler } from './utils/lidHandler'
 import type { LidMapping } from './utils/lidHandler'
-import { areJidsEquivalent, isLidAndPhonePair } from './utils/jidUtils'
+import { areJidsEquivalent, isLidAndPhonePair, canonicalPhoneJid, resolveStorageIdentity } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
 import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
@@ -49,7 +49,7 @@ import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/co
 import type { ConnectionConfig, ConnectionManagerConfig } from './types/connection'
 import { EventEmitter } from 'events'
 import { SharedQueueManager, JobType, SharedQueueManagerConfig } from './utils/sharedQueueManager'
-import { normalizeMessageTimestamp, wrapMessageWrites } from './utils/messageTimestamp'
+import { normalizeMessageTimestamp, wrapMessageWrites, writeMessageUpdate } from './utils/messageTimestamp'
 
 // Declare Node.js globals if not available in tsconfig
 declare global {
@@ -197,6 +197,44 @@ const shouldLogOnce = (key: string, ttlSeconds: number = 2): boolean => {
     }
     logThrottleCache.set(key, true, ttlSeconds)
     return true
+}
+
+// WAB-859 (port of esm a597c70): copy each messages.upsert message before the first await,
+// so other listeners that change the shared object cannot change the stored identity.
+// Keeps Buffers, typed arrays, dates, prototypes and circular references.
+const cloneMessageForListener = <T>(message: T): T => {
+    const seen = new WeakMap<object, unknown>()
+    const cloneValue = (value: unknown): unknown => {
+        if (Buffer.isBuffer(value)) return Buffer.from(value)
+        if (value instanceof Uint8Array) return new Uint8Array(value)
+        if (value instanceof Date) return new Date(value.getTime())
+        if (Array.isArray(value)) {
+            const existing = seen.get(value)
+            if (existing) return existing
+            const clone: unknown[] = []
+            seen.set(value, clone)
+            for (const item of value) clone.push(cloneValue(item))
+            return clone
+        }
+        if (value && typeof value === 'object') {
+            const existing = seen.get(value)
+            if (existing) return existing
+            const source = value as Record<PropertyKey, unknown>
+            const clone = Object.create(Object.getPrototypeOf(value)) as Record<PropertyKey, unknown>
+            seen.set(value, clone)
+            for (const key of Reflect.ownKeys(source)) {
+                const descriptor = Object.getOwnPropertyDescriptor(source, key)
+                if (!descriptor) continue
+                Object.defineProperty(clone, key, {
+                    ...descriptor,
+                    ...('value' in descriptor ? { value: cloneValue(descriptor.value) } : {})
+                })
+            }
+            return clone
+        }
+        return value
+    }
+    return cloneValue(message) as T
 }
 
 // Helper function to convert MongoDB Binary objects to Buffers
@@ -1428,15 +1466,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 return { success: true, type: 'upsert' }
             } else if (type === 'update' && update) {
-                // Update message
+                // Update message (WAB-859: a non-edit update keeps an existing valid time)
+                const isEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
                 await withConnection(async () =>
-                    collections.messages.updateOne(
-                        {
-                            instanceId: validatedInstanceId,
-                            jid,
-                            'key.id': messageId
-                        },
-                        { $set: { ...update, updatedAt: new Date() } }
+                    writeMessageUpdate(
+                        collections.messages,
+                        { instanceId: validatedInstanceId, jid, 'key.id': messageId },
+                        { ...update, updatedAt: new Date() },
+                        { isEdit }
                     )
                 )
                 return { success: true, type: 'update' }
@@ -2407,33 +2444,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             }
                             
                             await withConnection(async () =>
-                                collections.messages.updateOne(
-                                    {
-                                        instanceId,
-                                        jid,
-                                        'key.id': messageId
-                                    },
-                                    {
-                                        $set: { 
-                                            ...finalUpdate,
-                                            message: mergedMessage,
-                                            updatedAt: new Date() 
-                                        }
-                                    }
+                                writeMessageUpdate(
+                                    collections.messages,
+                                    { instanceId, jid, 'key.id': messageId },
+                                    { ...finalUpdate, message: mergedMessage, updatedAt: new Date() },
+                                    { isEdit: isMessageEdit }
                                 )
                             )
                         } else {
                             // No existing quoted message, proceed with update
                             await withConnection(async () =>
-                                collections.messages.updateOne(
-                                    {
-                                        instanceId,
-                                        jid,
-                                        'key.id': messageId
-                                    },
-                                    {
-                                        $set: { ...finalUpdate, updatedAt: new Date() }
-                                    }
+                                writeMessageUpdate(
+                                    collections.messages,
+                                    { instanceId, jid, 'key.id': messageId },
+                                    { ...finalUpdate, updatedAt: new Date() },
+                                    { isEdit: isMessageEdit }
                                 )
                             )
                         }
@@ -4747,6 +4772,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
                 
+                // WAB-859: a key that carries a LID and a valid phone is stored phone-primary
+                // (phone remoteJid, LID remoteJidAlt, addressingMode pn), for every caller.
+                const identity = resolveStorageIdentity(clonedMessage.key)
+                if (identity) {
+                    clonedMessage.key = { ...clonedMessage.key, remoteJid: identity.phone, remoteJidAlt: identity.lid, addressingMode: 'pn' }
+                    jid = identity.phone
+                    if (lidHandler) {
+                        try {
+                            await lidHandler.storeLidMapping(identity.lid, identity.phone)
+                        } catch {
+                            logWarn(`[${instanceId}] [LID] Mapping storage failed; the message is still saved under the phone jid`)
+                        }
+                    }
+                }
+
                 // Normalize JID through LID handler if available
                 // Note: Message object LID processing is done in the messages.upsert event handler
                 let normalizedJid = jid
@@ -5099,16 +5139,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             }
             
+            // WAB-859: a non-edit update (for example a read receipt) keeps an existing valid time.
+            const isEdit = !!(update.message?.editedMessage || (update as any).editedMessage)
             const result = await withConnection(async () =>
-                collections.messages.updateOne(
-                    {
-                        instanceId,
-                        jid: normalizedJid,
-                    'key.id': id
-                },
-                {
-                    $set: { ...finalUpdate, updatedAt: new Date() }
-                }
+                writeMessageUpdate(
+                    collections.messages,
+                    { instanceId, jid: normalizedJid, 'key.id': id },
+                    { ...finalUpdate, updatedAt: new Date() },
+                    { isEdit }
                 )
             )
             
@@ -5704,8 +5742,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Messages upsert - CRITICAL for storing messages including polls
             const messagesUpsertHandler = async ({ messages }: any) => {
                 if (enableMetrics) updateEventMetrics('messages.upsert', 'received')
+                const messageSnapshots = messages.map(cloneMessageForListener)
                 
-                for (const msg of messages) {
+                for (const msg of messageSnapshots) {
                     let jid = msg.key.remoteJid
                     if (!jid) continue
                     
@@ -5797,6 +5836,22 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         try {
                             // Enhanced LID handling with complete pattern support
                             // Supports both new format (remoteJidAlt + addressingMode) and legacy (senderLid + senderPn)
+                            // WAB-859: LID addresses are moved to the phone jid only from trusted message
+                            // evidence with a valid phone. Old rows are re-keyed after the new message is saved.
+                            let rekey: { lid: string; phone: string } | null = null
+                            const adoptPhone = (lid: string, phone: string) => {
+                                msg.key.remoteJid = phone
+                                ;(msg.key as any).remoteJidAlt = lid
+                                ;(msg.key as any).addressingMode = 'pn'
+                                jid = phone
+                            }
+                            const storeMappingBestEffort = async (lid: string, phone: string, pushName?: string) => {
+                                try {
+                                    await lidHandler!.storeLidMapping(lid, phone, pushName)
+                                } catch {
+                                    logWarn(`[${instanceId}] [LID] Mapping storage failed; the message is still saved under the phone jid`)
+                                }
+                            }
                             if (lidHandler) {
                                 const isFromMe = msg.key.fromMe || false
                                 const remoteJid = msg.key.remoteJid
@@ -5805,106 +5860,75 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 // NEW FORMAT: Extract remoteJidAlt and addressingMode
                                 const addressingMode = (msg.key as any)?.addressingMode
                                 const remoteJidAlt = (msg.key as any)?.remoteJidAlt
+                                const identity = resolveStorageIdentity(msg.key)
+                                const senderPhone = canonicalPhoneJid(senderPn)
                                 
-                                // NEW PATTERN A: addressingMode='pn' - Incoming message (customer to bot)
-                                // remoteJid is phone number, remoteJidAlt is LID
-                                if (addressingMode === 'pn' && remoteJidAlt && lidHandler.isLidFormat(remoteJidAlt) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
-                                    log(`[LID] New Pattern A: addressingMode=pn, remoteJid=phone, remoteJidAlt=lid`)
-                                    log(`[LID] Discovering: ${remoteJidAlt} -> ${remoteJid}`)
-                                    
-                                    // Store the mapping (lid -> phone)
-                                    await lidHandler.storeLidMapping(remoteJidAlt, remoteJid, msg.pushName || msg.verifiedBizName)
-                                    
-                                    // jid is already the phone number, no change needed
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJidAlt, remoteJid)
-                                }
-                                // NEW PATTERN B: addressingMode='lid' - Outgoing message (bot to customer, sent from phone)
-                                // remoteJid is LID, remoteJidAlt is phone number
-                                else if (addressingMode === 'lid' && remoteJidAlt && !lidHandler.isLidFormat(remoteJidAlt) && remoteJid && lidHandler.isLidFormat(remoteJid)) {
-                                    log(`[LID] New Pattern B: addressingMode=lid, remoteJid=lid, remoteJidAlt=phone`)
-                                    log(`[LID] Discovering: ${remoteJid} -> ${remoteJidAlt}`)
-                                    
-                                    // Store the mapping (lid -> phone)
-                                    // Outgoing message: do not persist pushName (it's our own)
-                                    await lidHandler.storeLidMapping(remoteJid, remoteJidAlt)
-                                    
-                                    // Update message to use phone number
-                                    msg.key.remoteJid = remoteJidAlt
-                                    jid = remoteJidAlt
-                                    
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJid, remoteJidAlt)
+                                // NEW PATTERNS A and B: the key carries both the LID and a valid phone.
+                                // upsertMessage stores the phone-primary key; the handler only picks the jid.
+                                if (identity) {
+                                    log(`[LID] Pattern ${addressingMode === 'pn' ? 'A' : 'B'}: trusted LID and phone pair in the message key`)
+                                    await storeMappingBestEffort(identity.lid, identity.phone, isFromMe ? undefined : (msg.pushName || msg.verifiedBizName))
+                                    jid = identity.phone
+                                    rekey = identity
                                 }
                                 // LEGACY Pattern 1: FromMe=false with LID remoteJid and phone number in senderPn
-                                else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPn && !lidHandler.isLidFormat(senderPn)) {
+                                else if (!isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid) && senderPhone) {
                                     log(`[LID] Legacy Pattern 1: FromMe=false, LID remoteJid with phone in senderPn`)
-                                    log(`[LID] Discovering: ${remoteJid} -> ${senderPn}`)
-                                    
-                                    // Store the mapping
-                                    await lidHandler.storeLidMapping(remoteJid, senderPn, msg.pushName || msg.verifiedBizName)
-                                    
-                                    // Update message to use phone number
-                                    msg.key.remoteJid = senderPn
-                                    jid = senderPn
-                                    
-                                    // Update existing messages with this LID
-                                    await lidHandler.updateExistingMessages(remoteJid, senderPn)
+                                    await storeMappingBestEffort(remoteJid, senderPhone, msg.pushName || msg.verifiedBizName)
+                                    adoptPhone(remoteJid, senderPhone)
+                                    rekey = { lid: remoteJid, phone: senderPhone }
                                 }
                                 // LEGACY Pattern 2: FromMe=true with LID remoteJid (both remoteJid and senderPn are LID)
                                 else if (isFromMe && remoteJid && lidHandler.isLidFormat(remoteJid)) {
                                     log(`[LID] Legacy Pattern 2: FromMe=true, LID remoteJid (need reverse lookup)`)
                                     
                                     // First check if we already have a mapping
-                                    let phoneNumber = await lidHandler.getPhoneNumberFromLid(remoteJid)
+                                    let phoneNumber = canonicalPhoneJid(await lidHandler.getPhoneNumberFromLid(remoteJid))
                                     
                                     // If no mapping, try reverse lookup from previous messages
                                     if (!phoneNumber) {
-                                        log(`[LID] No cached mapping, attempting reverse lookup for ${remoteJid}`)
-                                        phoneNumber = await lidHandler.reversePhoneLookupFromMessages(remoteJid)
+                                        log(`[LID] No cached mapping, attempting reverse lookup`)
+                                        phoneNumber = canonicalPhoneJid(await lidHandler.reversePhoneLookupFromMessages(remoteJid))
                                         
                                         if (phoneNumber) {
-                                            log(`[LID] Reverse lookup found: ${remoteJid} -> ${phoneNumber}`)
+                                            log(`[LID] Reverse lookup found a valid phone`)
                                             // Outgoing message: do not persist pushName (it's our own)
-                                            await lidHandler.storeLidMapping(remoteJid, phoneNumber)
-                                            await lidHandler.updateExistingMessages(remoteJid, phoneNumber)
+                                            await storeMappingBestEffort(remoteJid, phoneNumber)
+                                            rekey = { lid: remoteJid, phone: phoneNumber }
                                         }
                                     }
                                     
                                     // Update message if we found the phone number
                                     if (phoneNumber) {
-                                        log(`[LID] Normalizing fromMe message: ${remoteJid} -> ${phoneNumber}`)
-                                        msg.key.remoteJid = phoneNumber
-                                        jid = phoneNumber
+                                        log(`[LID] Normalizing fromMe message to the phone jid`)
+                                        adoptPhone(remoteJid, phoneNumber)
                                     } else {
-                                        log(`[LID] Warning: Could not resolve LID ${remoteJid} for fromMe message`)
+                                        log(`[LID] Warning: Could not resolve a LID for a fromMe message`)
                                     }
                                 }
                                 // Pattern X: FromMe=false, senderLid present and remoteJid already a phone number
                                 // Proactively store mapping with pushName
-                                else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && remoteJid && !lidHandler.isLidFormat(remoteJid)) {
+                                else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && canonicalPhoneJid(remoteJid)) {
                                     log(`[LID] Pattern X: FromMe=false, senderLid with phone remoteJid`)
-                                    await lidHandler.storeLidMapping(senderLid, remoteJid, msg.pushName || msg.verifiedBizName)
+                                    await storeMappingBestEffort(senderLid, canonicalPhoneJid(remoteJid)!, msg.pushName || msg.verifiedBizName)
                                 }
                                 // Pattern 3: FromMe=false with only senderLid (no phone yet)
                                 else if (!isFromMe && senderLid && lidHandler.isLidFormat(senderLid) && !senderPn) {
                                     log(`[LID] Pattern 3: FromMe=false, only senderLid (waiting for phone discovery)`)
                                     
                                     // Check if we have a cached mapping
-                                    const phoneNumber = await lidHandler.getPhoneNumberFromLid(senderLid)
+                                    const phoneNumber = canonicalPhoneJid(await lidHandler.getPhoneNumberFromLid(senderLid))
                                     if (phoneNumber && remoteJid && lidHandler.isLidFormat(remoteJid)) {
-                                        log(`[LID] Using cached mapping: ${remoteJid} -> ${phoneNumber}`)
-                                        msg.key.remoteJid = phoneNumber
-                                        jid = phoneNumber
+                                        log(`[LID] Using cached mapping`)
+                                        adoptPhone(remoteJid, phoneNumber)
                                     }
                                 }
                                 // Pattern 4: Standard normalization for any remaining LID formats
                                 else if (remoteJid && lidHandler.isLidFormat(remoteJid)) {
-                                    const phoneNumber = await lidHandler.getPhoneNumberFromLid(remoteJid)
+                                    const phoneNumber = canonicalPhoneJid(await lidHandler.getPhoneNumberFromLid(remoteJid))
                                     if (phoneNumber) {
-                                        log(`[LID] Standard normalization: ${remoteJid} -> ${phoneNumber}`)
-                                        msg.key.remoteJid = phoneNumber
-                                        jid = phoneNumber
+                                        log(`[LID] Standard normalization from a stored mapping`)
+                                        adoptPhone(remoteJid, phoneNumber)
                                     }
                                 }
                                 
@@ -6012,6 +6036,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 await storeImpl.upsertMessage(jid, msg)
                             } else {
                                 log(`[Warning] Skipping message storage - no valid JID for message ${msg.key?.id}`)
+                            }
+
+                            // WAB-859: re-key old LID rows only after the new message is saved. The re-key is
+                            // bounded and best-effort; a failure never undoes or blocks the save.
+                            if (rekey && lidHandler) {
+                                try {
+                                    await lidHandler.updateExistingMessages(rekey.lid, rekey.phone)
+                                } catch (error) {
+                                    logWarn(`[${instanceId}] [LID] Re-key of older messages failed: ${(error as any)?.codeName || (error as any)?.name || 'Error'}`)
+                                }
                             }
                             
                             // Handle media download if configured

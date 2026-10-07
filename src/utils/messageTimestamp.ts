@@ -4,7 +4,7 @@
 // MongoDB orders strings after numbers and range queries only match one BSON type,
 // so every write normalizes here.
 import { BSON, Long } from 'mongodb'
-import type { Collection, Document } from 'mongodb'
+import type { Collection, Document, Filter, UpdateResult } from 'mongodb'
 
 const MS_THRESHOLD = 9999999999n
 const INT32_MAX = 2147483647n
@@ -168,4 +168,40 @@ export const wrapMessageWrites = <T extends Document>(
             return typeof value === 'function' ? value.bind(obj) : value
         },
     }) as Collection<T>
+}
+
+const TS_TYPE = { $type: '$messageTimestamp' }
+
+/**
+ * WAB-859: apply a message update without moving an existing valid send time.
+ * Baileys receipts (rc13+) and merged whole-message patches carry a later time; a non-edit
+ * update therefore never changes a stored time that normalizes to a valid value. If the stored
+ * time is missing or invalid, the incoming valid time fills it with a compare-and-set on the
+ * exact stored value and BSON type, so a time another writer stored first is kept.
+ * Edits pass straight through: their callers already resolved the preserved time.
+ */
+export const writeMessageUpdate = async (
+    collection: Collection<any>,
+    filter: Filter<any>,
+    set: Document,
+    options: { isEdit?: boolean } = {}
+): Promise<UpdateResult> => {
+    if (options.isEdit || !Object.prototype.hasOwnProperty.call(set, 'messageTimestamp')) {
+        return collection.updateOne(filter, { $set: set })
+    }
+    const { messageTimestamp: incoming, ...rest } = set
+    const result = await collection.updateOne(filter, { $set: rest })
+    if (normalizeMessageTimestamp(incoming) === undefined) return result
+
+    const [stored] = await collection.aggregate(
+        [{ $match: filter }, { $limit: 1 }, { $project: { _id: 1, t: TS_TYPE, v: '$messageTimestamp' } }],
+        { promoteValues: false }
+    ).toArray()
+    if (!stored || normalizeMessageTimestamp(stored.v) !== undefined) return result
+
+    const unchanged = stored.t === 'missing'
+        ? { messageTimestamp: { $exists: false } }
+        : { $expr: { $and: [{ $eq: [TS_TYPE, stored.t] }, { $eq: ['$messageTimestamp', { $literal: stored.v }] }] } }
+    await collection.updateOne({ _id: stored._id, ...unchanged }, { $set: { messageTimestamp: incoming } })
+    return result
 }
