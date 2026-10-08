@@ -6095,9 +6095,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     }, '🔍 DEBUG: Media download detection')
                                 }
                                 
-                                // Prefer background queue when available
+                                // WAB-866: Baileys media is downloaded inline only. Official API media is also
+                                // queued here (unchanged); the inline download below runs for both.
                                 const mediaInfo = extractMediaInfo(msg)
-                                if (mediaInfo && sharedQueueManager && useSharedQueues) {
+                                if (isOfficialAPI && mediaInfo && sharedQueueManager && useSharedQueues) {
                                     try {
                                         const queueAttempts = config.media?.maxRetries ? Math.max(config.media.maxRetries, 3) : 5
                                         const backoffDelay = config.media?.retryDelay ?? 1000
@@ -6112,13 +6113,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             }
                                         )
                                         log(`📥 Media download queued for message ${msg.key?.id}`)
-                                        // Do not also attempt inline; queue will update DB when done
                                     } catch (e) {
                                         logError(`❌ Failed to queue media download, falling back inline:`, e)
                                     }
                                 }
 
-                                // Fallback inline behavior
+                                // Inline download
                                 let mediaResult
                                 if (isOfficialAPI) {
                                     config.logger?.info({ 

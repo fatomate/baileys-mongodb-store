@@ -833,40 +833,10 @@ export class SharedQueueManager extends EventEmitter {
         this.log('info', '🛑 SharedQueueManager: Starting graceful shutdown...')
         
         try {
-            // Stop accepting new jobs
-            for (const queue of this.queues.values()) {
-                await queue.pause()
-            }
-            
-            // Wait for active jobs to complete (max 30 seconds)
-            const shutdownTimeout = 30000
-            const startTime = Date.now()
-            
-            while (Date.now() - startTime < shutdownTimeout) {
-                let hasActiveJobs = false
-                
-                for (const [queueName] of this.workers) {
-                    // Check for active jobs in the queue
-                    const queue = this.queues.get(queueName)!
-                    const counts = await queue.getJobCounts()
-                    if (counts.active > 0) {
-                        hasActiveJobs = true
-                        break
-                    }
-                }
-                
-                if (!hasActiveJobs) {
-                    break
-                }
-                
-                this.log('info', '⏳ Waiting for active jobs to complete...')
-                await new Promise(resolve => setTimeout(resolve, 1000))
-            }
-            
-            // Close workers
-            for (const worker of this.workers.values()) {
-                await worker.close()
-            }
+            // WAB-866: stop only this process's workers. Worker.close() stops fetching and waits for
+            // this worker's active jobs. Do not use Queue.pause(): it pauses the shared queue for
+            // every worker on this Redis and nothing resumes it.
+            await Promise.all(Array.from(this.workers.values()).map((worker) => worker.close()))
             
             // Close queue events
             for (const queueEvents of this.queueEvents.values()) {
