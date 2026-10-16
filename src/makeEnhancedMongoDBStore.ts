@@ -41,7 +41,10 @@ import { LidHandler } from './utils/lidHandler'
 import type { LidMapping } from './utils/lidHandler'
 import { areJidsEquivalent, isLidAndPhonePair, canonicalPhoneJid, resolveStorageIdentity } from './utils/jidUtils'
 import { ConnectionManager, getConnectionManager } from './utils/connectionManager'
-import { retryWithBackoff, isRetryableError, RetryOptions } from './utils/connectionRetry'
+import { retryWithBackoff, isRetryableError, RetryOptions, StoreClosedError } from './utils/connectionRetry'
+import { errorKind, reportBurst } from './utils/burstLog'
+import { createTaskLimiter } from './utils/taskLimiter'
+import { randomUUID } from 'crypto'
 import { ConnectionHealthMonitor } from './utils/connectionHealth'
 import { safeDropIndex, batchCreateIndexes, recreateIndexes } from './utils/indexHelper'
 import { shouldCreateIndexes, IndexSpec, clearCollectionCache } from './utils/collectionHelper'
@@ -739,6 +742,17 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let isUsingSharedConnection = false
     let currentSharedPoolId: string | null = null
     let reconnectAttempts = 0
+    // WAB-978 lifecycle state:
+    // - storeClosed: close() finished draining; every operation rejects with StoreClosedError.
+    // - ownerId: this store's lease on a shared pool. Duplicate stores of one instance have different leases.
+    // - ownsClient: true only for a dedicated client. A store never closes a shared pool client.
+    // - reconnectPromise: the one reconnect in flight. All callers wait on it.
+    // - connectionGeneration: increments on each reconnect; stale signals from an older client are ignored.
+    let storeClosed = false
+    const ownerId = `${instanceId}:${randomUUID()}`
+    let ownsClient = false
+    let reconnectPromise: Promise<void> | null = null
+    let connectionGeneration = 0
     
     // Connection state management
     enum MongoConnectionState {
@@ -759,7 +773,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const connectionCheckInterval = connectionManagerOverrides?.monitoringInterval ?? 60000
     let lastSuccessfulPing = 0
 
-    const markConnectionStale = (reason: string, error?: unknown) => {
+    const markConnectionStale = (reason: string, error?: unknown, observedGeneration?: number) => {
+        // WAB-978: a reconnect in flight already replaces the client, and a failure seen on an
+        // older client must not discard a newer one. Either case would start extra reconnects.
+        if (reconnectPromise) return
+        if (observedGeneration !== undefined && observedGeneration !== connectionGeneration) return
         const err = error instanceof Error ? error : new Error(reason)
         lastSuccessfulPing = 0
         mongoConnectionState = MongoConnectionState.DISCONNECTED
@@ -832,12 +850,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 instanceId: validatedInstanceId,
                 uri,
                 database: dbName,
-                config: connectionConfig
+                config: connectionConfig,
+                ownerId
             })
             
             client = connection.client
             db = connection.db
             isUsingSharedConnection = true
+            ownsClient = false
             currentSharedPoolId = connection.poolId
             mongoConnectionState = MongoConnectionState.CONNECTED
             lastSuccessfulPing = Date.now()
@@ -856,8 +876,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             await client.connect()
             db = client.db(dbName)
             isUsingSharedConnection = false
+            ownsClient = true
             connectionManager = null
             currentSharedPoolId = null
+            mongoConnectionState = MongoConnectionState.CONNECTED
             lastSuccessfulPing = Date.now()
         }
     } else {
@@ -870,6 +892,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         })
         await client.connect()
         db = client.db(dbName)
+        ownsClient = true
         mongoConnectionState = MongoConnectionState.CONNECTED
         currentSharedPoolId = null
         lastSuccessfulPing = Date.now()
@@ -925,12 +948,136 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     let collections = getCollections()
     
     // Ensure connection is active before operations with enhanced error handling
+    const assertOpen = (): void => {
+        if (storeClosed) {
+            throw new StoreClosedError(validatedInstanceId)
+        }
+    }
+
+    // WAB-978: called after each await of a reconnect. If close() finished meanwhile, give back
+    // what the reconnect acquired (a late shared lease or a new dedicated client) and stop.
+    const releaseIfClosed = async (acquired: { manager?: ConnectionManager | null; dedicatedClient?: MongoClient }): Promise<void> => {
+        if (!storeClosed) return
+        if (acquired.manager) {
+            await acquired.manager.unregisterInstance(validatedInstanceId, ownerId).catch(() => {})
+        }
+        if (acquired.dedicatedClient) {
+            await acquired.dedicatedClient.close().catch(() => {})
+        }
+        throw new StoreClosedError(validatedInstanceId)
+    }
+
+    const connectDedicated = async (): Promise<void> => {
+        const next = new MongoClient(uri, {
+            maxPoolSize: dedicatedMaxPoolSize,
+            minPoolSize: dedicatedMinPoolSize,
+            maxIdleTimeMS: 30000,
+            writeConcern: { w: 1, j: false }
+        })
+        await next.connect()
+        await releaseIfClosed({ dedicatedClient: next })
+        client = next
+        db = next.db(dbName)
+        isUsingSharedConnection = false
+        ownsClient = true
+        currentSharedPoolId = null
+    }
+
+    const reinitializeLidHandler = async (): Promise<void> => {
+        if (!lidHandler) return
+        const reinitResult = await retryWithBackoff(
+            () => lidHandler!.initialize(db, collectionPrefix),
+            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
+            (attempt, error, delay) => {
+                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
+            }
+        )
+        if (!reinitResult.success) {
+            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
+        }
+    }
+
+    // The one reconnect. Only ensureConnection starts it, through reconnectPromise.
+    const reconnectNow = async (): Promise<void> => {
+        mongoConnectionState = reconnectAttempts > 0 ? MongoConnectionState.RECONNECTING : MongoConnectionState.CONNECTING
+        // close() may clear connectionManager while this reconnect waits; keep the manager that holds the lease
+        const manager = useSharedConnections ? connectionManager : null
+        try {
+            if (manager) {
+                try {
+                    const connection = await manager.registerInstance({
+                        instanceId: validatedInstanceId,
+                        uri,
+                        database: dbName,
+                        config: connectionConfig,
+                        ownerId
+                    })
+                    await releaseIfClosed({ manager })
+                    client = connection.client
+                    db = connection.db
+                    isUsingSharedConnection = true
+                    ownsClient = false
+                    currentSharedPoolId = connection.poolId
+                } catch (error) {
+                    if (error instanceof StoreClosedError) throw error
+                    logWarn(`Failed to reconnect with shared connection, falling back to dedicated:`, error)
+                    // Give back this store's shared lease before it leaves the manager
+                    await manager.unregisterInstance(validatedInstanceId, ownerId).catch(() => {})
+                    connectionManager = null
+                    await connectDedicated()
+                }
+            } else {
+                // Dedicated: replace only a client this store owns. Never close a shared pool client.
+                if (client && ownsClient) {
+                    await client.close().catch(() => {})
+                }
+                await connectDedicated()
+            }
+
+            collections = getCollections()
+            await reinitializeLidHandler()
+            await releaseIfClosed({
+                manager: isUsingSharedConnection ? manager : null,
+                dedicatedClient: ownsClient ? client : undefined
+            })
+
+            reconnectAttempts = 0
+            connectionGeneration++
+            mongoConnectionState = MongoConnectionState.CONNECTED
+            connectionStateEmitter.emit('connected')
+            healthMonitor.updateConnectionState('connected')
+            lastSuccessfulPing = Date.now()
+            log(`Reconnected to MongoDB (${isUsingSharedConnection ? 'shared' : 'dedicated'}) for instance ${validatedInstanceId}`)
+        } catch (error) {
+            if (error instanceof StoreClosedError) {
+                mongoConnectionState = MongoConnectionState.DISCONNECTED
+                throw error
+            }
+            reconnectAttempts++
+            mongoConnectionState = MongoConnectionState.FAILED
+            connectionStateEmitter.emit('failed', error)
+            healthMonitor.updateConnectionState('failed')
+            healthMonitor.recordFailure()
+            logError(`Failed to reconnect to MongoDB for instance ${validatedInstanceId}:`, error)
+            throw new Error(`Failed to connect to MongoDB: ${(error as Error).message}`)
+        }
+    }
+
     const ensureConnection = async (): Promise<void> => {
+        assertOpen()
+
+        if (reconnectPromise) {
+            return reconnectPromise
+        }
+
         if (isUsingSharedConnection && connectionManager && mongoConnectionState === MongoConnectionState.CONNECTED) {
             const poolState = connectionManager.getInstancePoolState(validatedInstanceId)
             if (poolState.pendingMigration && poolState.pendingMigration.toPoolId !== currentSharedPoolId) {
                 markConnectionStale('shared pool migration pending')
-            } else if (poolState.currentPoolId && currentSharedPoolId && poolState.currentPoolId !== currentSharedPoolId) {
+            } else if (!poolState.currentPoolId) {
+                // WAB-978: the manager closed or evicted this store's pool
+                markConnectionStale('shared pool released')
+            } else if (currentSharedPoolId && poolState.currentPoolId !== currentSharedPoolId) {
                 markConnectionStale('shared pool mismatch')
             }
         }
@@ -951,160 +1098,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 markConnectionStale('ping failure', error)
             }
         }
-        
-        // If already connecting or reconnecting, wait for it
-        if (mongoConnectionState === MongoConnectionState.CONNECTING || mongoConnectionState === MongoConnectionState.RECONNECTING) {
-            return new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => {
-                    connectionStateEmitter.off('connected', onConnected)
-                    connectionStateEmitter.off('failed', onFailed)
-                    reject(new Error('Connection timeout'))
-                }, 30000) // 30 second timeout
-                
-                const onConnected = () => {
-                    clearTimeout(timeout)
-                    resolve()
-                }
-                
-                const onFailed = (error: Error) => {
-                    clearTimeout(timeout)
-                    reject(error)
-                }
-                
-                // Add listeners without removing all - the off() calls above handle cleanup
-                connectionStateEmitter.once('connected', onConnected)
-                connectionStateEmitter.once('failed', onFailed)
+
+        // WAB-978: single-flight. Every caller waits on the same reconnect; no per-caller listeners.
+        if (!reconnectPromise) {
+            reconnectPromise = reconnectNow().finally(() => {
+                reconnectPromise = null
             })
         }
-        
-        // Mark as connecting/reconnecting
-        mongoConnectionState = reconnectAttempts > 0 ? MongoConnectionState.RECONNECTING : MongoConnectionState.CONNECTING
-        
-        try {
-            // For shared connections, we need to re-register
-            if (useSharedConnections && connectionManager) {
-                try {
-                    const connection = await connectionManager.registerInstance({
-                        instanceId: validatedInstanceId,
-                        uri,
-                        database: dbName,
-                        config: connectionConfig
-                    })
-                    
-                    client = connection.client
-                    db = connection.db
-                    isUsingSharedConnection = true
-                    currentSharedPoolId = connection.poolId
-                    
-                    // Refresh collections after reconnection
-                    collections = getCollections()
-                    
-                    // Re-initialize LID handler if needed with retry
-                    if (lidHandler) {
-                        const reinitResult = await retryWithBackoff(
-                            () => lidHandler!.initialize(db, collectionPrefix),
-                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
-                            (attempt, error, delay) => {
-                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
-                            }
-                        )
-                        if (!reinitResult.success) {
-                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
-                        }
-                    }
-                    
-                    reconnectAttempts = 0
-                    mongoConnectionState = MongoConnectionState.CONNECTED
-                    connectionStateEmitter.emit('connected')
-                    healthMonitor.updateConnectionState('connected')
-                    lastSuccessfulPing = Date.now()
-                    log(`Reconnected to MongoDB (shared) for instance ${validatedInstanceId}`)
-                } catch (error) {
-                    // Fall back to dedicated connection if shared fails
-                    logWarn(`Failed to reconnect with shared connection, falling back to dedicated:`, error)
-                    
-                    client = new MongoClient(uri, {
-                        maxPoolSize: dedicatedMaxPoolSize,
-                        minPoolSize: dedicatedMinPoolSize,
-                        maxIdleTimeMS: 30000,
-                        writeConcern: { w: 1, j: false }
-                    })
-                    await client.connect()
-                    db = client.db(dbName)
-                    isUsingSharedConnection = false
-                    connectionManager = null
-                    currentSharedPoolId = null
-                    
-                    // Refresh collections after reconnection
-                    collections = getCollections()
-                    
-                    // Re-initialize LID handler if needed with retry
-                    if (lidHandler) {
-                        const reinitResult = await retryWithBackoff(
-                            () => lidHandler!.initialize(db, collectionPrefix),
-                            { maxAttempts: 3, initialDelay: 500, maxDelay: 5000 },
-                            (attempt, error, delay) => {
-                                log(`[LID Handler] Retry reconnection attempt ${attempt} after error: ${error.message}. Waiting ${delay}ms...`)
-                            }
-                        )
-                        if (!reinitResult.success) {
-                            logWarn(`[LID Handler] Failed to re-initialize after reconnection: ${reinitResult.error}`)
-                        }
-                    }
-                    
-                    reconnectAttempts = 0
-                    mongoConnectionState = MongoConnectionState.CONNECTED
-                    connectionStateEmitter.emit('connected')
-                    healthMonitor.updateConnectionState('connected')
-                    lastSuccessfulPing = Date.now()
-                    log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
-                }
-            } else {
-                // For dedicated connections, reconnect directly
-                if (client) {
-                    try {
-                        await client.close()
-                    } catch (error) {
-                        // Ignore close errors
-                    }
-                }
-                
-                client = new MongoClient(uri, {
-                    maxPoolSize: dedicatedMaxPoolSize,
-                    minPoolSize: dedicatedMinPoolSize,
-                    maxIdleTimeMS: 30000,
-                    writeConcern: { w: 1, j: false }
-                })
-                await client.connect()
-                db = client.db(dbName)
-                currentSharedPoolId = null
-
-                // Refresh collections after reconnection
-                collections = getCollections()
-                
-                // Re-initialize LID handler if needed
-                if (lidHandler) {
-                    await lidHandler.initialize(db, collectionPrefix)
-                }
-                
-                reconnectAttempts = 0
-                mongoConnectionState = MongoConnectionState.CONNECTED
-                connectionStateEmitter.emit('connected')
-                healthMonitor.updateConnectionState('connected')
-                lastSuccessfulPing = Date.now()
-                log(`Reconnected to MongoDB (dedicated) for instance ${validatedInstanceId}`)
-            }
-        } catch (error) {
-            reconnectAttempts++
-            mongoConnectionState = MongoConnectionState.FAILED
-            connectionStateEmitter.emit('failed', error)
-            healthMonitor.updateConnectionState('failed')
-            healthMonitor.recordFailure()
-            logError(`Failed to reconnect to MongoDB for instance ${validatedInstanceId}:`, error)
-            throw new Error(`Failed to connect to MongoDB: ${(error as Error).message}`)
-        } finally {
-            // Connection state is managed by enum now
-        }
+        return reconnectPromise
     }
     
     // Initialize LID handler after ensureConnection is available
@@ -1151,7 +1152,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             // Prefer reusing existing Redis connection; fallback to lightweight cache client
             redisClient: (redisConnection as any) || (lidRedisClient as any) || undefined,
             ...lidHandlerConfig,
-            ensureConnection: ensureConnection
+            ensureConnection: ensureConnection,
+            // WAB-978: mapping writes use the store's recovery: reconnect, retry and operation counting
+            runOperation: <T>(operation: () => Promise<T>) => withConnection(operation, undefined, { reportFailure: false })
         })
         const initResult = await retryWithBackoff(
             () => lidHandler!.initialize(db, collectionPrefix),
@@ -1176,11 +1179,16 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     }
     
     // Enhanced wrapper for operations with retry logic
+    // reportFailure: false when the caller reports the failure itself (LID mapping writes), so one
+    // burst gives one summary line
     const withConnection = async <T>(
         operation: () => Promise<T>,
-        retryOptions?: Partial<RetryOptions>
+        retryOptions?: Partial<RetryOptions>,
+        { reportFailure = true }: { reportFailure?: boolean } = {}
     ): Promise<T> => {
+        assertOpen()
         const startTime = Date.now()
+        let attemptGeneration = connectionGeneration
         
         // Define retry options with defaults
         const options: RetryOptions = {
@@ -1203,6 +1211,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             return error.name === 'MongoNotConnectedError'
                 || error.name === 'MongoExpiredSessionError'
                 || error.name === 'MongoPoolClosedError'
+                || error.name === 'MongoClientClosedError'
+                || error.name === 'MongoServerClosedError'
+                || error.name === 'MongoTopologyClosedError'
                 || isTransientTransactionError(error)
                 || /session has ended/i.test(message)
                 || /closed connection pool/i.test(message)
@@ -1212,6 +1223,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         const result = await retryWithBackoff(
             async () => {
                 await ensureConnection()
+                attemptGeneration = connectionGeneration
                 const endPoolOperation = isUsingSharedConnection && connectionManager
                     ? connectionManager.beginInstanceOperation(validatedInstanceId)
                     : null
@@ -1227,7 +1239,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             options,
             (attempt, error, delay) => {
                 if (isConnectionClosedError(error)) {
-                    markConnectionStale('retry detected closed session', error)
+                    markConnectionStale('retry detected closed session', error, attemptGeneration)
                 }
                 const retryLogKey = `retry-${validatedInstanceId}-${error?.name || 'unknown'}`
                 if (shouldLogOnce(retryLogKey, 5)) {
@@ -1239,9 +1251,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         if (!result.success) {
             if (isConnectionClosedError(result.error)) {
-                markConnectionStale('retry budget exhausted', result.error)
+                markConnectionStale('retry budget exhausted', result.error, attemptGeneration)
             }
-            logError(`[withConnection] Operation failed after ${result.attempts} attempts:`, result.error)
+            // WAB-978: one summary line per burst instead of one stack per operation
+            if (reportFailure && logLevel !== 'none' && (result.error as any)?.name !== 'StoreClosedError') {
+                reportBurst(`[withConnection] [${instanceId}] Operation failed after retries`, errorKind(result.error))
+            }
             healthMonitor.recordFailure()
             throw result.error
         }
@@ -1267,7 +1282,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Track background tasks for cleanup
     let profilePictureFetchHandle: NodeJS.Immediate | null = null
+    // isClosing: close() started; the store takes no new events. storeClosed (above) follows after the drain.
     let isClosing = false
+    let closePromise: Promise<void> | null = null
+    // WAB-978: bounded lid-mapping.update persistence, and the count of accepted events not yet finished
+    const lidMappingLimiter = createTaskLimiter(lidHandlerConfig?.mappingUpdateConcurrency ?? 16)
+    let pendingLidMappingUpdates = 0
+    const LID_DRAIN_TIMEOUT_MS = 15000
     
     // Operation locking for clearAll to prevent race conditions
     let clearAllInProgress = false
@@ -3299,7 +3320,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     }
     
     // Helper to check if event should be stored
-    const shouldStoreEvent = async (eventType: string, data: any): Promise<boolean> => {
+    // admitted: the caller accepted the event before close() started (lid-mapping.update), so
+    // close() must still let it through while it drains
+    const shouldStoreEvent = async (eventType: string, data: any, admitted = false): Promise<boolean> => {
+        // WAB-978: a closing store takes no new events
+        if (isClosing && !admitted) {
+            return false
+        }
         const config = getEventConfig(eventType)
         
         if (!config.enabled) {
@@ -3664,7 +3691,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Track current event emitter and handlers for proper cleanup
     let currentEventEmitter: BaileysEventEmitter | null = null
-    const eventHandlers = new Map<string, (...args: any[]) => Promise<void>>()
+    const boundListeners: Array<[string, (...args: any[]) => any]> = []
     
     // LID resolution helper function
     const performProactiveLidResolutionForLabelAssociations = async (
@@ -3733,14 +3760,21 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         return totalLabelAssociationsUpdated
     }
     // Safe LID setter - handles E11000 duplicate key conflicts on contacts_lid_lookup
-    const safeSetLid = async (contactId: string, lid: string, targetInstanceId?: string): Promise<void> => {
+    const safeSetLid = async (
+        contactId: string,
+        lid: string,
+        targetInstanceId?: string,
+        reporting: { reportFailure?: boolean } = {}
+    ): Promise<void> => {
         const inst = targetInstanceId || instanceId
         try {
             await withConnection(async () =>
                 collections.contacts.updateOne(
                     { instanceId: inst, id: contactId },
                     { $set: { lid, updatedAt: new Date() } }
-                )
+                ),
+                undefined,
+                reporting
             )
         } catch (e: any) {
             if (e?.code === 11000 && e?.keyPattern?.lid) {
@@ -3749,14 +3783,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     collections.contacts.updateOne(
                         { instanceId: inst, lid, id: { $ne: contactId } },
                         { $unset: { lid: 1 }, $set: { updatedAt: new Date() } }
-                    )
+                    ),
+                    undefined,
+                    reporting
                 )
                 try {
                     await withConnection(async () =>
                         collections.contacts.updateOne(
                             { instanceId: inst, id: contactId },
                             { $set: { lid, updatedAt: new Date() } }
-                        )
+                        ),
+                        undefined,
+                        reporting
                     )
                 } catch (retryError: any) {
                     if (retryError?.code === 11000) {
@@ -3769,6 +3807,178 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 throw e
             }
         }
+    }
+
+    // WAB-978: lid-mapping.update persistence, run through lidMappingLimiter
+    const persistLidMappingUpdate = async (data: { lid: string; pn: string }): Promise<void> => {
+        try {
+            const { lid, pn } = data
+            
+            if (!lid || !pn) {
+                log(`[${instanceId}] Invalid lid-mapping.update data: missing lid or pn`)
+                return
+            }
+            
+            log(`📍 [LID Mapping Update] Received: ${lid} -> ${pn}`)
+            
+            // Store the mapping in MongoDB via LidHandler
+            if (lidHandler) {
+                await lidHandler.handleLidMappingUpdate(data)
+                
+                // Also update the contact if it exists (safe against duplicate key)
+                await safeSetLid(pn, lid, validatedInstanceId, { reportFailure: false })
+            }
+            
+            if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')
+            if (hooks.afterStore) await hooks.afterStore('lid-mapping.update', data)
+            
+            log(`✅ [LID Mapping Update] Stored: ${lid} -> ${pn}`)
+        } catch (error) {
+            // Same label as LidHandler: one summary line for a burst of mapping failures
+            reportBurst('[LidHandler] Failed to store LID mapping', errorKind(error))
+            if (enableMetrics) updateEventMetrics('lid-mapping.update', 'error')
+        }
+    }
+
+    // WAB-978 shutdown order: stop taking events, drain accepted LID work (it can need a reconnect),
+    // then mark the store closed and release this store's lease. A store never closes a shared pool client.
+    const drainLidMappingUpdates = async (deadline: number): Promise<void> => {
+        while (pendingLidMappingUpdates > 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 20))
+        }
+        if (pendingLidMappingUpdates > 0) {
+            const dropped = lidMappingLimiter.clear(new StoreClosedError(validatedInstanceId))
+            console.error(`[${instanceId}] close() stopped waiting after ${LID_DRAIN_TIMEOUT_MS / 1000}s: ${dropped} queued lid-mapping.update event(s) dropped, ${lidMappingLimiter.active} still running`)
+        }
+    }
+
+    const closeStore = async (): Promise<void> => {
+        // Stop taking new events and background work
+        isClosing = true
+
+        // Unbind all event listeners to prevent memory leaks
+        if (isBound && currentEventEmitter) {
+            log(`[${instanceId}] Unbinding all event listeners during close`)
+            storeImpl.unbind()
+        }
+
+        // One deadline for the drain and for a reconnect in flight
+        const deadline = Date.now() + LID_DRAIN_TIMEOUT_MS
+        await drainLidMappingUpdates(deadline)
+        const remaining = deadline - Date.now()
+        if (reconnectPromise && remaining > 0) {
+            await Promise.race([
+                reconnectPromise.catch(() => {}),
+                new Promise((resolve) => setTimeout(resolve, remaining).unref?.())
+            ])
+        }
+        storeClosed = true
+        
+        // Clear profile picture fetch handle if it exists
+        if (profilePictureFetchHandle) {
+            clearImmediate(profilePictureFetchHandle)
+            profilePictureFetchHandle = null
+        }
+        
+        // Clear stale operation cleanup timer
+        if (staleOperationCleanupTimer) {
+            clearInterval(staleOperationCleanupTimer)
+            staleOperationCleanupTimer = null
+            log(`[${instanceId}] Stopped stale operation cleanup timer`)
+        }
+        
+        // Unregister instance processors from SharedQueueManager to prevent memory leaks
+        if (sharedQueueManager && useSharedQueues) {
+            log(`🗑️ Unregistering processors for instance ${instanceId} from SharedQueueManager`)
+            sharedQueueManager.unregisterInstanceProcessors(validatedInstanceId)
+            try {
+                await sharedQueueManager.releaseInstanceOwnership(validatedInstanceId)
+                log(`[${instanceId}] Released shared queue ownership`)
+            } catch (error) {
+                logWarn(`[${instanceId}] Failed to release shared queue ownership:`, error)
+            }
+        }
+        
+        // Remove repeatable job for cleanup if it exists
+        if (queues.has(QueueType.LABEL_ASSOCIATIONS)) {
+            const labelQueue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
+            try {
+                await labelQueue.removeRepeatableByKey('label-cache-cleanup')
+                log('[Label Cache Cleanup] Removed scheduled cleanup job')
+            } catch (error) {
+                // Ignore if job doesn't exist
+            }
+        }
+        
+        // Close Bull queues if initialized
+        if (bullInitialized && !useSharedQueues) {
+            log(`🛑 Closing Bull queues for instance ${instanceId}...`)
+            try {
+                // Close all workers and remove event listeners
+                for (const worker of workers.values()) {
+                    // Remove event listeners if they exist
+                    if ((worker as any).__eventHandlers) {
+                        const handlers = (worker as any).__eventHandlers
+                        worker.off('completed', handlers.completed)
+                        worker.off('failed', handlers.failed)
+                        worker.off('stalled', handlers.stalled)
+                        delete (worker as any).__eventHandlers
+                    }
+                    await worker.close()
+                }
+                // Close all queues
+                for (const queue of queues.values()) {
+                    await queue.close()
+                }
+                // Disconnect Redis
+                if (redisConnection) redisConnection.disconnect()
+                if (lidRedisClient && lidRedisClient !== redisConnection) {
+                    try { lidRedisClient.disconnect() } catch {}
+                }
+            } catch (error) {
+                logError('Error closing Bull queues:', error)
+            }
+        }
+        
+        // Wait for all p-queues to finish
+        await Promise.all([
+            Promise.resolve() // Bull handles queue processing
+        ])
+        
+        // Clear cache
+        const keys = binaryConversionCache.keys()
+        keys.forEach(key => {
+            if (key.startsWith(`msg_${instanceId}_`)) {
+                binaryConversionCache.del(key)
+            }
+        })
+        
+        // Stop TTL monitor if running
+        if (ttlMonitor) {
+            ttlMonitor.stopMonitoring()
+            ttlMonitor = null
+        }
+        
+        // Release only what this store holds: its own lease on a shared pool (other stores of the
+        // same instance keep theirs), or its own dedicated client
+        if (isUsingSharedConnection && connectionManager) {
+            await connectionManager.unregisterInstance(validatedInstanceId, ownerId)
+            connectionManager = null
+            currentSharedPoolId = null
+        } else if (client && ownsClient) {
+            await client.close().catch(() => {})
+            currentSharedPoolId = null
+        }
+        
+        // Reset connection state
+        mongoConnectionState = MongoConnectionState.DISCONNECTED
+        reconnectAttempts = 0
+        
+        // Clean up EventEmitter to prevent memory leaks
+        connectionStateEmitter.removeAllListeners()
+        
+        // Reset binding state
+        isBound = false
     }
 
     // Main store implementation
@@ -5737,6 +5947,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Store the event emitter reference for cleanup
             currentEventEmitter = ev
+
+            // WAB-978: record every listener, so unbind() and close() remove all of them
+            const on = ((event: any, handler: (...args: any[]) => any) => {
+                ev.on(event, handler)
+                boundListeners.push([event, handler])
+            }) as BaileysEventEmitter['on']
             
             log(`[${instanceId}] store.bind() called - setting up event listeners with selective storage`)
             
@@ -5749,8 +5965,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     if (hooks.afterStore) await hooks.afterStore('connection.update', update)
                 }
             }
-            eventHandlers.set('connection.update', connectionUpdateHandler)
-            ev.on('connection.update', connectionUpdateHandler)
+            on('connection.update', connectionUpdateHandler)
 
             // Messages upsert - CRITICAL for storing messages including polls
             const messagesUpsertHandler = async ({ messages }: any) => {
@@ -6170,11 +6385,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     }
                 }
             }
-            eventHandlers.set('messages.upsert', messagesUpsertHandler)
-            ev.on('messages.upsert', messagesUpsertHandler)
+            on('messages.upsert', messagesUpsertHandler)
 
             // Messages update
-            ev.on('messages.update', async (updates) => {
+            on('messages.update', async (updates) => {
                 if (enableMetrics) updateEventMetrics('messages.update', 'received')
                 
                 for (const update of updates) {
@@ -6286,7 +6500,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Messages delete
-            ev.on('messages.delete', async (item) => {
+            on('messages.delete', async (item) => {
                 if (enableMetrics) updateEventMetrics('messages.delete', 'received')
                 
                 if ('keys' in item) {
@@ -6363,7 +6577,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Chats upsert
-            ev.on('chats.upsert', async (chats) => {
+            on('chats.upsert', async (chats) => {
                 if (enableMetrics) updateEventMetrics('chats.upsert', 'received')
                 
                 const chatsToStore = []
@@ -6386,7 +6600,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Chats update
-            ev.on('chats.update', async (updates) => {
+            on('chats.update', async (updates) => {
                 if (enableMetrics) updateEventMetrics('chats.update', 'received')
                 
                 for (const update of updates) {
@@ -6404,7 +6618,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Chats delete
-            ev.on('chats.delete', async (deletions) => {
+            on('chats.delete', async (deletions) => {
                 if (enableMetrics) updateEventMetrics('chats.delete', 'received')
                 
                 if (await shouldStoreEvent('chats.delete', deletions)) {
@@ -6420,7 +6634,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Contacts upsert
-            ev.on('contacts.upsert', async (contacts) => {
+            on('contacts.upsert', async (contacts) => {
                 if (enableMetrics) updateEventMetrics('contacts.upsert', 'received')
                 
                 const contactsToStore = []
@@ -6443,7 +6657,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Contacts update
-            ev.on('contacts.update', async (updates) => {
+            on('contacts.update', async (updates) => {
                 if (enableMetrics) updateEventMetrics('contacts.update', 'received')
                 
                 const contactsToUpdate = []
@@ -6466,7 +6680,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Group participants update
-            ev.on('group-participants.update', async ({ id, participants, action }) => {
+            on('group-participants.update', async ({ id, participants, action }) => {
                 if (enableMetrics) updateEventMetrics('group-participants.update', 'received')
                 
                 const updateData = { id, participants, action }
@@ -6501,7 +6715,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Groups upsert
-            ev.on('groups.upsert', async (groups) => {
+            on('groups.upsert', async (groups) => {
                 if (enableMetrics) updateEventMetrics('groups.upsert', 'received')
                 
                 for (const group of groups) {
@@ -6519,7 +6733,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Groups update
-            ev.on('groups.update', async (updates) => {
+            on('groups.update', async (updates) => {
                 if (enableMetrics) updateEventMetrics('groups.update', 'received')
                 
                 for (const update of updates) {
@@ -6543,7 +6757,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Presence update
-            ev.on('presence.update', async ({ id, presences }) => {
+            on('presence.update', async ({ id, presences }) => {
                 if (enableMetrics) updateEventMetrics('presence.update', 'received')
                 
                 const updateData = { id, presences }
@@ -6559,7 +6773,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
             })
             // Messaging history sync with debouncing
-            ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
+            on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages, isLatest }) => {
                 if (enableMetrics) updateEventMetrics('messaging-history.set', 'received')
                 
                 const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
@@ -6687,7 +6901,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Labels edit
-            ev.on('labels.edit', async (label) => {
+            on('labels.edit', async (label) => {
                 if (enableMetrics) updateEventMetrics('labels.edit', 'received')
                 
                 if (await shouldStoreEvent('labels.edit', label)) {
@@ -6718,7 +6932,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Labels association
-            ev.on('labels.association', async ({ type, association }) => {
+            on('labels.association', async ({ type, association }) => {
                 if (enableMetrics) updateEventMetrics('labels.association', 'received')
                 
                 // Enhanced debug logging for label association events
@@ -6750,7 +6964,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Message receipt update
-            ev.on('message-receipt.update', async (updates) => {
+            on('message-receipt.update', async (updates) => {
                 if (enableMetrics) updateEventMetrics('message-receipt.update', 'received')
                 
                 for (const { key, receipt } of updates) {
@@ -6780,7 +6994,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             })
 
             // Messages reaction
-            ev.on('messages.reaction', async (reactions) => {
+            on('messages.reaction', async (reactions) => {
                 if (enableMetrics) updateEventMetrics('messages.reaction', 'received')
                 
                 for (const { key, reaction } of reactions) {
@@ -6811,7 +7025,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Baileys v7+ LID mapping update event
             // This event is emitted when Baileys discovers a new LID-to-phone number mapping
-            ev.on('lid-mapping.update', async (data: { lid: string; pn: string }) => {
+            // WAB-978: one app-state sync can emit thousands of these at once. The store accepts an
+            // event only before close() starts, runs at most mappingUpdateConcurrency of them at a time,
+            // and close() waits for every accepted event (see drainLidMappingUpdates).
+            on('lid-mapping.update', async (data: { lid: string; pn: string }) => {
+                if (isClosing) return
                 if (enableMetrics) updateEventMetrics('lid-mapping.update', 'received')
                 
                 // Check if LID mapping handling is enabled
@@ -6820,37 +7038,20 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     log(`[${instanceId}] Skipping lid-mapping.update event (disabled in config)`)
                     return
                 }
-                
-                if (await shouldStoreEvent('lid-mapping.update', data)) {
-                    try {
-                        const { lid, pn } = data
-                        
-                        if (!lid || !pn) {
-                            log(`[${instanceId}] Invalid lid-mapping.update data: missing lid or pn`)
-                            return
-                        }
-                        
-                        log(`📍 [LID Mapping Update] Received: ${lid} -> ${pn}`)
-                        
-                        // Store the mapping in MongoDB via LidHandler
-                        if (lidHandler) {
-                            await lidHandler.handleLidMappingUpdate(data)
-                            
-                            // Also update the contact if it exists (safe against duplicate key)
-                            await safeSetLid(pn, lid, validatedInstanceId)
-                        }
-                        
-                        if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')
-                        if (hooks.afterStore) await hooks.afterStore('lid-mapping.update', data)
-                        
-                        log(`✅ [LID Mapping Update] Stored: ${lid} -> ${pn}`)
-                    } catch (error) {
-                        logError(`[${instanceId}] Failed to process lid-mapping.update:`, error)
-                        if (enableMetrics) updateEventMetrics('lid-mapping.update', 'error')
+
+                pendingLidMappingUpdates++
+                try {
+                    if (await shouldStoreEvent('lid-mapping.update', data, true)) {
+                        await lidMappingLimiter.run(() => persistLidMappingUpdate(data))
                     }
+                } catch {
+                    // Only a task that close() dropped after its drain limit gets here; close() logs the count
+                } finally {
+                    pendingLidMappingUpdates--
                 }
             })
         },
+
 
         // Method to update socket reference after store creation
         setSock(socket: any): void {
@@ -6945,8 +7146,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 log(`[${instanceId}] Cleared pending history sync data`)
             }
 
-            // Remove all registered event listeners
-            for (const [eventName, handler] of eventHandlers.entries()) {
+            // Remove every listener that bind() added
+            for (const [eventName, handler] of boundListeners) {
                 try {
                     (currentEventEmitter as any).off(eventName, handler)
                     log(`[${instanceId}] Removed listener for: ${eventName}`)
@@ -6956,7 +7157,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
 
             // Clear the handlers registry
-            eventHandlers.clear()
+            boundListeners.length = 0
             
             // Reset state
             currentEventEmitter = null
@@ -6978,34 +7179,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         // Connection recovery method
         async reconnect(): Promise<void> {
-            // If already reconnecting, wait for it to complete
-            if (mongoConnectionState === MongoConnectionState.CONNECTING || 
-                mongoConnectionState === MongoConnectionState.RECONNECTING) {
-                log(`[${instanceId}] Already reconnecting, waiting for completion...`)
-                return new Promise((resolve, reject) => {
-                    const timeout = setTimeout(() => {
-                        connectionStateEmitter.off('connected', onConnected)
-                        connectionStateEmitter.off('failed', onFailed)
-                        reject(new Error('Reconnection timeout'))
-                    }, 30000)
-                    
-                    const onConnected = () => {
-                        clearTimeout(timeout)
-                        resolve()
-                    }
-                    
-                    const onFailed = (error: Error) => {
-                        clearTimeout(timeout)
-                        reject(error)
-                    }
-                    
-                    connectionStateEmitter.once('connected', onConnected)
-                    connectionStateEmitter.once('failed', onFailed)
-                })
-            }
-            
-            // Force reconnection
+            // WAB-978: force a reconnect, or join the one in flight. No per-caller listeners.
+            assertOpen()
             log(`[${instanceId}] Initiating reconnection...`)
+            markConnectionStale('manual reconnect')
             await ensureConnection()
         },
 
@@ -7606,123 +7783,14 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         },
         
-        async close(): Promise<void> {
-            // Set closing flag to stop background operations
-            isClosing = true
-            
-            // Unbind all event listeners to prevent memory leaks
-            if (isBound && currentEventEmitter) {
-                log(`[${instanceId}] Unbinding all event listeners during close`)
-                storeImpl.unbind()
+        close(): Promise<void> {
+            // WAB-978: close() is idempotent; a second call waits for the first
+            if (!closePromise) {
+                closePromise = closeStore()
             }
-            
-            // Clear profile picture fetch handle if it exists
-            if (profilePictureFetchHandle) {
-                clearImmediate(profilePictureFetchHandle)
-                profilePictureFetchHandle = null
-            }
-            
-            // Clear stale operation cleanup timer
-            if (staleOperationCleanupTimer) {
-                clearInterval(staleOperationCleanupTimer)
-                staleOperationCleanupTimer = null
-                log(`[${instanceId}] Stopped stale operation cleanup timer`)
-            }
-            
-            // Unregister instance processors from SharedQueueManager to prevent memory leaks
-            if (sharedQueueManager && useSharedQueues) {
-                log(`🗑️ Unregistering processors for instance ${instanceId} from SharedQueueManager`)
-                sharedQueueManager.unregisterInstanceProcessors(validatedInstanceId)
-                try {
-                    await sharedQueueManager.releaseInstanceOwnership(validatedInstanceId)
-                    log(`[${instanceId}] Released shared queue ownership`)
-                } catch (error) {
-                    logWarn(`[${instanceId}] Failed to release shared queue ownership:`, error)
-                }
-            }
-            
-            // Remove repeatable job for cleanup if it exists
-            if (queues.has(QueueType.LABEL_ASSOCIATIONS)) {
-                const labelQueue = queues.get(QueueType.LABEL_ASSOCIATIONS)!
-                try {
-                    await labelQueue.removeRepeatableByKey('label-cache-cleanup')
-                    log('[Label Cache Cleanup] Removed scheduled cleanup job')
-                } catch (error) {
-                    // Ignore if job doesn't exist
-                }
-            }
-            
-            // Close Bull queues if initialized
-            if (bullInitialized && !useSharedQueues) {
-                log(`🛑 Closing Bull queues for instance ${instanceId}...`)
-                try {
-                    // Close all workers and remove event listeners
-                    for (const worker of workers.values()) {
-                        // Remove event listeners if they exist
-                        if ((worker as any).__eventHandlers) {
-                            const handlers = (worker as any).__eventHandlers
-                            worker.off('completed', handlers.completed)
-                            worker.off('failed', handlers.failed)
-                            worker.off('stalled', handlers.stalled)
-                            delete (worker as any).__eventHandlers
-                        }
-                        await worker.close()
-                    }
-                    // Close all queues
-                    for (const queue of queues.values()) {
-                        await queue.close()
-                    }
-                    // Disconnect Redis
-                    if (redisConnection) redisConnection.disconnect()
-                    if (lidRedisClient && lidRedisClient !== redisConnection) {
-                        try { lidRedisClient.disconnect() } catch {}
-                    }
-                } catch (error) {
-                    logError('Error closing Bull queues:', error)
-                }
-            }
-            
-            // Wait for all p-queues to finish
-            await Promise.all([
-                Promise.resolve() // Bull handles queue processing
-            ])
-            
-            // Clear cache
-            const keys = binaryConversionCache.keys()
-            keys.forEach(key => {
-                if (key.startsWith(`msg_${instanceId}_`)) {
-                    binaryConversionCache.del(key)
-                }
-            })
-            
-            // Stop TTL monitor if running
-            if (ttlMonitor) {
-                ttlMonitor.stopMonitoring()
-                ttlMonitor = null
-            }
-            
-            // Handle connection cleanup based on connection type
-            if (isUsingSharedConnection && connectionManager) {
-                // Unregister from connection manager
-                await connectionManager.unregisterInstance(validatedInstanceId)
-                connectionManager = null
-                currentSharedPoolId = null
-            } else if (client && !isUsingSharedConnection) {
-                // Close dedicated connection
-                await client.close()
-                currentSharedPoolId = null
-            }
-            
-            // Reset connection state
-            mongoConnectionState = MongoConnectionState.DISCONNECTED
-            reconnectAttempts = 0
-            
-            // Clean up EventEmitter to prevent memory leaks
-            connectionStateEmitter.removeAllListeners()
-            
-            // Reset binding state
-            isBound = false
+            return closePromise
         },
+
 
         /**
          * Proactively resolve LID jids in historical messages to phone numbers

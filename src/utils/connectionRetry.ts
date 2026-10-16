@@ -15,6 +15,14 @@ export interface RetryResult<T> {
     attempts: number
 }
 
+/** WAB-978: thrown by a store after close(). Never retried. */
+export class StoreClosedError extends Error {
+    constructor(instanceId: string) {
+        super(`Store for instance ${instanceId} is closed`)
+        this.name = 'StoreClosedError'
+    }
+}
+
 const hasErrorLabel = (error: any, label: string): boolean => {
     if (!error) {
         return false
@@ -35,6 +43,9 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
     factor: 2,
     jitter: true,
     shouldRetry: (error: any) => {
+        if (error?.name === 'StoreClosedError') {
+            return false
+        }
         // Retry on connection errors and transient failures
         const errorMessage = error.message || ''
         const retryableErrors = [
@@ -66,6 +77,8 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
                error.name === 'MongoNotConnectedError' ||
                error.name === 'MongoExpiredSessionError' ||
                error.name === 'MongoClientClosedError' ||
+               error.name === 'MongoServerClosedError' ||
+               error.name === 'MongoTopologyClosedError' ||
                error.name === 'MongoPoolClosedError' ||
                error.codeName === 'NoSuchTransaction' ||
                hasErrorLabel(error, 'RetryableWriteError') ||
