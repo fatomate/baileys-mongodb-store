@@ -229,8 +229,10 @@ export class ConnectionManager {
      * Unregister an instance.
      * With ownerId, release only that owner; the registration stays while other owners hold it.
      * Without ownerId, release the instance for all owners (original behaviour).
+     * maxWaitMs limits how long a pool that becomes empty waits for active operations before
+     * it closes (default 15 s), so a caller with its own shutdown deadline can keep it.
      */
-    public async unregisterInstance(instanceId: string, ownerId?: string): Promise<void> {
+    public async unregisterInstance(instanceId: string, ownerId?: string, options?: { maxWaitMs?: number }): Promise<void> {
         if (ownerId !== undefined) {
             const owners = this.instanceOwners.get(instanceId)
             owners?.delete(ownerId)
@@ -256,10 +258,10 @@ export class ConnectionManager {
 
         // Close pools that have no more instances
         if (pool && pool.instances.size === 0) {
-            await this.closePool(pool.id)
+            await this.closePool(pool.id, options?.maxWaitMs)
         }
         if (pendingPool && pendingPool !== pool && pendingPool.instances.size === 0) {
-            await this.closePool(pendingPool.id)
+            await this.closePool(pendingPool.id, options?.maxWaitMs)
         }
     }
     
@@ -444,30 +446,28 @@ export class ConnectionManager {
         // WAB-978: every return below adds the instance to the pool in the same synchronous step
         // as the capacity check, so concurrent registrations cannot overfill one pool
 
-        // Look for existing pool with capacity
-        for (const [, pool] of this.pools) {
-            if (!pool.isClosing &&
-                pool.uri === uri && 
-                pool.database === database && 
-                pool.tier === tier &&
-                pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
-
-                pool.lastUsedAt = new Date()
-                pool.instances.add(instanceId)
-                return { pool, isNew: false, reason: 'existing' }
-            }
-        }
-
-        // WAB-978: concurrent registrations share one pool creation instead of creating one pool each
+        // WAB-978: concurrent registrations share one pool creation instead of creating one pool each.
+        // A waiter that finds the new pool full selects again, and joins the next creation if any.
         const creationKey = `${uri}:${database}:${tier}`
-        const inFlight = this.creatingPools.get(creationKey)
-        if (inFlight) {
-            const pool = await inFlight
-            if (!pool.isClosing && this.pools.has(pool.id) && pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
-                pool.lastUsedAt = new Date()
-                pool.instances.add(instanceId)
-                return { pool, isNew: false, reason: 'existing' }
+        for (;;) {
+            // Look for existing pool with capacity
+            for (const [, pool] of this.pools) {
+                if (!pool.isClosing &&
+                    pool.uri === uri && 
+                    pool.database === database && 
+                    pool.tier === tier &&
+                    pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
+
+                    pool.lastUsedAt = new Date()
+                    pool.instances.add(instanceId)
+                    return { pool, isNew: false, reason: 'existing' }
+                }
             }
+
+            const inFlight = this.creatingPools.get(creationKey)
+            if (!inFlight) break
+            // A failed creation is the creator's error; this caller selects again
+            await inFlight.catch(() => undefined)
         }
         
         // Check if we can create a new pool
@@ -563,7 +563,7 @@ export class ConnectionManager {
         }
     }
     
-    private async closePool(poolId: string): Promise<void> {
+    private async closePool(poolId: string, maxWaitMs: number = 15000): Promise<void> {
         const pool = this.pools.get(poolId)
         if (!pool) return
         
@@ -581,7 +581,7 @@ export class ConnectionManager {
         
         // Wait for active operations to complete (with timeout)
         const waitForOperations = async () => {
-            const maxWait = 15000 // 15 seconds grace
+            const maxWait = Math.max(0, maxWaitMs) // grace for active operations (default 15 s)
             const startTime = Date.now()
             
             while (pool.activeOperations > 0) {

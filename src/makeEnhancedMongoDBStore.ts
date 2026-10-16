@@ -3962,7 +3962,10 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         // Release only what this store holds: its own lease on a shared pool (other stores of the
         // same instance keep theirs), or its own dedicated client
         if (isUsingSharedConnection && connectionManager) {
-            await connectionManager.unregisterInstance(validatedInstanceId, ownerId)
+            // Pass what is left of the shutdown deadline, so an empty pool does not add its own 15 s
+            await connectionManager.unregisterInstance(validatedInstanceId, ownerId, {
+                maxWaitMs: Math.max(0, deadline - Date.now())
+            })
             connectionManager = null
             currentSharedPoolId = null
         } else if (client && ownsClient) {

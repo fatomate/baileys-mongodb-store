@@ -312,6 +312,25 @@ describe('WAB-978 store lifecycle', () => {
         expect(errors.some((e) => e.includes('close() stopped waiting after 15s'))).toBe(true)
     })
 
+    test('close() keeps the 15 s deadline when a counted database operation never settles', async () => {
+        const instanceId = newInstance()
+        const store = await make(instanceId)
+        const ev = new EventEmitter()
+        store.bind(ev)
+        // The pool counts this operation as active, and Mongo never answers it
+        jest.spyOn(Collection.prototype, 'updateOne').mockImplementation(() => new Promise(() => {}) as any)
+        emitBurst(ev, 1)
+        await new Promise((r) => setTimeout(r, 300))
+
+        const started = Date.now()
+        await store.close()
+        const elapsed = Date.now() - started
+
+        expect(elapsed).toBeGreaterThanOrEqual(14000)
+        expect(elapsed).toBeLessThan(20000)
+        expect(ConnectionManager.getInstance().getInstancePoolState(instanceId).currentPoolId).toBeUndefined()
+    })
+
     test('a burst of failing mapping events is counted under one log label only', async () => {
         const label = '[LidHandler] Failed to store LID mapping'
         const instanceId = newInstance()

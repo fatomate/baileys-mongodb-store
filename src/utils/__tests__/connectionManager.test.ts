@@ -398,5 +398,20 @@ describe('ConnectionManager', () => {
 
             expect(a.poolId).not.toBe(b.poolId)
         })
+
+        it('creates only as many pools as capacity needs when many registrations overflow a pending pool', async () => {
+            manager = getConnectionManager({
+                tierConfigurations: { warm: { maxPoolSize: 5, minPoolSize: 1, maxInstancesPerPool: 2, maxIdleTimeMS: 60000 } }
+            })
+            const results = await Promise.all(
+                ['a', 'b', 'c', 'd', 'e', 'f'].map((id) => manager!.registerInstance(reg(id)))
+            )
+
+            const sizes = new Map<string, number>()
+            for (const r of results) sizes.set(r.poolId, (sizes.get(r.poolId) ?? 0) + 1)
+            expect(sizes.size).toBe(3)
+            expect(Array.from(sizes.values())).toEqual([2, 2, 2])
+            expect(MongoClient).toHaveBeenCalledTimes(3)
+        })
     })
 })
