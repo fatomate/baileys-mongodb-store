@@ -413,5 +413,21 @@ describe('ConnectionManager', () => {
             expect(Array.from(sizes.values())).toEqual([2, 2, 2])
             expect(MongoClient).toHaveBeenCalledTimes(3)
         })
+
+        it('gives a shared pool creation failure to every waiter with one connection attempt', async () => {
+            manager = getConnectionManager()
+            ;(MongoClient as unknown as jest.Mock).mockImplementationOnce(() => ({
+                connect: jest.fn().mockRejectedValue(new Error('mongo down')),
+                close: jest.fn().mockResolvedValue(undefined),
+                db: jest.fn()
+            }))
+
+            const results = await Promise.allSettled(
+                ['a', 'b', 'c', 'd', 'e'].map((id) => manager!.registerInstance(reg(id)))
+            )
+
+            expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected', 'rejected', 'rejected', 'rejected'])
+            expect(MongoClient).toHaveBeenCalledTimes(1)
+        })
     })
 })

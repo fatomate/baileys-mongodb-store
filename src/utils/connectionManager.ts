@@ -466,8 +466,8 @@ export class ConnectionManager {
 
             const inFlight = this.creatingPools.get(creationKey)
             if (!inFlight) break
-            // A failed creation is the creator's error; this caller selects again
-            await inFlight.catch(() => undefined)
+            // A failed creation fails every waiter too, so N waiters do not retry the connection one by one
+            await inFlight
         }
         
         // Check if we can create a new pool
