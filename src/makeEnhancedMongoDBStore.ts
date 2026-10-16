@@ -1005,14 +1005,29 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         try {
             if (manager) {
                 try {
-                    const connection = await manager.registerInstance({
-                        instanceId: validatedInstanceId,
-                        uri,
-                        database: dbName,
-                        config: connectionConfig,
-                        ownerId
-                    })
-                    await releaseIfClosed({ manager })
+                    const register = async () => {
+                        const registered = await manager.registerInstance({
+                            instanceId: validatedInstanceId,
+                            uri,
+                            database: dbName,
+                            config: connectionConfig,
+                            ownerId
+                        })
+                        await releaseIfClosed({ manager })
+                        return registered
+                    }
+                    let connection = await register()
+                    // WAB-978: the manager can return the same pool that made this store reconnect
+                    // (failed ping, explicit reconnect). Check it. If its client does not answer,
+                    // retire the pool for every store and register again on a new pool.
+                    try {
+                        await connection.db.admin().ping()
+                    } catch (pingError) {
+                        logWarn(`[${instanceId}] Shared pool did not answer a ping; replacing it:`, pingError)
+                        await manager.retirePool(connection.poolId)
+                        connection = await register()
+                        await connection.db.admin().ping()
+                    }
                     client = connection.client
                     db = connection.db
                     isUsingSharedConnection = true
@@ -5941,6 +5956,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
         // bind method continues with event handling...
         bind(ev: BaileysEventEmitter): void {
+            // WAB-978: a closing or closed store attaches nothing; close() would never remove it
+            if (isClosing || storeClosed) {
+                logWarn(`[${instanceId}] store.bind() called after close(); ignored`)
+                return
+            }
             // Check if already bound to prevent duplicate bindings
             if (isBound) {
                 log(`[${instanceId}] store.bind() already called, skipping duplicate binding`)

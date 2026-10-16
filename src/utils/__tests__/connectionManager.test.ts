@@ -429,5 +429,36 @@ describe('ConnectionManager', () => {
             expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected', 'rejected', 'rejected', 'rejected'])
             expect(MongoClient).toHaveBeenCalledTimes(1)
         })
+
+        it('closes each dedicated pool when its own owner releases it', async () => {
+            manager = getConnectionManager()
+            const dedicated = (ownerId: string) => ({ ...reg('inst', ownerId), config: { poolStrategy: 'dedicated' as const } })
+            const first = await manager.registerInstance(dedicated('store-a'))
+            const second = await manager.registerInstance(dedicated('store-b'))
+            expect(first.poolId).not.toBe(second.poolId)
+
+            await manager.unregisterInstance('inst', 'store-a')
+
+            expect(first.client.close).toHaveBeenCalled()
+            expect(second.client.close).not.toHaveBeenCalled()
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(second.poolId)
+
+            await manager.unregisterInstance('inst', 'store-b')
+
+            expect(second.client.close).toHaveBeenCalled()
+            expect(manager.getMetrics().totalPools).toBe(0)
+        })
+
+        it('retires a pool so the next registration gets a new client', async () => {
+            manager = getConnectionManager()
+            const first = await manager.registerInstance(reg('inst', 'store-a'))
+
+            await manager.retirePool(first.poolId)
+            const next = await manager.registerInstance(reg('inst', 'store-a'))
+
+            expect(first.client.close).toHaveBeenCalled()
+            expect(next.poolId).not.toBe(first.poolId)
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(next.poolId)
+        })
     })
 })

@@ -30,6 +30,8 @@ export class ConnectionManager {
     // WAB-978: stores that hold each instance registration, and pools that are being created
     private instanceOwners: Map<string, Set<string>> = new Map()
     private creatingPools: Map<string, Promise<ConnectionPool>> = new Map()
+    // Dedicated pools belong to one owner: `${instanceId}\u0000${ownerId}` -> poolId
+    private dedicatedPools: Map<string, string> = new Map()
     private poolSequence = 0
     
     // Configuration
@@ -198,6 +200,17 @@ export class ConnectionManager {
         this.instanceOwners.set(instanceId, owners)
         poolSelection.pool.lastUsedAt = new Date()
 
+        // WAB-978: a dedicated pool belongs to its owner. A new dedicated registration by the same
+        // owner (a reconnect) replaces the owner's previous dedicated pool.
+        if (config?.poolStrategy === 'dedicated') {
+            const key = this.ownerKey(instanceId, ownerId ?? instanceId)
+            const previous = this.dedicatedPools.get(key)
+            this.dedicatedPools.set(key, poolId)
+            if (previous && previous !== poolId) {
+                await this.releaseDedicatedPool(instanceId, previous)
+            }
+        }
+
         if (pendingMigration && poolId === pendingMigration.toPoolId) {
             const previousPool = this.pools.get(pendingMigration.fromPoolId)
             this.pendingMigrations.delete(instanceId)
@@ -236,9 +249,26 @@ export class ConnectionManager {
         if (ownerId !== undefined) {
             const owners = this.instanceOwners.get(instanceId)
             owners?.delete(ownerId)
+            const key = this.ownerKey(instanceId, ownerId)
+            const ownDedicatedPool = this.dedicatedPools.get(key)
+            this.dedicatedPools.delete(key)
             if (owners && owners.size > 0) {
+                if (ownDedicatedPool) {
+                    await this.releaseDedicatedPool(instanceId, ownDedicatedPool, options?.maxWaitMs)
+                }
                 this.log('info', `Released one owner of instance ${instanceId}; ${owners.size} owner(s) remain`)
                 return
+            }
+            if (ownDedicatedPool) {
+                await this.releaseDedicatedPool(instanceId, ownDedicatedPool, options?.maxWaitMs)
+            }
+        }
+        // Any dedicated pools still held for this instance go with it
+        const remainingDedicated: string[] = []
+        for (const [key, dedicatedPoolId] of this.dedicatedPools) {
+            if (key.startsWith(`${instanceId}\u0000`)) {
+                remainingDedicated.push(dedicatedPoolId)
+                this.dedicatedPools.delete(key)
             }
         }
         this.instanceOwners.delete(instanceId)
@@ -262,6 +292,51 @@ export class ConnectionManager {
         }
         if (pendingPool && pendingPool !== pool && pendingPool.instances.size === 0) {
             await this.closePool(pendingPool.id, options?.maxWaitMs)
+        }
+        for (const dedicatedPoolId of remainingDedicated) {
+            if (dedicatedPoolId !== pool?.id) {
+                await this.releaseDedicatedPool(instanceId, dedicatedPoolId, options?.maxWaitMs)
+            }
+        }
+    }
+
+    /**
+     * WAB-978: close a pool whose client does not work, for every instance on it. Instances see
+     * the missing mapping and register again on a new pool. Active operations are not awaited,
+     * because a pool that does not answer will not finish them.
+     */
+    public async retirePool(poolId: string): Promise<void> {
+        if (!this.pools.has(poolId)) return
+        this.log('warn', `Retiring pool ${this.redactConnectionString(poolId)}`)
+        await this.closePool(poolId, 0)
+    }
+
+    private ownerKey(instanceId: string, ownerId: string): string {
+        return `${instanceId}\u0000${ownerId}`
+    }
+
+    /** Detach one owner's dedicated pool from the instance and close it when no instance uses it. */
+    private async releaseDedicatedPool(instanceId: string, poolId: string, maxWaitMs?: number): Promise<void> {
+        const pool = this.pools.get(poolId)
+        if (!pool) return
+        pool.instances.delete(instanceId)
+        if (this.instancePools.get(instanceId) === poolId) {
+            // Point the instance at another live dedicated pool of the same instance, if any
+            let replacement: string | undefined
+            for (const [key, otherPoolId] of this.dedicatedPools) {
+                if (key.startsWith(`${instanceId}\u0000`) && otherPoolId !== poolId && this.pools.has(otherPoolId)) {
+                    replacement = otherPoolId
+                    break
+                }
+            }
+            if (replacement) {
+                this.instancePools.set(instanceId, replacement)
+            } else {
+                this.instancePools.delete(instanceId)
+            }
+        }
+        if (pool.instances.size === 0) {
+            await this.closePool(poolId, maxWaitMs)
         }
     }
     
@@ -414,6 +489,7 @@ export class ConnectionManager {
         this.pendingMigrations.clear()
         this.instanceOwners.clear()
         this.creatingPools.clear()
+        this.dedicatedPools.clear()
         
         // Clear singleton instance
         ConnectionManager.instance = null

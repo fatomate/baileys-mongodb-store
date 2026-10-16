@@ -111,6 +111,36 @@ describe('WAB-978 store lifecycle', () => {
         expect(ev.eventNames().filter((name) => ev.listenerCount(name) > 0)).toEqual([])
     })
 
+    test('bind() after close() attaches no listeners', async () => {
+        const store = await make(newInstance())
+        await store.close()
+        const ev = new EventEmitter()
+
+        store.bind(ev)
+
+        expect(listenerTotal(ev)).toBe(0)
+    })
+
+    test('reconnect() replaces a shared pool whose client no longer answers', async () => {
+        const instanceId = newInstance()
+        const store = await make(instanceId)
+        const ev = new EventEmitter()
+        store.bind(ev)
+        const cm = ConnectionManager.getInstance()
+        const oldPoolId = cm.getInstancePoolState(instanceId).currentPoolId!
+        const oldPool = (cm as any).pools.get(oldPoolId)
+        // The old client stays open but no longer answers (wedged)
+        jest.spyOn(oldPool.db, 'admin').mockReturnValue({ ping: () => Promise.reject(new Error('wedged')) } as any)
+
+        await store.reconnect()
+
+        const newPoolId = cm.getInstancePoolState(instanceId).currentPoolId
+        expect(newPoolId).toBeDefined()
+        expect(newPoolId).not.toBe(oldPoolId)
+        emitBurst(ev, 50)
+        await waitForCount(instanceId, 50)
+    })
+
     test('R1: an operation on a closed store rejects and does not break another store on the shared pool', async () => {
         const a = await make(newInstance())
         const bId = newInstance()
