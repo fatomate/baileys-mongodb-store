@@ -11,6 +11,7 @@ import {
     canonicalPhoneJid
 } from './jidUtils'
 import { retryWithBackoff } from './connectionRetry'
+import { errorKind, reportBurst } from './burstLog'
 import type { BaileysLIDMappingStore, BaileysLIDMapping } from './lidCompatibility'
 
 export interface LidMapping {
@@ -26,6 +27,14 @@ export interface LidHandlerConfig {
     enableCache?: boolean // Enable caching (default: true)
     skipIndexCreation?: boolean // Skip creating indexes here (default: true; smart manager handles it)
     ensureConnection?: () => Promise<void> // Optional callback to ensure connection before operations
+    /**
+     * WAB-978: runs each mapping write with the store's connection recovery (reconnect, retry,
+     * operation counting). The operation reads the collection handles on each attempt, so a
+     * retry after a reconnect uses the new client.
+     */
+    runOperation?: <T>(operation: () => Promise<T>) => Promise<T>
+    /** WAB-978: store-level limit for concurrent lid-mapping.update persistence. Default: 16 */
+    mappingUpdateConcurrency?: number
     /**
      * When false, DB lookups into contacts are disabled; only legacy lidMappings and
      * reverse lookups from messages will be attempted. Default: true
@@ -81,6 +90,7 @@ export class LidHandler {
     private db: Db | null = null
     private cache: NodeCache
     private ensureConnectionCb?: () => Promise<void>
+    private runOperation: <T>(operation: () => Promise<T>) => Promise<T>
     private config: { cacheTTL: number; enableCache: boolean; skipIndexCreation: boolean; autoFillFromLegacy: boolean; lookupsEnabled: boolean; preferReverseLookupFirst: boolean; contactsQueryMaxTimeMS: number; dynamicNegativeBackoff: boolean; minNegativeCacheTTL: number; maxNegativeCacheTTL: number; cacheTTLSeconds: number }
     private instanceId: string
     private isInitialized: boolean = false
@@ -112,6 +122,7 @@ export class LidHandler {
             cacheTTLSeconds: config?.cacheTTLSeconds ?? (3 * 24 * 60 * 60)
         }
         this.ensureConnectionCb = config?.ensureConnection
+        this.runOperation = config?.runOperation ?? (<T>(operation: () => Promise<T>) => operation())
         this.redis = config?.redisClient ?? null
 
         const derivedNegativeTTL = Math.max(60, Math.min(300, Math.floor((this.config.cacheTTL || 600) / 6)))
@@ -244,8 +255,9 @@ export class LidHandler {
                 error.message?.includes('Client must be connected') ||
                 error.message?.includes('server is closed') ||
                 error.message?.includes('Topology is closed')) {
+                // WAB-978: keep isInitialized. Clearing it made storeLidMapping skip writes silently
+                // until the next re-init; the store's reconnect refreshes the handles instead.
                 console.warn(`[LidHandler] ${operationName}: Connection lost during operation, returning fallback`)
-                this.isInitialized = false // Mark as not initialized so caller can re-init after reconnection
                 return fallback
             }
             
@@ -538,11 +550,13 @@ export class LidHandler {
         // Decide whether to update fields to avoid unnecessary writes
         let shouldSetPushName = false
         let shouldSetLid = true // default true; will turn false if existing doc has same lid
+        // WAB-978: read the handle inside each attempt; a reconnect re-initializes it
+        const contacts = () => this.contactsCollection!
         try {
-            const existing = await this.contactsCollection.findOne(
+            const existing = await this.runOperation(() => contacts().findOne(
                 { instanceId: this.instanceId, id: normalizedPhone },
                 { projection: { pushName: 1, lid: 1 } }
-            )
+            ))
             if (existing) {
                 if (cleanedPushName && existing.pushName !== cleanedPushName) {
                     shouldSetPushName = true
@@ -565,7 +579,7 @@ export class LidHandler {
         try {
             // Upsert the mapping into contacts (by phone JID as contact id)
             try {
-                await this.contactsCollection.updateOne(
+                await this.runOperation(() => contacts().updateOne(
                     { 
                         instanceId: this.instanceId, 
                         id: normalizedPhone 
@@ -583,11 +597,11 @@ export class LidHandler {
                         }
                     },
                     { upsert: true }
-                )
+                ))
             } catch (e: any) {
                 if (e?.code === 11000) {
                     // Retry without upsert; don't override existing pushName if set
-                    await this.contactsCollection.updateOne(
+                    await this.runOperation(() => contacts().updateOne(
                         { 
                             instanceId: this.instanceId, 
                             id: normalizedPhone,
@@ -601,7 +615,7 @@ export class LidHandler {
                             }
                         },
                         { upsert: false }
-                    )
+                    ))
                 } else {
                     throw e
                 }
@@ -616,7 +630,7 @@ export class LidHandler {
 
             if (this.lidMappingsCollection) {
                 try {
-                    const result = await this.lidMappingsCollection.updateOne(
+                    const result = await this.runOperation(() => this.lidMappingsCollection!.updateOne(
                         { instanceId: this.instanceId, lid: normalizedLid },
                         {
                             $setOnInsert: {
@@ -628,7 +642,7 @@ export class LidHandler {
                             }
                         },
                         { upsert: true }
-                    )
+                    ))
 
                     if (result.matchedCount > 0 && result.upsertedCount === 0 && process.env.DEBUG_LID === 'true') {
                         const existing = await this.lidMappingsCollection.findOne(
@@ -649,7 +663,8 @@ export class LidHandler {
             
             console.log(`[LidHandler] Stored mapping in contacts: [redacted] -> [redacted]`)
         } catch (error) {
-            console.error('[LidHandler] Failed to store LID mapping:', ((error as any)?.codeName || (error as any)?.name || 'Error'))
+            // WAB-978: one summary line per burst instead of one line per write
+            reportBurst('[LidHandler] Failed to store LID mapping', errorKind(error))
         }
     }
 

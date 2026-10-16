@@ -109,6 +109,11 @@ export interface InstanceRegistration {
     uri: string
     database: string
     config?: ConnectionConfig
+    /**
+     * One store that holds this registration (WAB-978). Several owners can share one instanceId;
+     * the registration is released only when the last owner releases it. Defaults to instanceId.
+     */
+    ownerId?: string
 }
 
 export interface InstanceRegistrationResult {

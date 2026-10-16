@@ -319,4 +319,165 @@ describe('ConnectionManager', () => {
             expect((ConnectionManager as any).instance).toBeNull()
         })
     })
+
+    describe('WAB-978 ownership and pool hygiene', () => {
+        const reg = (instanceId: string, ownerId?: string) => ({
+            instanceId, ownerId, uri: 'mongodb://localhost:27017', database: 'testdb'
+        })
+
+        it('keeps the registration and pool while another owner of the same instance holds it', async () => {
+            manager = getConnectionManager()
+            const { client } = await manager.registerInstance(reg('inst', 'store-a'))
+            await manager.registerInstance(reg('inst', 'store-b'))
+
+            await manager.unregisterInstance('inst', 'store-a')
+
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBeDefined()
+            expect(client.close).not.toHaveBeenCalled()
+
+            await manager.unregisterInstance('inst', 'store-b')
+
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBeUndefined()
+            expect(client.close).toHaveBeenCalled()
+        })
+
+        it('releases the instance for all owners when unregistered without an ownerId', async () => {
+            manager = getConnectionManager()
+            const { client } = await manager.registerInstance(reg('inst', 'store-a'))
+            await manager.registerInstance(reg('inst', 'store-b'))
+
+            await manager.unregisterInstance('inst')
+
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBeUndefined()
+            expect(client.close).toHaveBeenCalled()
+        })
+
+        it('never hands out a pool that is closing', async () => {
+            manager = getConnectionManager()
+            const first = await manager.registerInstance(reg('inst-1'))
+            const endOperation = manager.beginInstanceOperation('inst-1')
+            const closing = (manager as any).closePool(first.poolId)
+
+            const second = await manager.registerInstance(reg('inst-2'))
+
+            expect(second.poolId).not.toBe(first.poolId)
+            expect(manager.getInstancePoolState('inst-1').currentPoolId).toBeUndefined()
+            endOperation()
+            await closing
+        })
+
+        it('creates one pool for concurrent registrations', async () => {
+            manager = getConnectionManager()
+            const results = await Promise.all(
+                ['a', 'b', 'c', 'd', 'e'].map((id) => manager!.registerInstance(reg(id)))
+            )
+
+            expect(new Set(results.map((r) => r.poolId)).size).toBe(1)
+            expect(MongoClient).toHaveBeenCalledTimes(1)
+        })
+
+        it('keeps a new registration made while the old owner pool is still closing', async () => {
+            manager = getConnectionManager()
+            await manager.registerInstance(reg('inst', 'old-store'))
+            const endOperation = manager.beginInstanceOperation('inst')
+            const unregistering = manager.unregisterInstance('inst', 'old-store')
+
+            const fresh = await manager.registerInstance(reg('inst', 'new-store'))
+            endOperation()
+            await unregistering
+
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(fresh.poolId)
+            expect(manager.getInstanceMetrics('inst')).toBeDefined()
+        })
+
+        it('does not overfill a pool when concurrent registrations wait for its creation', async () => {
+            manager = getConnectionManager({
+                tierConfigurations: { warm: { maxPoolSize: 5, minPoolSize: 1, maxInstancesPerPool: 1, maxIdleTimeMS: 60000 } }
+            })
+            const [a, b] = await Promise.all([manager.registerInstance(reg('a')), manager.registerInstance(reg('b'))])
+
+            expect(a.poolId).not.toBe(b.poolId)
+        })
+
+        it('creates only as many pools as capacity needs when many registrations overflow a pending pool', async () => {
+            manager = getConnectionManager({
+                tierConfigurations: { warm: { maxPoolSize: 5, minPoolSize: 1, maxInstancesPerPool: 2, maxIdleTimeMS: 60000 } }
+            })
+            const results = await Promise.all(
+                ['a', 'b', 'c', 'd', 'e', 'f'].map((id) => manager!.registerInstance(reg(id)))
+            )
+
+            const sizes = new Map<string, number>()
+            for (const r of results) sizes.set(r.poolId, (sizes.get(r.poolId) ?? 0) + 1)
+            expect(sizes.size).toBe(3)
+            expect(Array.from(sizes.values())).toEqual([2, 2, 2])
+            expect(MongoClient).toHaveBeenCalledTimes(3)
+        })
+
+        it('gives a shared pool creation failure to every waiter with one connection attempt', async () => {
+            manager = getConnectionManager()
+            ;(MongoClient as unknown as jest.Mock).mockImplementationOnce(() => ({
+                connect: jest.fn().mockRejectedValue(new Error('mongo down')),
+                close: jest.fn().mockResolvedValue(undefined),
+                db: jest.fn()
+            }))
+
+            const results = await Promise.allSettled(
+                ['a', 'b', 'c', 'd', 'e'].map((id) => manager!.registerInstance(reg(id)))
+            )
+
+            expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected', 'rejected', 'rejected', 'rejected'])
+            expect(MongoClient).toHaveBeenCalledTimes(1)
+        })
+
+        it('closes each dedicated pool when its own owner releases it', async () => {
+            manager = getConnectionManager()
+            const dedicated = (ownerId: string) => ({ ...reg('inst', ownerId), config: { poolStrategy: 'dedicated' as const } })
+            const first = await manager.registerInstance(dedicated('store-a'))
+            const second = await manager.registerInstance(dedicated('store-b'))
+            expect(first.poolId).not.toBe(second.poolId)
+
+            await manager.unregisterInstance('inst', 'store-a')
+
+            expect(first.client.close).toHaveBeenCalled()
+            expect(second.client.close).not.toHaveBeenCalled()
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(second.poolId)
+
+            await manager.unregisterInstance('inst', 'store-b')
+
+            expect(second.client.close).toHaveBeenCalled()
+            expect(manager.getMetrics().totalPools).toBe(0)
+        })
+
+        it('keeps a new owner registered while the last old owner dedicated pool is closing', async () => {
+            manager = getConnectionManager()
+            const dedicated = (ownerId: string) => ({ ...reg('inst', ownerId), config: { poolStrategy: 'dedicated' as const } })
+            await manager.registerInstance(dedicated('old-store'))
+            const endOperation = manager.beginInstanceOperation('inst')
+            const unregistering = manager.unregisterInstance('inst', 'old-store')
+
+            const fresh = await manager.registerInstance(dedicated('new-store'))
+            endOperation()
+            await unregistering
+
+            expect(fresh.client.close).not.toHaveBeenCalled()
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(fresh.poolId)
+            expect(manager.getInstanceMetrics('inst')).toBeDefined()
+
+            await manager.unregisterInstance('inst', 'new-store')
+            expect(fresh.client.close).toHaveBeenCalled()
+        })
+
+        it('retires a pool so the next registration gets a new client', async () => {
+            manager = getConnectionManager()
+            const first = await manager.registerInstance(reg('inst', 'store-a'))
+
+            await manager.retirePool(first.poolId)
+            const next = await manager.registerInstance(reg('inst', 'store-a'))
+
+            expect(first.client.close).toHaveBeenCalled()
+            expect(next.poolId).not.toBe(first.poolId)
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(next.poolId)
+        })
+    })
 })

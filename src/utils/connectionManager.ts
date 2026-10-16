@@ -27,6 +27,12 @@ export class ConnectionManager {
     private instanceMetrics: Map<string, InstanceMetrics> = new Map()
     private instancePools: Map<string, string> = new Map() // instanceId -> poolId
     private pendingMigrations: Map<string, PendingMigration> = new Map()
+    // WAB-978: stores that hold each instance registration, and pools that are being created
+    private instanceOwners: Map<string, Set<string>> = new Map()
+    private creatingPools: Map<string, Promise<ConnectionPool>> = new Map()
+    // Dedicated pools belong to one owner: `${instanceId}\u0000${ownerId}` -> poolId
+    private dedicatedPools: Map<string, string> = new Map()
+    private poolSequence = 0
     
     // Configuration
     private config: Required<ConnectionManagerConfig>
@@ -149,7 +155,7 @@ export class ConnectionManager {
      * Register an instance and get a connection
      */
     public async registerInstance(registration: InstanceRegistration): Promise<InstanceRegistrationResult> {
-        const { instanceId, uri, database, config } = registration
+        const { instanceId, uri, database, config, ownerId } = registration
         
         this.log('info', `Registering instance ${instanceId}`)
         
@@ -189,7 +195,21 @@ export class ConnectionManager {
         const poolId = poolSelection.pool.id
         this.instancePools.set(instanceId, poolId)
         poolSelection.pool.instances.add(instanceId)
+        const owners = this.instanceOwners.get(instanceId) ?? new Set<string>()
+        owners.add(ownerId ?? instanceId)
+        this.instanceOwners.set(instanceId, owners)
         poolSelection.pool.lastUsedAt = new Date()
+
+        // WAB-978: a dedicated pool belongs to its owner. A new dedicated registration by the same
+        // owner (a reconnect) replaces the owner's previous dedicated pool.
+        if (config?.poolStrategy === 'dedicated') {
+            const key = this.ownerKey(instanceId, ownerId ?? instanceId)
+            const previous = this.dedicatedPools.get(key)
+            this.dedicatedPools.set(key, poolId)
+            if (previous && previous !== poolId) {
+                await this.releaseDedicatedPool(instanceId, previous)
+            }
+        }
 
         if (pendingMigration && poolId === pendingMigration.toPoolId) {
             const previousPool = this.pools.get(pendingMigration.fromPoolId)
@@ -219,38 +239,116 @@ export class ConnectionManager {
     }
     
     /**
-     * Unregister an instance
+     * Unregister an instance.
+     * With ownerId, release only that owner; the registration stays while other owners hold it.
+     * Without ownerId, release the instance for all owners (original behaviour).
+     * maxWaitMs limits how long a pool that becomes empty waits for active operations before
+     * it closes (default 15 s), so a caller with its own shutdown deadline can keep it.
      */
-    public async unregisterInstance(instanceId: string): Promise<void> {
+    public async unregisterInstance(instanceId: string, ownerId?: string, options?: { maxWaitMs?: number }): Promise<void> {
+        // WAB-978: change all registration state before the first await, then close only the pools
+        // captured here. A new owner can register this instance while a pool closes, and that
+        // registration must survive this cleanup.
+        const poolsToClose: string[] = []
+
+        if (ownerId !== undefined) {
+            const owners = this.instanceOwners.get(instanceId)
+            owners?.delete(ownerId)
+            const key = this.ownerKey(instanceId, ownerId)
+            const ownDedicatedPool = this.dedicatedPools.get(key)
+            this.dedicatedPools.delete(key)
+            if (ownDedicatedPool) {
+                this.detachDedicatedPool(instanceId, ownDedicatedPool, poolsToClose)
+            }
+            if (owners && owners.size > 0) {
+                this.log('info', `Released one owner of instance ${instanceId}; ${owners.size} owner(s) remain`)
+                await this.closeEmptyPools(poolsToClose, options?.maxWaitMs)
+                return
+            }
+        }
+        this.instanceOwners.delete(instanceId)
         this.log('info', `Unregistering instance ${instanceId}`)
-        
-        const poolId = this.instancePools.get(instanceId)
-        if (poolId) {
-            const pool = this.pools.get(poolId)
-            if (pool) {
-                pool.instances.delete(instanceId)
-                
-                // Close pool if no more instances
-                if (pool.instances.size === 0) {
-                    await this.closePool(poolId)
-                }
+
+        // Any dedicated pools still held for this instance go with it
+        for (const [key, dedicatedPoolId] of Array.from(this.dedicatedPools)) {
+            if (key.startsWith(`${instanceId}\u0000`)) {
+                this.dedicatedPools.delete(key)
+                this.detachDedicatedPool(instanceId, dedicatedPoolId, poolsToClose)
             }
         }
 
+        const poolId = this.instancePools.get(instanceId)
+        const pool = poolId ? this.pools.get(poolId) : undefined
         const pendingMigration = this.pendingMigrations.get(instanceId)
-        if (pendingMigration) {
-            const pendingPool = this.pools.get(pendingMigration.toPoolId)
-            if (pendingPool) {
-                pendingPool.instances.delete(instanceId)
-                if (pendingPool.instances.size === 0) {
-                    await this.closePool(pendingPool.id)
-                }
-            }
-            this.pendingMigrations.delete(instanceId)
-        }
-        
+        const pendingPool = pendingMigration ? this.pools.get(pendingMigration.toPoolId) : undefined
         this.instancePools.delete(instanceId)
         this.instanceMetrics.delete(instanceId)
+        this.pendingMigrations.delete(instanceId)
+        if (pool) {
+            pool.instances.delete(instanceId)
+            poolsToClose.push(pool.id)
+        }
+        if (pendingPool) {
+            pendingPool.instances.delete(instanceId)
+            poolsToClose.push(pendingPool.id)
+        }
+
+        await this.closeEmptyPools(poolsToClose, options?.maxWaitMs)
+    }
+
+    /** Close each listed pool that still exists and that no instance uses at the time of its close. */
+    private async closeEmptyPools(poolIds: string[], maxWaitMs?: number): Promise<void> {
+        for (const poolId of new Set(poolIds)) {
+            const pool = this.pools.get(poolId)
+            if (pool && pool.instances.size === 0) {
+                await this.closePool(poolId, maxWaitMs)
+            }
+        }
+    }
+
+    /**
+     * WAB-978: close a pool whose client does not work, for every instance on it. Instances see
+     * the missing mapping and register again on a new pool. Active operations are not awaited,
+     * because a pool that does not answer will not finish them.
+     */
+    public async retirePool(poolId: string): Promise<void> {
+        if (!this.pools.has(poolId)) return
+        this.log('warn', `Retiring pool ${this.redactConnectionString(poolId)}`)
+        await this.closePool(poolId, 0)
+    }
+
+    private ownerKey(instanceId: string, ownerId: string): string {
+        return `${instanceId}\u0000${ownerId}`
+    }
+
+    /** Detach one owner's dedicated pool from the instance and close it when no instance uses it. */
+    private async releaseDedicatedPool(instanceId: string, poolId: string, maxWaitMs?: number): Promise<void> {
+        const poolsToClose: string[] = []
+        this.detachDedicatedPool(instanceId, poolId, poolsToClose)
+        await this.closeEmptyPools(poolsToClose, maxWaitMs)
+    }
+
+    /** Synchronous part of a dedicated-pool release. Adds the pool to poolsToClose. */
+    private detachDedicatedPool(instanceId: string, poolId: string, poolsToClose: string[]): void {
+        const pool = this.pools.get(poolId)
+        if (!pool) return
+        pool.instances.delete(instanceId)
+        if (this.instancePools.get(instanceId) === poolId) {
+            // Point the instance at another live dedicated pool of the same instance, if any
+            let replacement: string | undefined
+            for (const [key, otherPoolId] of this.dedicatedPools) {
+                if (key.startsWith(`${instanceId}\u0000`) && otherPoolId !== poolId && this.pools.has(otherPoolId)) {
+                    replacement = otherPoolId
+                    break
+                }
+            }
+            if (replacement) {
+                this.instancePools.set(instanceId, replacement)
+            } else {
+                this.instancePools.delete(instanceId)
+            }
+        }
+        poolsToClose.push(poolId)
     }
     
     /**
@@ -400,6 +498,9 @@ export class ConnectionManager {
         this.instanceMetrics.clear()
         this.instancePools.clear()
         this.pendingMigrations.clear()
+        this.instanceOwners.clear()
+        this.creatingPools.clear()
+        this.dedicatedPools.clear()
         
         // Clear singleton instance
         ConnectionManager.instance = null
@@ -425,19 +526,35 @@ export class ConnectionManager {
                 }
             }
             const pool = await this.createPool(uri, database, tier)
+            pool.instances.add(instanceId)
             return { pool, isNew: true, reason: 'dedicated' }
         }
 
-        // Look for existing pool with capacity
-        for (const [, pool] of this.pools) {
-            if (pool.uri === uri && 
-                pool.database === database && 
-                pool.tier === tier &&
-                pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
+        // WAB-978: every return below adds the instance to the pool in the same synchronous step
+        // as the capacity check, so concurrent registrations cannot overfill one pool
 
-                pool.lastUsedAt = new Date()
-                return { pool, isNew: false, reason: 'existing' }
+        // WAB-978: concurrent registrations share one pool creation instead of creating one pool each.
+        // A waiter that finds the new pool full selects again, and joins the next creation if any.
+        const creationKey = `${uri}:${database}:${tier}`
+        for (;;) {
+            // Look for existing pool with capacity
+            for (const [, pool] of this.pools) {
+                if (!pool.isClosing &&
+                    pool.uri === uri && 
+                    pool.database === database && 
+                    pool.tier === tier &&
+                    pool.instances.size < this.tierConfigs[tier].maxInstancesPerPool) {
+
+                    pool.lastUsedAt = new Date()
+                    pool.instances.add(instanceId)
+                    return { pool, isNew: false, reason: 'existing' }
+                }
             }
+
+            const inFlight = this.creatingPools.get(creationKey)
+            if (!inFlight) break
+            // A failed creation fails every waiter too, so N waiters do not retry the connection one by one
+            await inFlight
         }
         
         // Check if we can create a new pool
@@ -449,6 +566,7 @@ export class ConnectionManager {
             const fallbackPool = this.findLeastLoadedPool(uri, database)
             if (fallbackPool) {
                 this.log('warn', `Connection limit reached, using fallback pool for ${instanceId}`)
+                fallbackPool.instances.add(instanceId)
                 return { pool: fallbackPool, isNew: false, reason: 'existing' }
             }
 
@@ -456,12 +574,22 @@ export class ConnectionManager {
         }
         
         // Create new pool
-        const pool = await this.createPool(uri, database, tier)
-        return { pool, isNew: true, reason: 'created' }
+        const creation = this.createPool(uri, database, tier)
+        this.creatingPools.set(creationKey, creation)
+        try {
+            const pool = await creation
+            pool.instances.add(instanceId)
+            return { pool, isNew: true, reason: 'created' }
+        } finally {
+            if (this.creatingPools.get(creationKey) === creation) {
+                this.creatingPools.delete(creationKey)
+            }
+        }
     }
     
     private async createPool(uri: string, database: string, tier: ConnectionTier): Promise<ConnectionPool> {
-        const poolId = `${uri}:${database}:${tier}:${Date.now()}`
+        // WAB-978: the sequence keeps IDs unique when two pools are created in the same millisecond
+        const poolId = `${uri}:${database}:${tier}:${Date.now()}:${++this.poolSequence}`
         const tierConfig = this.tierConfigs[tier]
         
         this.log('info', `Creating new ${tier} pool: ${this.redactConnectionString(poolId)}`)
@@ -492,10 +620,37 @@ export class ConnectionManager {
         }
         
         this.pools.set(poolId, pool)
+
+        // WAB-978: a client closed outside closePool() must not stay selectable
+        if (typeof (client as any).on === 'function') {
+            client.on('topologyClosed', () => {
+                if (this.pools.get(poolId) === pool) {
+                    this.log('warn', `Pool ${this.redactConnectionString(poolId)} client closed; removing pool`)
+                    pool.isClosing = true
+                    pool.acceptingOperations = false
+                    this.detachPool(poolId)
+                }
+            })
+        }
         return pool
     }
+
+    /** Remove a pool from selection and from every instance mapping. Does not close its client. */
+    private detachPool(poolId: string): void {
+        this.pools.delete(poolId)
+        for (const [instanceId, associatedPoolId] of this.instancePools) {
+            if (associatedPoolId === poolId) {
+                this.instancePools.delete(instanceId)
+            }
+        }
+        for (const [instanceId, migration] of this.pendingMigrations) {
+            if (migration.toPoolId === poolId || migration.fromPoolId === poolId) {
+                this.pendingMigrations.delete(instanceId)
+            }
+        }
+    }
     
-    private async closePool(poolId: string): Promise<void> {
+    private async closePool(poolId: string, maxWaitMs: number = 15000): Promise<void> {
         const pool = this.pools.get(poolId)
         if (!pool) return
         
@@ -506,10 +661,14 @@ export class ConnectionManager {
         
         // Stop accepting new operations
         pool.acceptingOperations = false
+
+        // WAB-978: remove the pool from selection before the wait, so no caller gets a client
+        // that is about to close. Stores see the missing mapping and register again.
+        this.detachPool(poolId)
         
         // Wait for active operations to complete (with timeout)
         const waitForOperations = async () => {
-            const maxWait = 15000 // 15 seconds grace
+            const maxWait = Math.max(0, maxWaitMs) // grace for active operations (default 15 s)
             const startTime = Date.now()
             
             while (pool.activeOperations > 0) {
@@ -536,22 +695,6 @@ export class ConnectionManager {
             
         } catch (error) {
             this.log('error', `Error closing pool ${this.redactConnectionString(poolId)}: ${error}`)
-        } finally {
-            // Always remove from pools map
-            this.pools.delete(poolId)
-            
-            // Clean up instance associations
-            for (const [instanceId, associatedPoolId] of this.instancePools) {
-                if (associatedPoolId === poolId) {
-                    this.instancePools.delete(instanceId)
-                }
-            }
-
-            for (const [instanceId, migration] of this.pendingMigrations) {
-                if (migration.toPoolId === poolId || migration.fromPoolId === poolId) {
-                    this.pendingMigrations.delete(instanceId)
-                }
-            }
         }
         
         this.log('info', `Pool ${this.redactConnectionString(poolId)} closed successfully`)
@@ -673,7 +816,7 @@ export class ConnectionManager {
         let minLoad = Infinity
         
         for (const pool of this.pools.values()) {
-            if (pool.uri !== uri || pool.database !== database) continue
+            if (pool.isClosing || pool.uri !== uri || pool.database !== database) continue
 
             const load = pool.instances.size / this.tierConfigs[pool.tier].maxInstancesPerPool
             if (load >= 1) continue
