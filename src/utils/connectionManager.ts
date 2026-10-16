@@ -246,36 +246,37 @@ export class ConnectionManager {
      * it closes (default 15 s), so a caller with its own shutdown deadline can keep it.
      */
     public async unregisterInstance(instanceId: string, ownerId?: string, options?: { maxWaitMs?: number }): Promise<void> {
+        // WAB-978: change all registration state before the first await, then close only the pools
+        // captured here. A new owner can register this instance while a pool closes, and that
+        // registration must survive this cleanup.
+        const poolsToClose: string[] = []
+
         if (ownerId !== undefined) {
             const owners = this.instanceOwners.get(instanceId)
             owners?.delete(ownerId)
             const key = this.ownerKey(instanceId, ownerId)
             const ownDedicatedPool = this.dedicatedPools.get(key)
             this.dedicatedPools.delete(key)
-            if (owners && owners.size > 0) {
-                if (ownDedicatedPool) {
-                    await this.releaseDedicatedPool(instanceId, ownDedicatedPool, options?.maxWaitMs)
-                }
-                this.log('info', `Released one owner of instance ${instanceId}; ${owners.size} owner(s) remain`)
-                return
-            }
             if (ownDedicatedPool) {
-                await this.releaseDedicatedPool(instanceId, ownDedicatedPool, options?.maxWaitMs)
+                this.detachDedicatedPool(instanceId, ownDedicatedPool, poolsToClose)
             }
-        }
-        // Any dedicated pools still held for this instance go with it
-        const remainingDedicated: string[] = []
-        for (const [key, dedicatedPoolId] of this.dedicatedPools) {
-            if (key.startsWith(`${instanceId}\u0000`)) {
-                remainingDedicated.push(dedicatedPoolId)
-                this.dedicatedPools.delete(key)
+            if (owners && owners.size > 0) {
+                this.log('info', `Released one owner of instance ${instanceId}; ${owners.size} owner(s) remain`)
+                await this.closeEmptyPools(poolsToClose, options?.maxWaitMs)
+                return
             }
         }
         this.instanceOwners.delete(instanceId)
         this.log('info', `Unregistering instance ${instanceId}`)
 
-        // WAB-978: remove the registration before any await. A new owner can register this
-        // instance while a pool closes, and that registration must survive this cleanup.
+        // Any dedicated pools still held for this instance go with it
+        for (const [key, dedicatedPoolId] of Array.from(this.dedicatedPools)) {
+            if (key.startsWith(`${instanceId}\u0000`)) {
+                this.dedicatedPools.delete(key)
+                this.detachDedicatedPool(instanceId, dedicatedPoolId, poolsToClose)
+            }
+        }
+
         const poolId = this.instancePools.get(instanceId)
         const pool = poolId ? this.pools.get(poolId) : undefined
         const pendingMigration = this.pendingMigrations.get(instanceId)
@@ -283,19 +284,24 @@ export class ConnectionManager {
         this.instancePools.delete(instanceId)
         this.instanceMetrics.delete(instanceId)
         this.pendingMigrations.delete(instanceId)
-        pool?.instances.delete(instanceId)
-        pendingPool?.instances.delete(instanceId)
+        if (pool) {
+            pool.instances.delete(instanceId)
+            poolsToClose.push(pool.id)
+        }
+        if (pendingPool) {
+            pendingPool.instances.delete(instanceId)
+            poolsToClose.push(pendingPool.id)
+        }
 
-        // Close pools that have no more instances
-        if (pool && pool.instances.size === 0) {
-            await this.closePool(pool.id, options?.maxWaitMs)
-        }
-        if (pendingPool && pendingPool !== pool && pendingPool.instances.size === 0) {
-            await this.closePool(pendingPool.id, options?.maxWaitMs)
-        }
-        for (const dedicatedPoolId of remainingDedicated) {
-            if (dedicatedPoolId !== pool?.id) {
-                await this.releaseDedicatedPool(instanceId, dedicatedPoolId, options?.maxWaitMs)
+        await this.closeEmptyPools(poolsToClose, options?.maxWaitMs)
+    }
+
+    /** Close each listed pool that still exists and that no instance uses at the time of its close. */
+    private async closeEmptyPools(poolIds: string[], maxWaitMs?: number): Promise<void> {
+        for (const poolId of new Set(poolIds)) {
+            const pool = this.pools.get(poolId)
+            if (pool && pool.instances.size === 0) {
+                await this.closePool(poolId, maxWaitMs)
             }
         }
     }
@@ -317,6 +323,13 @@ export class ConnectionManager {
 
     /** Detach one owner's dedicated pool from the instance and close it when no instance uses it. */
     private async releaseDedicatedPool(instanceId: string, poolId: string, maxWaitMs?: number): Promise<void> {
+        const poolsToClose: string[] = []
+        this.detachDedicatedPool(instanceId, poolId, poolsToClose)
+        await this.closeEmptyPools(poolsToClose, maxWaitMs)
+    }
+
+    /** Synchronous part of a dedicated-pool release. Adds the pool to poolsToClose. */
+    private detachDedicatedPool(instanceId: string, poolId: string, poolsToClose: string[]): void {
         const pool = this.pools.get(poolId)
         if (!pool) return
         pool.instances.delete(instanceId)
@@ -335,9 +348,7 @@ export class ConnectionManager {
                 this.instancePools.delete(instanceId)
             }
         }
-        if (pool.instances.size === 0) {
-            await this.closePool(poolId, maxWaitMs)
-        }
+        poolsToClose.push(poolId)
     }
     
     /**

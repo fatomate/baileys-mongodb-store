@@ -449,6 +449,25 @@ describe('ConnectionManager', () => {
             expect(manager.getMetrics().totalPools).toBe(0)
         })
 
+        it('keeps a new owner registered while the last old owner dedicated pool is closing', async () => {
+            manager = getConnectionManager()
+            const dedicated = (ownerId: string) => ({ ...reg('inst', ownerId), config: { poolStrategy: 'dedicated' as const } })
+            await manager.registerInstance(dedicated('old-store'))
+            const endOperation = manager.beginInstanceOperation('inst')
+            const unregistering = manager.unregisterInstance('inst', 'old-store')
+
+            const fresh = await manager.registerInstance(dedicated('new-store'))
+            endOperation()
+            await unregistering
+
+            expect(fresh.client.close).not.toHaveBeenCalled()
+            expect(manager.getInstancePoolState('inst').currentPoolId).toBe(fresh.poolId)
+            expect(manager.getInstanceMetrics('inst')).toBeDefined()
+
+            await manager.unregisterInstance('inst', 'new-store')
+            expect(fresh.client.close).toHaveBeenCalled()
+        })
+
         it('retires a pool so the next registration gets a new client', async () => {
             manager = getConnectionManager()
             const first = await manager.registerInstance(reg('inst', 'store-a'))
