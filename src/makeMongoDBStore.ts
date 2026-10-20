@@ -712,7 +712,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                             'message.protocolMessage': message.message.protocolMessage,
                                             revoked: true,
                                             revokedAt: new Date(),
-                                            revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid
+                                            revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
+                                            updatedAt: new Date()
                                         }
                                     }
                                 )
@@ -2176,7 +2177,7 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                             try {
                                 await collections.messages.updateOne(
                                     { instanceId: validatedInstanceId, 'key.id': validId },
-                                    { $set: { jid: validJid, 'key.remoteJid': validJid } }
+                                    { $set: { jid: validJid, 'key.remoteJid': validJid, updatedAt: new Date() } }
                                 )
                             } catch {}
                         }
@@ -2246,7 +2247,8 @@ export const makeMongoDBStore = async (config: MongoDBStoreConfig): Promise<Mong
                                         'message.protocolMessage': message.message.protocolMessage,
                                         revoked: true,
                                         revokedAt: new Date(),
-                                        revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid
+                                        revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
+                                        updatedAt: new Date()
                                     }
                                 }
                             )

@@ -202,6 +202,6 @@ export const writeMessageUpdate = async (
     const unchanged = stored.t === 'missing'
         ? { messageTimestamp: { $exists: false } }
         : { $expr: { $and: [{ $eq: [TS_TYPE, stored.t] }, { $eq: ['$messageTimestamp', { $literal: stored.v }] }] } }
-    await collection.updateOne({ _id: stored._id, ...unchanged }, { $set: { messageTimestamp: incoming } })
+    await collection.updateOne({ _id: stored._id, ...unchanged }, { $set: { messageTimestamp: incoming, updatedAt: new Date() } })
     return result
 }
