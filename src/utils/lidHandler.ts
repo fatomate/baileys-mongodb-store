@@ -1240,7 +1240,8 @@ export class LidHandler {
                                     'key.remoteJidAlt': normalizedLid,
                                     'key.addressingMode': 'pn',
                                     'lidMapping.resolved': true,
-                                    'lidMapping.resolvedAt': new Date()
+                                    'lidMapping.resolvedAt': new Date(),
+                                    updatedAt: new Date()
                                 }
                             },
                             { maxTimeMS: Math.max(1, left()) }

@@ -59,6 +59,14 @@ describe('updateExistingMessages', () => {
         expect(await byId('a1')).toMatchObject({ jid: PHONE, key: { remoteJid: PHONE, remoteJidAlt: LID, addressingMode: 'pn' } })
     })
 
+    // WAB-484: the backend Live Chat list cache reads changed rows by updatedAt; a re-key moves the row to another conversation.
+    it('moves updatedAt on a re-keyed row', async () => {
+        const old = new Date('2026-01-01T00:00:00Z')
+        await messages(h).insertOne(row('u1', { updatedAt: old }))
+        await handler.updateExistingMessages(LID, PHONE)
+        expect((await byId('u1'))!.updatedAt.getTime()).toBeGreaterThan(old.getTime())
+    })
+
     it('does not select a row whose jid already names another phone', async () => {
         await messages(h).insertOne(row('c1', { jid: OTHER }))
         const result = await handler.updateExistingMessages(LID, PHONE)

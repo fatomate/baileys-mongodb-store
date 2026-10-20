@@ -1450,7 +1450,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             revoked: true,
                             revokedAt: new Date(),
                             revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
-                            messageStubType: 1
+                            messageStubType: 1,
+                            updatedAt: new Date()
                         }
                         
                         let updateResult = await withConnection(async () =>
@@ -2233,7 +2234,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     revoked: true,
                                     revokedAt: new Date(),
                                     revokedBy: message.key?.fromMe ? 'me' : message.key?.participant || message.key?.remoteJid,
-                                    messageStubType: 1
+                                    messageStubType: 1,
+                                    updatedAt: new Date()
                                 }
                                 
                                 let updateResult = await withConnection(async () =>
@@ -4777,7 +4779,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             await withConnection(async () =>
                                 collections.messages.updateOne(
                                     { instanceId: validatedInstanceId, 'key.id': validId },
-                                    { $set: { jid: validJid, 'key.remoteJid': validJid } }
+                                    { $set: { jid: validJid, 'key.remoteJid': validJid, updatedAt: new Date() } }
                                 )
                             )
                         } catch {}
@@ -4853,7 +4855,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                             'key.remoteJid': phoneJid,
                                                             jid: phoneJid,
                                                             'lidMapping.resolved': true,
-                                                            'lidMapping.resolvedAt': new Date()
+                                                            'lidMapping.resolvedAt': new Date(),
+                                                            updatedAt: new Date()
                                                         }
                                                     }
                                                 )
@@ -4879,7 +4882,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                                             jid: phoneJid,
                                                             'key.remoteJid': phoneJid,
                                                             'lidMapping.resolved': true,
-                                                            'lidMapping.resolvedAt': new Date()
+                                                            'lidMapping.resolvedAt': new Date(),
+                                                            updatedAt: new Date()
                                                         }
                                                     }
                                                 )
@@ -4956,7 +4960,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 revoked: true,
                                 revokedAt: new Date(),
                                 revokedBy: clonedMessage.key.fromMe ? 'me' : clonedMessage.key.participant || clonedMessage.key.remoteJid,
-                                messageStubType: 1
+                                messageStubType: 1,
+                                updatedAt: new Date()
                             }
                             
                             let updateResult = await withConnection(async () =>
@@ -6026,7 +6031,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     revoked: true,
                                     revokedAt: new Date(),
                                     revokedBy: msg.key.fromMe ? 'me' : msg.key.participant || msg.key.remoteJid,
-                                    messageStubType: 1 // REVOKE
+                                    messageStubType: 1, // REVOKE
+                                    updatedAt: new Date()
                                 }
                                 
                                 let updateResult = await withConnection(async () =>
