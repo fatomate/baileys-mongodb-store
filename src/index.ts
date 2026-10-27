@@ -2,6 +2,7 @@ export { makeMongoDBStore, cleanupMongoDBStore } from './makeMongoDBStore'
 export { makeEnhancedMongoDBStore } from './makeEnhancedMongoDBStore'
 export { getConnectionManager, getConnectionMetrics, ConnectionManager } from './utils/connectionManager'
 export { normalizeMessageTimestamp } from './utils/messageTimestamp'
+export { shutdownSharedQueueManager } from './utils/sharedQueueManager'
 export type { MongoDBStore, MongoDBStoreConfig } from './types'
 export type { EnhancedMongoDBStore, EnhancedMongoDBStoreConfig } from './types-enhanced'
 export type { 
@@ -21,5 +22,6 @@ module.exports = {
     getConnectionManager: require('./utils/connectionManager').getConnectionManager,
     getConnectionMetrics: require('./utils/connectionManager').getConnectionMetrics,
     ConnectionManager: require('./utils/connectionManager').ConnectionManager,
-    normalizeMessageTimestamp: require('./utils/messageTimestamp').normalizeMessageTimestamp
+    normalizeMessageTimestamp: require('./utils/messageTimestamp').normalizeMessageTimestamp,
+    shutdownSharedQueueManager: require('./utils/sharedQueueManager').shutdownSharedQueueManager
 }
