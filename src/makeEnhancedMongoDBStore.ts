@@ -2078,7 +2078,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                     },
                     queueConcurrency: redis.queueConcurrency,
                     enableMetrics: enableMetrics,
-                    logLevel: logLevel as any
+                    logLevel: logLevel as any,
+                    handleProcessSignals: redis.handleProcessSignals
                 }
                 
                 // Get or create singleton instance

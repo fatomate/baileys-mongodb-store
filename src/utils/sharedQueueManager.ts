@@ -72,6 +72,12 @@ export interface SharedQueueManagerConfig {
     workerId?: string
     enableMetrics?: boolean
     logLevel?: 'none' | 'error' | 'warn' | 'info' | 'debug' | 'all'
+    /**
+     * Install the manager's own SIGINT/SIGTERM handler, which shuts the queues down and calls
+     * process.exit(0). Default true. Set false when the application owns its shutdown; it must
+     * then call shutdownSharedQueueManager() itself.
+     */
+    handleProcessSignals?: boolean
     missingProcessorHandling?: {
         /**
          * Maximum number of times to re-attempt a job when no processor is registered
@@ -181,8 +187,10 @@ export class SharedQueueManager extends EventEmitter {
         // Initialize queues
         this.initializeQueues()
         
-        // Set up graceful shutdown handlers
-        this.setupShutdownHandlers()
+        // Set up graceful shutdown handlers, unless the application owns process signals
+        if (config.handleProcessSignals !== false) {
+            this.setupShutdownHandlers()
+        }
     }
     
     private safeRandomId(): string {
@@ -1024,4 +1032,14 @@ export class SharedQueueManager extends EventEmitter {
             this.log('info', `✅ Cleaned queue ${queueName}`)
         }
     }
+}
+
+/**
+ * Shut the shared queue manager down, when one exists. For applications that own their process
+ * signals (handleProcessSignals: false). Returns false when no manager was created.
+ */
+export async function shutdownSharedQueueManager(): Promise<boolean> {
+    if (!SharedQueueManager.isInitialized()) return false
+    await SharedQueueManager.getInstance().shutdown()
+    return true
 }

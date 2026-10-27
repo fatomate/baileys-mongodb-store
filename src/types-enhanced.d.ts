@@ -168,6 +168,14 @@ export interface RedisConfig {
         media?: number
         lowPriority?: number
     }
+
+    /**
+     * Let the shared queue manager install its own SIGINT/SIGTERM handler, which shuts the
+     * queues down and calls process.exit(0). Default true. Set false when the application owns
+     * its shutdown; it must then call shutdownSharedQueueManager(). Only applies when
+     * useSharedQueues is true; the first store that creates the shared manager decides.
+     */
+    handleProcessSignals?: boolean
 }
 
 /**
