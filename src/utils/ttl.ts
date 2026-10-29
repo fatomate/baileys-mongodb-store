@@ -4,6 +4,17 @@
 
 import { Db } from 'mongodb'
 
+/**
+ * WAB-1070: messages and chats must not be age-deleted or get a new TTL apart from each other.
+ * A message-only delete left chats with unread and no messages; the application owns that
+ * lifecycle (chat row, unread accounting and messages together).
+ */
+function assertNotMessagesOrChats(collectionName: string, action: string): void {
+    if (/(messages|chats)$/.test(collectionName)) {
+        throw new Error(`WAB-1070: ${action} is not allowed on ${collectionName}; delete chats, their unread and their messages together in the application`)
+    }
+}
+
 export interface TTLConfig {
     /**
      * TTL in days
@@ -199,6 +210,7 @@ export class TTLMonitor {
         fieldName: string = 'updatedAt',
         ttlDays?: number
     ): Promise<void> {
+        assertNotMessagesOrChats(collectionName, 'replacing the TTL index')
         const collection = this.db.collection(collectionName)
         const ttlSeconds = (ttlDays || this.config.days) * 24 * 60 * 60
         
@@ -367,6 +379,7 @@ export class TTLMonitor {
         fieldName: string = 'updatedAt',
         dryRun: boolean = true
     ): Promise<{ deleted: number; dryRun: boolean }> {
+        if (!dryRun) assertNotMessagesOrChats(collectionName, 'an age delete')
         const collection = this.db.collection(collectionName)
         const expiryDate = new Date()
         expiryDate.setDate(expiryDate.getDate() - this.config.days)

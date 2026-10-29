@@ -7258,6 +7258,11 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         },
 
         async clearAll(options?: { preserve?: Array<'chats' | 'contacts' | 'messages' | 'presences'> }): Promise<void> {
+            // WAB-1070: deleting the messages while keeping the chats leaves chats with unread and
+            // no messages. Refuse it before any work.
+            if (options?.preserve?.includes('chats') && !options.preserve.includes('messages')) {
+                throw new Error('WAB-1070: clearAll cannot delete messages while it keeps chats')
+            }
             // Check if clearAll is already in progress
             if (clearAllInProgress) {
                 log(`[${instanceId}] clearAll already in progress, skipping duplicate call`)
