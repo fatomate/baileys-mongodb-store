@@ -247,6 +247,23 @@ describe('TTL Monitoring Utilities', () => {
                 updatedAt: { $lt: expect.any(Date) }
             })
         })
+
+        // WAB-1070: an age delete of messages or chats alone leaves chats with unread and no
+        // messages (or messages with no chat) and skips the unread accounting of the backend.
+        test.each(['wabot_messages', 'wabot_chats'])('refuses an age delete on %s', async (name) => {
+            await expect(ttlMonitor.cleanupExpiredDocuments(name, 'updatedAt', false)).rejects.toThrow(/WAB-1070/)
+            expect(mockCollection.deleteMany).not.toHaveBeenCalled()
+        })
+    })
+
+    describe('Message and Chat TTL Guard (WAB-1070)', () => {
+        // A replaced TTL index can delete messages by a shorter age than the chats that hold their unread.
+        test.each(['wabot_messages', 'wabot_chats'])('refuses to replace the TTL index of %s', async (name) => {
+            mockCollection.indexes.mockResolvedValue([{ name: 'updatedAt_1', key: { updatedAt: 1 }, expireAfterSeconds: 31536000 }] as any)
+            await expect(ttlMonitor.ensureTTLIndex(name, 'updatedAt', 7)).rejects.toThrow(/WAB-1070/)
+            expect(mockCollection.dropIndex).not.toHaveBeenCalled()
+            expect(mockCollection.createIndex).not.toHaveBeenCalled()
+        })
     })
     
     describe('TTL Status Report', () => {
