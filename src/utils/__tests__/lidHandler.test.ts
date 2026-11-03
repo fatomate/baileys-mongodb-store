@@ -1,6 +1,7 @@
 import { MongoClient, Db } from 'mongodb'
 import { MongoMemoryServer } from 'mongodb-memory-server'
 import { LidHandler } from '../lidHandler'
+import { flushBurst } from '../burstLog'
 import { proto } from 'baileys'
 
 describe('LidHandler', () => {
@@ -589,6 +590,84 @@ describe('LidHandler', () => {
             
             expect(mappings).toHaveLength(3)
             expect(mappings.map(m => m.lid).sort()).toEqual(['111@lid', '222@lid', '333@lid'])
+        })
+    })
+
+    // WAB-1248: the backend subscriber sync writes contacts with id = lid = '<n>@lid'
+    describe('self-referencing @lid contacts (WAB-1248)', () => {
+        const INSTANCE = 'test-instance'
+        const LID = '987650001@lid'
+        const PHONE = '60123450001@s.whatsapp.net'
+        const LABEL = '[LidHandler] Failed to store LID mapping'
+        const contacts = () => db.collection('test_contacts')
+        const mappings = () => db.collection('test_lidMappings')
+        // Same unique indexes as production wabot_contacts (the handler skips index creation here)
+        beforeAll(async () => {
+            await contacts().createIndex({ instanceId: 1, id: 1 }, { unique: true, name: 'wab1248_id' })
+            await contacts().createIndex({ instanceId: 1, lid: 1 }, { unique: true, name: 'wab1248_lid', partialFilterExpression: { lid: { $type: 'string' } } })
+        })
+        afterAll(async () => {
+            await contacts().dropIndex('wab1248_id')
+            await contacts().dropIndex('wab1248_lid')
+        })
+        const holdLidOnSelfRefContact = () => contacts().insertOne({ instanceId: INSTANCE, id: LID, jid: LID, lid: LID })
+
+        it('logs the Mongo code when the LID is held by a self-referencing contact', async () => {
+            await holdLidOnSelfRefContact()
+            await contacts().insertOne({ instanceId: INSTANCE, id: PHONE })
+            const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
+            try {
+                flushBurst(LABEL)
+                errorSpy.mockClear()
+
+                await lidHandler.storeLidMapping(LID, PHONE)
+                flushBurst(LABEL)
+
+                expect(errorSpy).toHaveBeenCalledTimes(1)
+                const line = String(errorSpy.mock.calls[0][0])
+                expect(line).toBe(`${LABEL}: 1 failure(s) in 5s (MongoServerError:11000×1)`)
+                expect(line).not.toMatch(/987650001|60123450001|@lid|whatsapp/)
+            } finally {
+                errorSpy.mockRestore()
+            }
+        })
+
+        it('does not return or store a LID as the phone from a self-referencing contact', async () => {
+            await holdLidOnSelfRefContact()
+
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBeNull()
+            expect(await mappings().countDocuments({ instanceId: INSTANCE, lid: LID })).toBe(0)
+        })
+
+        it('ignores a stored lid->lid mapping and uses a valid contact', async () => {
+            await mappings().insertOne({ instanceId: INSTANCE, lid: LID, phoneNumber: LID, firstSeen: new Date() })
+            await contacts().insertOne({ instanceId: INSTANCE, id: PHONE, lid: LID })
+
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBe(PHONE)
+        })
+
+        it('returns null for a stored lid->lid mapping with no valid contact', async () => {
+            await mappings().insertOne({ instanceId: INSTANCE, lid: LID, phoneNumber: LID, firstSeen: new Date() })
+
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBeNull()
+        })
+
+        it('ignores a cached LID value and reads the database', async () => {
+            const cacheLidAsPhone = () =>
+                (lidHandler as unknown as { cache: { set(key: string, value: string): void } }).cache.set(`lid:${INSTANCE}:${LID}`, LID)
+            cacheLidAsPhone()
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBeNull()
+
+            cacheLidAsPhone()
+            await mappings().insertOne({ instanceId: INSTANCE, lid: LID, phoneNumber: PHONE, firstSeen: new Date() })
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBe(PHONE)
+        })
+
+        it('keeps a negative cache entry without reading the database again', async () => {
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBeNull()
+            await mappings().insertOne({ instanceId: INSTANCE, lid: LID, phoneNumber: PHONE, firstSeen: new Date() })
+
+            expect(await lidHandler.getPhoneNumberFromLid(LID)).toBeNull()
         })
     })
 })

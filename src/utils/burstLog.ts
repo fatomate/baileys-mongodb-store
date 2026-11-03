@@ -47,5 +47,7 @@ export function burstTotal(label: string): number {
 
 export function errorKind(error: unknown): string {
     const e = error as any
-    return e?.codeName || e?.name || 'Error'
+    const kind = e?.codeName || e?.name || 'Error'
+    // WAB-1248: write errors carry no codeName, so keep the numeric server code (never keys or values)
+    return typeof e?.code === 'number' ? `${kind}:${e.code}` : kind
 }

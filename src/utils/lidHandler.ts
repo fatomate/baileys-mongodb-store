@@ -678,13 +678,19 @@ export class LidHandler {
         const cacheKey = this.getRedisKey('lid', normalizedLid)
         if (this.config.enableCache) {
             const cached = await this.cacheGet(cacheKey)
-            if (cached !== undefined) {
-                return cached === LidHandler.NEGATIVE_CACHE_SENTINEL ? null : cached
-            }
+            if (cached === LidHandler.NEGATIVE_CACHE_SENTINEL) return null
+            // WAB-1248: older releases cached a LID as the phone; treat that as a miss
+            if (cached !== undefined && isPhoneNumberFormat(cached)) return cached
         }
 
         if (this.pendingLidLookups.has(normalizedLid)) {
             return this.pendingLidLookups.get(normalizedLid)!
+        }
+
+        // WAB-1248: only a phone JID is a valid answer (self-referencing @lid contacts and lid->lid rows exist)
+        const asPhone = (jid: string | null | undefined): string | null => {
+            const normalized = jid ? normalizeJidForStorage(jid) : null
+            return normalized && isPhoneNumberFormat(normalized) ? normalized : null
         }
 
         const lookupPromise = this.runWithLimiter(async () => {
@@ -701,9 +707,7 @@ export class LidHandler {
                     if (this.config.preferReverseLookupFirst) {
                         try {
                             const reverse = await this.reversePhoneLookupFromMessages(normalizedLid)
-                            if (reverse) {
-                                phoneNumber = normalizeJidForStorage(reverse)
-                            }
+                            phoneNumber = asPhone(reverse)
                         } catch (_err) {
                             // Ignore errors during reverse lookup fallback
                         }
@@ -715,9 +719,10 @@ export class LidHandler {
                                 { instanceId: this.instanceId, lid: normalizedLid },
                                 { projection: { phoneNumber: 1 } }
                             )
-                            if (mapping?.phoneNumber) {
-                                phoneNumber = normalizeJidForStorage(mapping.phoneNumber)
-                                if (phoneNumber && this.config.autoFillFromLegacy) {
+                            const mappedPhone = asPhone(mapping?.phoneNumber)
+                            if (mappedPhone) {
+                                phoneNumber = mappedPhone
+                                if (this.config.autoFillFromLegacy) {
                                     try {
                                         await this.storeLidMapping(normalizedLid, phoneNumber)
                                     } catch (fillError) {
@@ -740,8 +745,9 @@ export class LidHandler {
                                     maxTimeMS: this.config.contactsQueryMaxTimeMS
                                 } as any
                             )
-                            if (contact?.id) {
-                                phoneNumber = normalizeJidForStorage(contact.id)
+                            const contactPhone = asPhone(contact?.id)
+                            if (contactPhone) {
+                                phoneNumber = contactPhone
                                 foundInContacts = true
                             }
                         } catch (err: any) {

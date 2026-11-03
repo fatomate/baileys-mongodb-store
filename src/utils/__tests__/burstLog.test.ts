@@ -1,4 +1,19 @@
-import { burstTotal, flushBurst, reportBurst } from '../burstLog'
+import { burstTotal, errorKind, flushBurst, reportBurst } from '../burstLog'
+
+// WAB-1248: write errors have no codeName, so the numeric code is the only clue to the cause
+describe('errorKind', () => {
+    it('adds the numeric Mongo code to the kind', () => {
+        expect(errorKind({ name: 'MongoServerError', code: 11000 })).toBe('MongoServerError:11000')
+        expect(errorKind({ name: 'MongoServerError', codeName: 'WriteConflict', code: 112 })).toBe('WriteConflict:112')
+    })
+
+    it('keeps the kind when there is no numeric code', () => {
+        expect(errorKind({ name: 'MongoPoolClosedError' })).toBe('MongoPoolClosedError')
+        expect(errorKind({ name: 'Error', code: 'ECONNRESET' })).toBe('Error')
+        expect(errorKind(undefined)).toBe('Error')
+        expect(errorKind('boom')).toBe('Error')
+    })
+})
 
 describe('WAB-978 burst log summary', () => {
     let errorSpy: jest.SpyInstance
