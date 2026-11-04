@@ -585,9 +585,13 @@ describe('contacts.lid ownership (WAB-1275)', () => {
         expect(await handler.getPhoneNumberFromLid(L)).toBe(P2)
     })
 
-    test('S8l (round 1): a holder without an id is an owner for an ordinary pair and yields only to lid-mapping.update', async () => {
+    test.each([
+        ['without an id', {}],
+        ['with a null id', { id: null }],
+        ['with an empty id', { id: '' }],
+    ])('S8l (rounds 1-2): a holder %s is an owner for an ordinary pair and yields only to lid-mapping.update', async (_name, idField) => {
         const handler = await makeHandler()
-        await contacts().insertOne({ instanceId: INSTANCE, lid: L, name: 'no id' })
+        await contacts().insertOne({ instanceId: INSTANCE, lid: L, name: 'no id', ...idField })
 
         await handler.storeLidMapping(L, P2)
 
@@ -598,6 +602,65 @@ describe('contacts.lid ownership (WAB-1275)', () => {
 
         await handler.handleLidMappingUpdate({ lid: L, pn: P2 })
         expect(await holderOf(L)).toBe(P2)
+    })
+
+    test('S8m (round 2): a failed publish after another handler moved the LID does not seed the local fallback', async () => {
+        const reader = await makeHandler()
+        const mover = await makeHandler()
+        await owner(P1)
+        const gate = deferred()
+        const reached = deferred()
+        let held = false
+        const holdFirst = async () => {
+            if (held) return
+            held = true
+            reached.resolve()
+            await gate.promise
+            throw new Error('delayed publish failure')
+        }
+        redis.evalHook = async (script) => { if (script === LID_CACHE_SCRIPTS.publish) await holdFirst() }
+        redis.setHook = holdFirst
+
+        const lookup = reader.getPhoneNumberFromLid(L)
+        await Promise.race([reached.promise, lookup])
+        redis.evalHook = null
+        redis.setHook = null
+        await mover.handleLidMappingUpdate({ lid: L, pn: P2 })
+        gate.resolve()
+        await lookup
+        redis.down = true
+
+        expect(await reader.getPhoneNumberFromLid(L)).toBe(P2)
+    })
+
+    test('S8n (round 2): a writer whose Redis begin fails does not remove the busy marker of a writer in progress', async () => {
+        const first = await makeHandler()
+        const second = await makeHandler()
+        const reader = await makeHandler()
+        await owner(P1)
+        const gate = deferred()
+        const reached = deferred()
+        // the first writer pauses after its mapping cutover, while its keys are busy
+        const target = coll(first, 'contactsCollection')
+        const original = target.updateOne.bind(target)
+        jest.spyOn(target, 'updateOne').mockImplementation((async (filter: any, update: any, options?: any) => {
+            if (update?.$unset?.lid !== undefined) { reached.resolve(); await gate.promise }
+            return original(filter, update, options)
+        }) as any)
+        const pending = first.handleLidMappingUpdate({ lid: L, pn: P2 })
+        await Promise.race([reached.promise, pending])
+
+        redis.evalHook = async (script) => { if (script === LID_CACHE_SCRIPTS.beginWrite) throw new Error('redis begin failed') }
+        await second.handleLidMappingUpdate({ lid: L, pn: P3 })
+        redis.evalHook = null
+
+        expect(redis.data.has(`{${redisKey('lid', L)}}:busy`)).toBe(true)
+        expect(await reader.getPhoneNumberFromLid(L)).toBe(P2) // the cutover already happened
+        expect(redis.data.has(redisKey('lid', L))).toBe(false) // busy: nothing cached
+        gate.resolve()
+        await pending
+        expect(await reader.getPhoneNumberFromLid(L)).toBe(P2)
+        expect(redis.data.get(redisKey('lid', L))).toBe(P2)
     })
 
     test('S9: concurrent moves of one LID in one handler leave contacts, mapping and cache in agreement', async () => {

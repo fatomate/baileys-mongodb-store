@@ -107,4 +107,34 @@ describeIfRedis('WAB-1275 Redis-side lookup fence (real Redis)', () => {
         expect(await reader.getPhoneNumberFromLid(L)).toBe(P2)
         expect(await admin.get(KEY)).toBe(P2)
     })
+
+    it('a writer whose begin call fails does not remove the busy marker of a writer in progress', async () => {
+        const first = await makeHandler()
+        const second = await makeHandler()
+        let release!: () => void
+        const gate = new Promise<void>((r) => { release = r })
+        let reachedResolve!: () => void
+        const reached = new Promise<void>((r) => { reachedResolve = r })
+        const contacts = (first as any).contactsCollection
+        const original = contacts.updateOne.bind(contacts)
+        jest.spyOn(contacts, 'updateOne').mockImplementation((async (filter: any, update: any, options?: any) => {
+            if (update?.$unset?.lid !== undefined) { reachedResolve(); await gate }
+            return original(filter, update, options)
+        }) as any)
+        const pending = first.handleLidMappingUpdate({ lid: L, pn: P2 })
+        await reached
+
+        const secondClient = (second as any).redis as Redis
+        const realEval = secondClient.eval.bind(secondClient)
+        jest.spyOn(secondClient, 'eval').mockImplementation((async (script: string, ...rest: any[]) => {
+            if (script === LID_CACHE_SCRIPTS.beginWrite) throw new Error('begin failed before Redis ran it')
+            return (realEval as any)(script, ...rest)
+        }) as any)
+        await second.handleLidMappingUpdate({ lid: L, pn: '60123450033@s.whatsapp.net' })
+
+        expect(await admin.exists(`{${KEY}}:busy`)).toBe(1)
+        release()
+        await pending
+        expect(await admin.exists(`{${KEY}}:busy`)).toBe(0)
+    })
 })

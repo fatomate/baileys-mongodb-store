@@ -200,23 +200,26 @@ export class LidHandler {
     }
 
     // WAB-1275: a write marks its keys busy and empties them, in Redis and in the local fallback.
-    // A Redis error throws, so the caller stops before it changes MongoDB.
-    private async beginCacheWrite(keys: string[]): Promise<void> {
+    // `begun` records each key whose Redis begin succeeded; only those are ended later, so a failed
+    // begin never removes another writer's busy marker. A Redis error throws, so the caller stops
+    // before it changes MongoDB.
+    private async beginCacheWrite(keys: string[], begun: string[]): Promise<void> {
         this.startKeyWrites(keys)
         keys.forEach(k => this.cache.del(k))
         if (!this.redis) return
         for (const key of keys) {
             await this.redis.eval(LID_CACHE_SCRIPTS.beginWrite, 3, ...this.fenceKeys(key),
                 LidHandler.FENCE_GENERATION_TTL_SECONDS, LidHandler.FENCE_BUSY_TTL_MS)
+            begun.push(key)
         }
     }
 
     // The write ends: empty the keys again and advance the generation, so no lookup that overlapped
     // the write can cache what it read. A Redis error here only delays caching until busy expires.
-    private async endCacheWrite(keys: string[]): Promise<void> {
+    private async endCacheWrite(keys: string[], begun: string[]): Promise<void> {
         keys.forEach(k => this.cache.del(k))
         if (this.redis) {
-            for (const key of keys) {
+            for (const key of begun) {
                 await this.redis.eval(LID_CACHE_SCRIPTS.endWrite, 3, ...this.fenceKeys(key), LidHandler.FENCE_GENERATION_TTL_SECONDS)
                     .catch((error: unknown) => console.debug('[LidHandler] Cache fence end failed:', errorKind(error)))
             }
@@ -247,22 +250,21 @@ export class LidHandler {
     }
 
     // Cache a lookup result only if no ownership write overlapped the lookup, in this handler or in
-    // any handler that shares Redis. A Redis failure falls back to the local cache, still fenced.
+    // any handler that shares Redis. With Redis configured, a lookup never writes the local fallback:
+    // the local fence cannot see writes made by another handler.
     private async publishLookup(key: string, value: string, ttlSeconds: number, fence: LookupFence): Promise<void> {
         if (fence.stale) return
-        if (this.redis) {
-            if (fence.redisGeneration !== null) {
-                try {
-                    await this.redis.eval(LID_CACHE_SCRIPTS.publish, 3, ...this.fenceKeys(key),
-                        fence.redisGeneration, value, Math.max(1, Math.floor(ttlSeconds)))
-                    return
-                } catch (err) {
-                    console.debug('[LidHandler] Redis set failed:', (err as any)?.message)
-                }
-            }
-            if (fence.stale) return
+        if (!this.redis) {
+            this.cache.set(key, value, ttlSeconds > 0 ? ttlSeconds : this.config.cacheTTL)
+            return
         }
-        this.cache.set(key, value, ttlSeconds > 0 ? ttlSeconds : this.config.cacheTTL)
+        if (fence.redisGeneration === null) return
+        try {
+            await this.redis.eval(LID_CACHE_SCRIPTS.publish, 3, ...this.fenceKeys(key),
+                fence.redisGeneration, value, Math.max(1, Math.floor(ttlSeconds)))
+        } catch (err) {
+            console.debug('[LidHandler] Redis set failed:', (err as any)?.message)
+        }
     }
 
     private endFence(key: string, fence: LookupFence): void {
@@ -707,6 +709,7 @@ export class LidHandler {
         const touchedKeys = [this.getRedisKey('lid', lid), this.getRedisKey('phone', phone)]
         let insertedMappingId: ObjectId | null = null
         let invalidated = false
+        const begunKeys: string[] = []
 
         try {
             const [holder, target, mapping] = await Promise.all([
@@ -716,13 +719,14 @@ export class LidHandler {
             ])
             const holderId: string | null = holder ? (holder.id ?? null) : null
             const holderIsSelfRef = !!holder && typeof holderId === 'string' && normalizeJidForStorage(holderId) === lid
-            // Every holder except the target and a verified self-ref is an owner, also one without an id
-            const contactOwner = holder && holderId !== phone && !holderIsSelfRef ? (holderId ?? 'holder-without-id') : null
+            // Every holder except the target and a verified self-ref is an owner, whatever its id
+            const holderIsOwner = !!holder && holderId !== phone && !holderIsSelfRef
+            const contactOwner = holderIsOwner && typeof holderId === 'string' && isPhoneNumberFormat(holderId) ? holderId : null
             const mappedPhone = this.asPhoneJid(mapping?.phoneNumber)
             const mappingOwner = mappedPhone && mappedPhone !== phone ? mappedPhone : null
 
-            if (!authoritative && (contactOwner || mappingOwner)) {
-                reportBurst(LidHandler.KEPT_LABEL, contactOwner ? 'contact' : 'mapping')
+            if (!authoritative && (holderIsOwner || mappingOwner)) {
+                reportBurst(LidHandler.KEPT_LABEL, holderIsOwner ? 'contact' : 'mapping')
                 return
             }
 
@@ -735,7 +739,7 @@ export class LidHandler {
                 if (displaced && isPhoneNumberFormat(displaced)) touchedKeys.push(this.getRedisKey('phone', normalizeJidForStorage(displaced)))
             }
             invalidated = true
-            if (this.config.enableCache) await this.beginCacheWrite(touchedKeys)
+            if (this.config.enableCache) await this.beginCacheWrite(touchedKeys, begunKeys)
             else this.startKeyWrites(touchedKeys)
 
             // The mapping write is the cutover: lookups read lidMappings first. It also runs when the
@@ -803,7 +807,7 @@ export class LidHandler {
         } finally {
             // A lookup that ran during this write must not cache what it read
             if (invalidated) {
-                if (this.config.enableCache) await this.endCacheWrite(touchedKeys)
+                if (this.config.enableCache) await this.endCacheWrite(touchedKeys, begunKeys)
                 else this.endKeyWrites(touchedKeys)
             }
         }
