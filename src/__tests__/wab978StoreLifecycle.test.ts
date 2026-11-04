@@ -377,8 +377,8 @@ describe('WAB-978 store lifecycle', () => {
         emitBurst(ev, 50)
         await new Promise((r) => setTimeout(r, 1500))
 
-        // Each event fails twice: the LidHandler write and the contact update
-        expect(burstTotal(label) - before).toBe(100)
+        // WAB-1275: each event fails once; the LidHandler is the only contacts.lid writer
+        expect(burstTotal(label) - before).toBe(50)
         expect(burstTotal(withConnectionLabel)).toBe(0)
         expect(burstTotal(eventLabel)).toBe(0)
     })

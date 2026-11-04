@@ -612,9 +612,20 @@ describe('LidHandler', () => {
         })
         const holdLidOnSelfRefContact = () => contacts().insertOne({ instanceId: INSTANCE, id: LID, jid: LID, lid: LID })
 
-        it('logs the Mongo code when the LID is held by a self-referencing contact', async () => {
-            await holdLidOnSelfRefContact()
+        // WAB-1275: a self-ref holder now yields, so force the duplicate key with a phone contact
+        // that takes the LID between the ownership checks and the write
+        it('logs the Mongo code when another contact takes the LID during the write', async () => {
             await contacts().insertOne({ instanceId: INSTANCE, id: PHONE })
+            const target = (lidHandler as any).contactsCollection
+            const original = target.updateOne.bind(target)
+            let raced = false
+            const updateSpy = jest.spyOn(target, 'updateOne').mockImplementation((async (filter: any, update: any, options?: any) => {
+                if (!raced && update?.$set?.lid === LID) {
+                    raced = true
+                    await contacts().insertOne({ instanceId: INSTANCE, id: '60123450099@s.whatsapp.net', lid: LID })
+                }
+                return original(filter, update, options)
+            }) as any)
             const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
             try {
                 flushBurst(LABEL)
@@ -629,6 +640,7 @@ describe('LidHandler', () => {
                 expect(line).not.toMatch(/987650001|60123450001|@lid|whatsapp/)
             } finally {
                 errorSpy.mockRestore()
+                updateSpy.mockRestore()
             }
         })
 

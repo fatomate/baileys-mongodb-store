@@ -1,4 +1,4 @@
-import { Collection, Db } from 'mongodb'
+import { Collection, Db, ObjectId } from 'mongodb'
 import Redis from 'ioredis'
 import NodeCache from 'node-cache'
 import { proto } from 'baileys'
@@ -84,6 +84,15 @@ export interface LidHandlerConfig {
 
 export class LidHandler {
     private static readonly NEGATIVE_CACHE_SENTINEL = '__MISS__'
+    // WAB-1275: counts ordinary pairs that disagree with the current owner (no IDs are logged)
+    private static readonly KEPT_LABEL = '[LidHandler] LID kept by existing owner'
+    private static readonly PHONE_JID_PATTERN = /(@s\.whatsapp\.net|@c\.us)$/
+    // WAB-1275: one ownership write per LID at a time in this process
+    private lidLocks: Map<string, Promise<void>> = new Map()
+    // WAB-1275: in-flight lookups per cache key; a write marks them stale so they do not cache old reads
+    private lookupFences: Map<string, Set<{ stale: boolean }>> = new Map()
+    // WAB-1275: cache keys with an ownership write in progress; a lookup that starts then never caches
+    private keysBeingWritten: Map<string, number> = new Map()
     private lidMappingsCollection: Collection<LidMapping> | null = null // legacy read-only fallback
     private contactsCollection: Collection<any> | null = null
     private messagesCollection: Collection<any> | null = null
@@ -172,6 +181,74 @@ export class LidHandler {
         }
         const ttl = ttlSeconds && ttlSeconds > 0 ? ttlSeconds : this.config.cacheTTL
         this.cache.set(key, value as any, ttl)
+    }
+
+    // WAB-1275: ownership writes update Redis and the local fallback together. A Redis error throws,
+    // so the caller stops before MongoDB and Redis can disagree.
+    private async cacheDeleteBoth(keys: string[]): Promise<void> {
+        if (this.redis && keys.length > 0) await this.redis.del(...keys)
+        keys.forEach(k => this.cache.del(k))
+    }
+
+    private async cacheWriteBoth(key: string, value: string, ttlSeconds: number): Promise<void> {
+        if (this.redis) await this.redis.set(key, value, 'EX', Math.floor(ttlSeconds))
+        this.cache.set(key, value, ttlSeconds)
+    }
+
+    private beginFence(key: string): { stale: boolean } {
+        const fence = { stale: this.keysBeingWritten.has(key) }
+        let fences = this.lookupFences.get(key)
+        if (!fences) {
+            fences = new Set()
+            this.lookupFences.set(key, fences)
+        }
+        fences.add(fence)
+        return fence
+    }
+
+    private endFence(key: string, fence: { stale: boolean }): void {
+        const fences = this.lookupFences.get(key)
+        if (!fences) return
+        fences.delete(fence)
+        if (fences.size === 0) this.lookupFences.delete(key)
+    }
+
+    private invalidateFences(keys: string[]): void {
+        for (const key of keys) this.lookupFences.get(key)?.forEach(fence => { fence.stale = true })
+    }
+
+    private startKeyWrites(keys: string[]): void {
+        for (const key of keys) this.keysBeingWritten.set(key, (this.keysBeingWritten.get(key) ?? 0) + 1)
+        this.invalidateFences(keys)
+    }
+
+    private endKeyWrites(keys: string[]): void {
+        this.invalidateFences(keys)
+        for (const key of keys) {
+            const count = (this.keysBeingWritten.get(key) ?? 1) - 1
+            if (count > 0) this.keysBeingWritten.set(key, count)
+            else this.keysBeingWritten.delete(key)
+        }
+    }
+
+    private async withLidLock<T>(lid: string, operation: () => Promise<T>): Promise<T> {
+        const previous = this.lidLocks.get(lid) ?? Promise.resolve()
+        let release!: () => void
+        const done = new Promise<void>(resolve => { release = resolve })
+        const current = previous.then(() => done)
+        this.lidLocks.set(lid, current)
+        await previous
+        try {
+            return await operation()
+        } finally {
+            release()
+            if (this.lidLocks.get(lid) === current) this.lidLocks.delete(lid)
+        }
+    }
+
+    private asPhoneJid(jid: string | null | undefined): string | null {
+        const normalized = jid ? normalizeJidForStorage(jid) : null
+        return normalized && isPhoneNumberFormat(normalized) ? normalized : null
     }
 
     private async cacheDel(keys: string[]): Promise<void> {
@@ -501,9 +578,20 @@ export class LidHandler {
     }
 
     /**
-     * Store or update a LID to phone number mapping
+     * Store a LID to phone number mapping under the WAB-1275 ownership rule.
+     *
+     * The owner of a LID is the phone contact that holds it in contacts and the valid
+     * (phone-valued) lidMappings row. A self-referencing @lid doc (id equal to the LID) is never
+     * an owner and always yields. An ordinary pair writes only when it agrees with every owner.
+     * Only an authoritative pair (Baileys lid-mapping.update) moves a LID from another owner.
+     *
+     * Order: invalidate caches, write the mapping (the cutover), release the holder, assign the
+     * contact, publish the caches. A failed step stops the later steps; there is no duplicate-key
+     * retry loop. Redis never disagrees with MongoDB: a Redis failure before the MongoDB writes leaves
+     * MongoDB unchanged; a failure while publishing leaves MongoDB moved and those cache keys empty.
+     * An authoritative mapping write is the cutover and is kept if a later step fails.
      */
-    async storeLidMapping(lid: string, phoneNumber: string, pushName?: string): Promise<void> {
+    async storeLidMapping(lid: string, phoneNumber: string, pushName?: string, options: { authoritative?: boolean } = {}): Promise<void> {
         if (!this.isConnected()) {
             console.debug('[LidHandler] Cannot store LID mapping - database not connected')
             // Still update cache if enabled
@@ -543,128 +631,120 @@ export class LidHandler {
             console.warn(`[LidHandler] Attempted to store LID as phone number: [redacted] -> [redacted]`)
             return
         }
-        
-        const now = new Date()
+
         const cleanedPushName = (typeof pushName === 'string' ? pushName.trim() : '') || undefined
-        
-        // Decide whether to update fields to avoid unnecessary writes
-        let shouldSetPushName = false
-        let shouldSetLid = true // default true; will turn false if existing doc has same lid
-        // WAB-978: read the handle inside each attempt; a reconnect re-initializes it
+        await this.withLidLock(normalizedLid, () =>
+            this.writeLidOwnership(normalizedLid, normalizedPhone, cleanedPushName, options.authoritative === true)
+        )
+    }
+
+    private async writeLidOwnership(lid: string, phone: string, pushName: string | undefined, authoritative: boolean): Promise<void> {
+        const instanceId = this.instanceId
+        // WAB-978: read the handles inside each attempt; a reconnect re-initializes them
         const contacts = () => this.contactsCollection!
+        const mappings = () => this.lidMappingsCollection
+        const now = new Date()
+        const touchedKeys = [this.getRedisKey('lid', lid), this.getRedisKey('phone', phone)]
+        let insertedMappingId: ObjectId | null = null
+        let invalidated = false
+
         try {
-            const existing = await this.runOperation(() => contacts().findOne(
-                { instanceId: this.instanceId, id: normalizedPhone },
-                { projection: { pushName: 1, lid: 1 } }
-            ))
-            if (existing) {
-                if (cleanedPushName && existing.pushName !== cleanedPushName) {
-                    shouldSetPushName = true
-                }
-                // Only set lid if changed
-                if (existing.lid === normalizedLid) {
-                    shouldSetLid = false
-                }
-            } else {
-                // New document: set phone and pushName (if provided)
-                shouldSetLid = true
-                shouldSetPushName = !!cleanedPushName
+            const [holder, target, mapping] = await Promise.all([
+                this.runOperation(() => contacts().findOne({ instanceId, lid }, { projection: { _id: 1, id: 1 } })),
+                this.runOperation(() => contacts().findOne({ instanceId, id: phone }, { projection: { _id: 1, pushName: 1, lid: 1 } })),
+                mappings() ? this.runOperation(() => mappings()!.findOne({ instanceId, lid }, { projection: { _id: 1, phoneNumber: 1 } })) : Promise.resolve(null),
+            ])
+            const holderId: string | null = holder ? (holder.id ?? null) : null
+            const holderIsSelfRef = !!holder && typeof holderId === 'string' && normalizeJidForStorage(holderId) === lid
+            const contactOwner = holder && holderId !== phone && !holderIsSelfRef ? holderId : null
+            const mappedPhone = this.asPhoneJid(mapping?.phoneNumber)
+            const mappingOwner = mappedPhone && mappedPhone !== phone ? mappedPhone : null
+
+            if (!authoritative && (contactOwner || mappingOwner)) {
+                reportBurst(LidHandler.KEPT_LABEL, contactOwner ? 'contact' : 'mapping')
+                return
             }
-        } catch (_err) {
-            // If read fails, proceed with setting both (safe; idempotent if equal)
-            shouldSetLid = true
-            shouldSetPushName = !!cleanedPushName
-        }
-        
-        try {
-            // Upsert the mapping into contacts (by phone JID as contact id)
-            try {
-                await this.runOperation(() => contacts().updateOne(
-                    { 
-                        instanceId: this.instanceId, 
-                        id: normalizedPhone 
-                    },
-                    {
-                        $set: {
-                            ...(shouldSetLid ? { lid: normalizedLid } : {}),
-                            updatedAt: now,
-                            ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
-                        },
-                        $setOnInsert: {
-                            instanceId: this.instanceId,
-                            id: normalizedPhone,
-                            lidFirstSeen: now
-                        }
-                    },
-                    { upsert: true }
-                ))
-            } catch (e: any) {
-                if (e?.code === 11000) {
-                    // Retry without upsert; don't override existing pushName if set
-                    await this.runOperation(() => contacts().updateOne(
-                        { 
-                            instanceId: this.instanceId, 
-                            id: normalizedPhone,
-                            ...(shouldSetPushName ? { $or: [ { pushName: { $exists: false } }, { pushName: { $in: [null, ''] } } ] } : {})
-                        } as any,
-                        {
-                            $set: {
-                                ...(shouldSetLid ? { lid: normalizedLid } : {}),
-                                updatedAt: now,
-                                ...(shouldSetPushName ? { pushName: cleanedPushName, pushNameUpdatedAt: now } : {})
-                            }
-                        },
-                        { upsert: false }
+
+            const setPushName = !!pushName && target?.pushName !== pushName
+            const contactDone = target?.lid === lid && !setPushName
+            const mappingDone = mappedPhone === phone
+            if (contactDone && mappingDone) return
+
+            for (const displaced of [contactOwner, mappingOwner]) {
+                if (displaced && isPhoneNumberFormat(displaced)) touchedKeys.push(this.getRedisKey('phone', normalizeJidForStorage(displaced)))
+            }
+            this.startKeyWrites(touchedKeys)
+            invalidated = true
+            if (this.config.enableCache) await this.cacheDeleteBoth(touchedKeys)
+
+            // The mapping write is the cutover: lookups read lidMappings first. It also runs when the
+            // mapping already agreed but contact work remains, because another writer can move the
+            // mapping after our reads (ordinary: the conditional upsert stops; authoritative: last wins).
+            if (mappings() && (!mappingDone || !contactDone)) {
+                const filter = authoritative
+                    ? { instanceId, lid }
+                    : { instanceId, lid, $or: [{ phoneNumber: phone }, { phoneNumber: { $not: LidHandler.PHONE_JID_PATTERN } }] }
+                try {
+                    const result = await this.runOperation(() => mappings()!.updateOne(
+                        filter,
+                        { $set: { phoneNumber: phone, updatedAt: now }, $setOnInsert: { instanceId, lid, firstSeen: now } },
+                        { upsert: true }
                     ))
-                } else {
+                    insertedMappingId = result.upsertedId ?? null
+                } catch (e: any) {
+                    // Another writer stored a different phone for this LID after our checks
+                    if (!authoritative && e?.code === 11000) {
+                        reportBurst(LidHandler.KEPT_LABEL, 'mapping')
+                        return
+                    }
                     throw e
                 }
             }
 
-            // Update cache if enabled (use normalized JIDs for cache keys)
-            if (this.config.enableCache) {
-                // Cache both directions
-                this.cache.set(`lid:${this.instanceId}:${normalizedLid}`, normalizedPhone)
-                this.cache.set(`phone:${this.instanceId}:${normalizedPhone}`, normalizedLid)
+            if (holder && holderId !== phone) {
+                const released = await this.runOperation(() => contacts().updateOne(
+                    { _id: holder._id, instanceId, lid, id: holderId },
+                    { $unset: { lid: 1 }, $set: { updatedAt: now } }
+                ))
+                // The holder changed after our reads (for example a re-key): stop, never retry
+                if (released.matchedCount !== 1) throw Object.assign(new Error('LID holder changed'), { name: 'HolderChanged' })
             }
 
-            if (this.lidMappingsCollection) {
+            if (!contactDone) {
+                const set = { lid, updatedAt: now, ...(setPushName ? { pushName, pushNameUpdatedAt: now } : {}) }
                 try {
-                    const result = await this.runOperation(() => this.lidMappingsCollection!.updateOne(
-                        { instanceId: this.instanceId, lid: normalizedLid },
-                        {
-                            $setOnInsert: {
-                                instanceId: this.instanceId,
-                                lid: normalizedLid,
-                                phoneNumber: normalizedPhone,
-                                firstSeen: now,
-                                updatedAt: now
-                            }
-                        },
+                    await this.runOperation(() => contacts().updateOne(
+                        { instanceId, id: phone },
+                        { $set: set, $setOnInsert: { instanceId, id: phone, lidFirstSeen: now } },
                         { upsert: true }
                     ))
-
-                    if (result.matchedCount > 0 && result.upsertedCount === 0 && process.env.DEBUG_LID === 'true') {
-                        const existing = await this.lidMappingsCollection.findOne(
-                            { instanceId: this.instanceId, lid: normalizedLid },
-                            { projection: { phoneNumber: 1 } }
-                        )
-                        if (existing && existing.phoneNumber !== normalizedPhone) {
-                            console.debug(
-                                `[LidHandler] Existing mapping for ${normalizedLid} uses ${existing.phoneNumber}; ` +
-                                `ignoring new phone ${normalizedPhone}`
-                            )
-                        }
-                    }
-                } catch (mappingError) {
-                    console.debug('[LidHandler] Failed to upsert lidMappings entry:', (mappingError as any)?.message)
+                } catch (e: any) {
+                    // A concurrent insert of the same contact id: update it once without upsert.
+                    // A conflict on the LID key is never retried.
+                    const keyPattern = e?.keyPattern
+                    if (e?.code !== 11000 || !keyPattern || !('id' in keyPattern) || 'lid' in keyPattern) throw e
+                    await this.runOperation(() => contacts().updateOne({ instanceId, id: phone }, { $set: set }))
                 }
             }
-            
+
+            if (this.config.enableCache) {
+                await this.cacheWriteBoth(this.getRedisKey('lid', lid), phone, this.config.cacheTTLSeconds)
+                await this.cacheWriteBoth(this.getRedisKey('phone', phone), lid, this.config.cacheTTLSeconds)
+            }
             console.log(`[LidHandler] Stored mapping in contacts: [redacted] -> [redacted]`)
         } catch (error) {
+            const insertedId = insertedMappingId
+            // An authoritative mapping write is the cutover and stays. An ordinary write removes the row
+            // it inserted, so lidMappings does not disagree with contacts.
+            if (!authoritative && insertedId !== null && mappings()) {
+                await this.runOperation(() => mappings()!.deleteOne({ _id: insertedId, instanceId, lid, phoneNumber: phone }))
+                    .catch((cleanupError) => console.debug('[LidHandler] Failed to remove the new lidMappings entry:', errorKind(cleanupError)))
+            }
             // WAB-978: one summary line per burst instead of one line per write
             reportBurst('[LidHandler] Failed to store LID mapping', errorKind(error))
+        } finally {
+            // A lookup that ran during this write must not cache what it read
+            if (invalidated) this.endKeyWrites(touchedKeys)
         }
     }
 
@@ -693,6 +773,8 @@ export class LidHandler {
             return normalized && isPhoneNumberFormat(normalized) ? normalized : null
         }
 
+        // WAB-1275: an ownership write during this lookup marks the fence; then the result is not cached
+        const fence = this.beginFence(cacheKey)
         const lookupPromise = this.runWithLimiter(async () => {
             const result = await this.withConnectionCheck(
                 async () => {
@@ -807,10 +889,10 @@ export class LidHandler {
 
         try {
             const result = await lookupPromise
-            if (this.config.enableCache) {
+            // WAB-1275: cache only this lookup's own key; the reverse key is written by its own lookup
+            if (this.config.enableCache && !fence.stale) {
                 if (result) {
                     await this.cacheSet(cacheKey, result, this.config.cacheTTLSeconds)
-                    await this.cacheSet(this.getRedisKey('phone', result), normalizedLid, this.config.cacheTTLSeconds)
                     // reset backoff on success
                     this.missBackoffCounts.delete(normalizedLid)
                 } else {
@@ -828,6 +910,7 @@ export class LidHandler {
             }
             return result
         } finally {
+            this.endFence(cacheKey, fence)
             this.pendingLidLookups.delete(normalizedLid)
         }
     }
@@ -851,6 +934,8 @@ export class LidHandler {
             return this.pendingPhoneLookups.get(normalizedPhone)!
         }
 
+        // WAB-1275: see getPhoneNumberFromLid
+        const fence = this.beginFence(cacheKey)
         const lookupPromise = this.runWithLimiter(async () => {
             const result = await this.withConnectionCheck(
                 async () => {
@@ -944,16 +1029,16 @@ export class LidHandler {
 
         try {
             const result = await lookupPromise
-            if (this.config.enableCache) {
+            if (this.config.enableCache && !fence.stale) {
                 if (result) {
                     await this.cacheSet(cacheKey, result, this.config.cacheTTLSeconds)
-                    await this.cacheSet(this.getRedisKey('lid', result), normalizedPhone, this.config.cacheTTLSeconds)
                 } else {
                     await this.cacheSet(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
                 }
             }
             return result
         } finally {
+            this.endFence(cacheKey, fence)
             this.pendingPhoneLookups.delete(normalizedPhone)
         }
     }
@@ -1637,8 +1722,8 @@ export class LidHandler {
 
         console.log(`[LidHandler] Received lid-mapping.update: [redacted] -> [redacted]`)
         
-        // Store in MongoDB
-        await this.storeLidMapping(lid, pn)
+        // WAB-1275: the only authoritative source; it may move the LID from another owner
+        await this.storeLidMapping(lid, pn, undefined, { authoritative: true })
     }
 
     /**
