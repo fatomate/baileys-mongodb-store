@@ -717,6 +717,66 @@ describe('contacts.lid ownership (WAB-1275)', () => {
         expect(lines(FAILED)).toEqual([])
     })
 
+    test('S8q (round 5): a phone that convergence assigns and then releases is not left cached as owning L', async () => {
+        const P4 = '60123450044@s.whatsapp.net'
+        const a = await makeHandler()
+        const b = await makeHandler()
+        const c = await makeHandler()
+        const reader = await makeHandler()
+        await owner(P1)
+        // C reads P1 as the owner, then pauses before its mapping write
+        const cReady = deferred(), cGate = deferred()
+        const cMappings = coll(c, 'lidMappingsCollection')
+        const cOriginal = cMappings.updateOne.bind(cMappings)
+        jest.spyOn(cMappings, 'updateOne').mockImplementation((async (...args: any[]) => {
+            cReady.resolve()
+            await cGate.promise
+            return (cOriginal as any)(...args)
+        }) as any)
+        const moveC = c.handleLidMappingUpdate({ lid: L, pn: P4 })
+        await Promise.race([cReady.promise, moveC])
+        // A pauses before its holder reads in its first and second reconcile attempts, and after it assigns P3
+        const firstReady = deferred(), firstGate = deferred()
+        const secondReady = deferred(), secondGate = deferred()
+        const assignedReady = deferred(), assignedGate = deferred()
+        const aContacts = coll(a, 'contactsCollection')
+        const aFind = aContacts.findOne.bind(aContacts)
+        const aUpdate = aContacts.updateOne.bind(aContacts)
+        let holderReads = 0
+        jest.spyOn(aContacts, 'findOne').mockImplementation((async (filter: any, ...rest: any[]) => {
+            if (filter?.lid === L && filter?.id === undefined) {
+                holderReads++
+                if (holderReads === 2) { firstReady.resolve(); await firstGate.promise }
+                if (holderReads === 3) { secondReady.resolve(); await secondGate.promise }
+            }
+            return (aFind as any)(filter, ...rest)
+        }) as any)
+        jest.spyOn(aContacts, 'updateOne').mockImplementation((async (filter: any, update: any, ...rest: any[]) => {
+            const result = await (aUpdate as any)(filter, update, ...rest)
+            if (filter?.id === P3 && update?.$set?.lid === L) { assignedReady.resolve(); await assignedGate.promise }
+            return result
+        }) as any)
+
+        const moveA = a.handleLidMappingUpdate({ lid: L, pn: P2 })
+        await Promise.race([firstReady.promise, moveA])
+        await b.handleLidMappingUpdate({ lid: L, pn: P3 })
+        firstGate.resolve()
+        await Promise.race([secondReady.promise, moveA])
+        cGate.resolve()
+        await moveC
+        secondGate.resolve()
+        await Promise.race([assignedReady.promise, moveA])
+        await reader.getLidFromPhoneNumber(P3) // reads the temporary P3 assignment
+        assignedGate.resolve()
+        await moveA
+
+        expect(await holderOf(L)).toBe(P4)
+        expect(await mappedPhone(L)).toBe(P4)
+        expect(await lidOf(P3)).toBeNull()
+        expect(await reader.getLidFromPhoneNumber(P3)).toBeNull()
+        expect([...redis.data.keys()].filter((k) => k.endsWith(':busy'))).toEqual([])
+    })
+
     test('S9: concurrent moves of one LID in one handler leave contacts, mapping and cache in agreement', async () => {
         const handler = await makeHandler()
         await owner(P1)

@@ -786,7 +786,20 @@ export class LidHandler {
             }
 
             if (authoritative) {
-                if (mappings()) await this.reconcileAuthoritativeContact(lid, phone, now, assign)
+                // Convergence can touch phones beyond our initial keys: fence each one before its write
+                const fencePhones = async (phones: Array<string | null | undefined>): Promise<void> => {
+                    const added: string[] = []
+                    for (const candidate of phones) {
+                        if (!candidate || !isPhoneNumberFormat(candidate)) continue
+                        const key = this.getRedisKey('phone', normalizeJidForStorage(candidate))
+                        if (!touchedKeys.includes(key) && !added.includes(key)) added.push(key)
+                    }
+                    if (added.length === 0) return
+                    touchedKeys.push(...added)
+                    if (this.config.enableCache) await this.beginCacheWrite(added, begunKeys)
+                    else this.startKeyWrites(added)
+                }
+                if (mappings()) await this.reconcileAuthoritativeContact(lid, phone, now, assign, fencePhones)
                 else if (!contactDone) await assign()
             } else {
                 if (holder && holderId !== phone) {
@@ -829,7 +842,13 @@ export class LidHandler {
      * mapping still names the holder after its last contact write, so the writer of the last contact
      * change always verifies it. At most five attempts, then it throws (the next event repairs).
      */
-    private async reconcileAuthoritativeContact(lid: string, phone: string, now: Date, assign: (target: string) => Promise<void>): Promise<void> {
+    private async reconcileAuthoritativeContact(
+        lid: string,
+        phone: string,
+        now: Date,
+        assign: (target: string) => Promise<void>,
+        fencePhones: (phones: Array<string | null | undefined>) => Promise<void>
+    ): Promise<void> {
         const instanceId = this.instanceId
         const contacts = () => this.contactsCollection!
         const mappings = () => this.lidMappingsCollection!
@@ -841,6 +860,8 @@ export class LidHandler {
             if (target !== phone) reportBurst(LidHandler.KEPT_LABEL, 'superseded')
             const holder = await this.runOperation(() => contacts().findOne({ instanceId, lid }, { projection: { _id: 1, id: 1 } }))
             if (holder?.id !== target) {
+                // The reverse cache keys of both phones are emptied and fenced until this write ends
+                await fencePhones([target, holder?.id])
                 if (holder) {
                     const released = await this.runOperation(() => contacts().updateOne(
                         { _id: holder._id, instanceId, lid, id: holder.id ?? null },
