@@ -691,6 +691,32 @@ describe('contacts.lid ownership (WAB-1275)', () => {
         expect(lines(FAILED)).toEqual([])
     })
 
+    test('S8p (round 4): a move that checked its mapping before another handler completed its own move still ends consistent', async () => {
+        const first = await makeHandler()
+        const second = await makeHandler()
+        await owner(P1)
+        const gate = deferred()
+        const reached = deferred()
+        // the first move pauses inside its reconcile, after the mapping check and before the holder read
+        const target = coll(first, 'contactsCollection')
+        const original = target.findOne.bind(target)
+        let holderReads = 0
+        jest.spyOn(target, 'findOne').mockImplementation((async (filter: any, options?: any) => {
+            if (filter?.lid === L && filter?.id === undefined && ++holderReads === 2) { reached.resolve(); await gate.promise }
+            return original(filter, options)
+        }) as any)
+
+        const pending = first.handleLidMappingUpdate({ lid: L, pn: P2 })
+        await Promise.race([reached.promise, pending])
+        await second.handleLidMappingUpdate({ lid: L, pn: P3 })
+        gate.resolve()
+        await pending
+
+        const holder = await holderOf(L)
+        expect(holder).toBe(await mappedPhone(L))
+        expect(lines(FAILED)).toEqual([])
+    })
+
     test('S9: concurrent moves of one LID in one handler leave contacts, mapping and cache in agreement', async () => {
         const handler = await makeHandler()
         await owner(P1)

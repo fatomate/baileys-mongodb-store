@@ -767,11 +767,13 @@ export class LidHandler {
             }
 
             const set = { lid, updatedAt: now, ...(setPushName ? { pushName, pushNameUpdatedAt: now } : {}) }
-            const assign = async (): Promise<void> => {
+            // The pushName applies only to this call's own phone; a later writer's phone gets the LID only
+            const assign = async (target: string = phone): Promise<void> => {
+                const targetSet = target === phone ? set : { lid, updatedAt: now }
                 try {
                     await this.runOperation(() => contacts().updateOne(
-                        { instanceId, id: phone },
-                        { $set: set, $setOnInsert: { instanceId, id: phone, lidFirstSeen: now } },
+                        { instanceId, id: target },
+                        { $set: targetSet, $setOnInsert: { instanceId, id: target, lidFirstSeen: now } },
                         { upsert: true }
                     ))
                 } catch (e: any) {
@@ -779,7 +781,7 @@ export class LidHandler {
                     // A conflict on the LID key is never retried here.
                     const keyPattern = e?.keyPattern
                     if (e?.code !== 11000 || !keyPattern || !('id' in keyPattern) || 'lid' in keyPattern) throw e
-                    await this.runOperation(() => contacts().updateOne({ instanceId, id: phone }, { $set: set }))
+                    await this.runOperation(() => contacts().updateOne({ instanceId, id: target }, { $set: targetSet }))
                 }
             }
 
@@ -820,42 +822,43 @@ export class LidHandler {
     }
 
     /**
-     * WAB-1275: after an authoritative mapping write, give the contact LID to the phone that the
-     * mapping names. Another process can run its own authoritative write for the same LID at the same
-     * time. Each attempt re-reads the mapping: when it names a different phone, the later writer owns
-     * the completion and this one stops. Otherwise it releases the current holder (compare-and-set)
-     * and assigns. A lost race re-reads, at most three attempts.
+     * WAB-1275: after an authoritative mapping write, make contacts agree with the mapping. Another
+     * process can run its own authoritative write for the same LID at the same time, so every attempt
+     * converges on the phone that the mapping names NOW (ours or a later writer's): release the current
+     * holder (compare-and-set), assign that phone, then re-read the mapping. It returns only when the
+     * mapping still names the holder after its last contact write, so the writer of the last contact
+     * change always verifies it. At most five attempts, then it throws (the next event repairs).
      */
-    private async reconcileAuthoritativeContact(lid: string, phone: string, now: Date, assign: () => Promise<void>): Promise<void> {
+    private async reconcileAuthoritativeContact(lid: string, phone: string, now: Date, assign: (target: string) => Promise<void>): Promise<void> {
         const instanceId = this.instanceId
         const contacts = () => this.contactsCollection!
         const mappings = () => this.lidMappingsCollection!
-        for (let attempt = 1; ; attempt++) {
-            const mapping = await this.runOperation(() => mappings().findOne({ instanceId, lid }, { projection: { phoneNumber: 1 } }))
-            if (this.asPhoneJid(mapping?.phoneNumber) !== phone) {
-                reportBurst(LidHandler.KEPT_LABEL, 'superseded')
-                return
-            }
+        const mappedPhone = async () => this.asPhoneJid((await this.runOperation(() =>
+            mappings().findOne({ instanceId, lid }, { projection: { phoneNumber: 1 } })))?.phoneNumber)
+        for (let attempt = 1; attempt <= 5; attempt++) {
+            const target = await mappedPhone()
+            if (!target) return // no valid mapping: nothing to converge on
+            if (target !== phone) reportBurst(LidHandler.KEPT_LABEL, 'superseded')
             const holder = await this.runOperation(() => contacts().findOne({ instanceId, lid }, { projection: { _id: 1, id: 1 } }))
-            let lost = false
-            if (holder && holder.id !== phone) {
-                const released = await this.runOperation(() => contacts().updateOne(
-                    { _id: holder._id, instanceId, lid, id: holder.id ?? null },
-                    { $unset: { lid: 1 }, $set: { updatedAt: now } }
-                ))
-                lost = released.matchedCount !== 1
-            }
-            if (!lost) {
+            if (holder?.id !== target) {
+                if (holder) {
+                    const released = await this.runOperation(() => contacts().updateOne(
+                        { _id: holder._id, instanceId, lid, id: holder.id ?? null },
+                        { $unset: { lid: 1 }, $set: { updatedAt: now } }
+                    ))
+                    if (released.matchedCount !== 1) continue
+                }
                 try {
-                    await assign()
-                    return
+                    await assign(target)
                 } catch (e: any) {
                     if (e?.code !== 11000) throw e
-                    lost = true
+                    continue
                 }
             }
-            if (attempt >= 3) throw Object.assign(new Error('LID ownership race not settled'), { name: 'OwnershipRace' })
+            // Verify after the contact step: a writer that changed the mapping meanwhile is converged next
+            if (await mappedPhone() === target) return
         }
+        throw Object.assign(new Error('LID ownership race not settled'), { name: 'OwnershipRace' })
     }
 
     /**
