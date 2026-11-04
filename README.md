@@ -50,6 +50,15 @@ A high-performance MongoDB store implementation for [Baileys](https://github.com
 - Schema on contacts: `lid`, `lidFirstSeen`, `updatedAt`, optional `pushName`, `pushNameUpdatedAt`.
 - Removed: `lidLastSeen`, `lidMappingUpdatedAt`.
 
+### Ownership of `contacts.lid` (WAB-1275)
+
+- `LidHandler.storeLidMapping` is the only writer of `contacts.lid`. The owner of a LID is the phone contact that holds it and the valid (phone-valued) `lidMappings` row.
+- A self-referencing doc (its `id` equals the LID) always yields to a phone contact.
+- An ordinary pair writes only when it agrees with every owner. Otherwise it writes nothing and is counted on `[LidHandler] LID kept by existing owner`.
+- Only Baileys `lid-mapping.update` moves a LID from another owner. Its mapping write is the cutover.
+- Lookups cache through a Redis-side fence (`LID_CACHE_SCRIPTS`: `{key}:gen` and `{key}:busy`), so a lookup that overlaps an ownership write never caches what it read.
+- Native LID fetches on `contacts.upsert` store through the LidHandler. Without the `lidHandler` option the store skips them.
+
 ### Performance controls (v2.1)
 
 - New LidHandler options (via `lidConfig` in `makeEnhancedMongoDBStore`):

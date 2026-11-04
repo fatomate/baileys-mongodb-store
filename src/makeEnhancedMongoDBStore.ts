@@ -3777,56 +3777,6 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
         return totalLabelAssociationsUpdated
     }
-    // Safe LID setter - handles E11000 duplicate key conflicts on contacts_lid_lookup
-    const safeSetLid = async (
-        contactId: string,
-        lid: string,
-        targetInstanceId?: string,
-        reporting: { reportFailure?: boolean } = {}
-    ): Promise<void> => {
-        const inst = targetInstanceId || instanceId
-        try {
-            await withConnection(async () =>
-                collections.contacts.updateOne(
-                    { instanceId: inst, id: contactId },
-                    { $set: { lid, updatedAt: new Date() } }
-                ),
-                undefined,
-                reporting
-            )
-        } catch (e: any) {
-            if (e?.code === 11000 && e?.keyPattern?.lid) {
-                log(`[LID] Conflict: LID ${lid} already assigned, reassigning to ${contactId}`)
-                await withConnection(async () =>
-                    collections.contacts.updateOne(
-                        { instanceId: inst, lid, id: { $ne: contactId } },
-                        { $unset: { lid: 1 }, $set: { updatedAt: new Date() } }
-                    ),
-                    undefined,
-                    reporting
-                )
-                try {
-                    await withConnection(async () =>
-                        collections.contacts.updateOne(
-                            { instanceId: inst, id: contactId },
-                            { $set: { lid, updatedAt: new Date() } }
-                        ),
-                        undefined,
-                        reporting
-                    )
-                } catch (retryError: any) {
-                    if (retryError?.code === 11000) {
-                        log(`[LID] Failed to assign LID ${lid} to ${contactId} after retry`)
-                    } else {
-                        throw retryError
-                    }
-                }
-            } else {
-                throw e
-            }
-        }
-    }
-
     // WAB-978: lid-mapping.update persistence, run through lidMappingLimiter
     const persistLidMappingUpdate = async (data: { lid: string; pn: string }): Promise<void> => {
         try {
@@ -3841,10 +3791,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             
             // Store the mapping in MongoDB via LidHandler
             if (lidHandler) {
+                // WAB-1275: the handler is the only contacts.lid ownership writer
                 await lidHandler.handleLidMappingUpdate(data)
-                
-                // Also update the contact if it exists (safe against duplicate key)
-                await safeSetLid(pn, lid, validatedInstanceId, { reportFailure: false })
             }
             
             if (enableMetrics) updateEventMetrics('lid-mapping.update', 'stored')
@@ -4516,7 +4464,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
             // Fetch LIDs asynchronously in the background
             // Supports both Baileys v7 (signalRepository.lidMapping) and legacy (onWhatsApp) APIs
-            if (finalLidConfig?.enabled && sock) {
+            // WAB-1275: fetched LIDs are stored only through the LidHandler (the one ownership writer);
+            // without the lidHandler option there is nothing to store, so do not call WhatsApp
+            if (finalLidConfig?.enabled && sock && !lidHandler) {
+                log(`⏭️ [Contacts] Skipping LID fetch - no lidHandler configured`)
+            }
+            if (finalLidConfig?.enabled && sock && lidHandler) {
                 setImmediate(async () => {
                     const lidFetchPromise = (async () => {
                         if (isClosing || clearAllInProgress) {
@@ -4586,10 +4539,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                             for (const mapping of mappings) {
                                                 const { pn, lid } = mapping
                                                 
-                                                // Update contact with LID in MongoDB (safe against duplicate key)
-                                                await safeSetLid(pn, lid)
-                                                
-                                                // Also store in LidHandler for cache
+                                                // WAB-1275: an ordinary pair; it never takes the LID from its current owner
                                                 if (lidHandler) {
                                                     try {
                                                         await lidHandler.storeLidMapping(lid, pn)
@@ -4639,10 +4589,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
                                         if (result && result.length > 0 && result[0].exists && result[0].lid) {
                                             lid = result[0].lid
-                                            // Update contact with LID (safe against duplicate key)
-                                            await safeSetLid(contactId, lid)
-
-                                            // Also store in LidHandler for cache
+                                            // WAB-1275: an ordinary pair; it never takes the LID from its current owner
                                             if (lidHandler) {
                                                 try {
                                                     await lidHandler.storeLidMapping(lid, contactId)
