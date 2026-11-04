@@ -2,7 +2,7 @@
 // and a Redis double so the lookup cache path is the one production uses.
 import { Collection, Db, MongoClient } from 'mongodb'
 import { MongoMemoryServer } from 'mongodb-memory-server'
-import { LidHandler } from '../lidHandler'
+import { LID_CACHE_SCRIPTS, LidHandler } from '../lidHandler'
 import { flushBurst } from '../burstLog'
 
 const INSTANCE = 'wab1275-a'
@@ -21,13 +21,38 @@ class RedisDouble {
     failSets = 0
     private check() { if (this.down) throw new Error('redis down') }
     async get(key: string) { this.check(); return this.data.has(key) ? this.data.get(key)! : null }
+    setHook: (() => Promise<void>) | null = null
     async set(key: string, value: string) {
         this.check()
+        if (this.setHook) await this.setHook()
         if (this.failSets > 0) { this.failSets--; throw new Error('redis set failed') }
         this.data.set(key, value)
         return 'OK'
     }
     async del(...keys: string[]) { this.check(); let n = 0; for (const k of keys) if (this.data.delete(k)) n++; return n }
+    // Emulates the three LID_CACHE_SCRIPTS (TTLs ignored); the real scripts run in lidOwnership.redis.int.test.ts
+    evalHook: ((script: string) => Promise<void>) | null = null
+    async eval(script: string, numKeys: number, ...args: Array<string | number>) {
+        this.check()
+        if (this.evalHook) await this.evalHook(script)
+        const [key, gen, busy] = args.slice(0, numKeys).map(String)
+        const argv = args.slice(numKeys).map(String)
+        const incr = (k: string) => this.data.set(k, String(Number(this.data.get(k) ?? 0) + 1))
+        if (script === LID_CACHE_SCRIPTS.beginWrite) { this.data.delete(key); incr(gen); incr(busy); return 1 }
+        if (script === LID_CACHE_SCRIPTS.endWrite) {
+            this.data.delete(key)
+            incr(gen)
+            const left = Number(this.data.get(busy) ?? 0) - 1
+            if (left <= 0) this.data.delete(busy); else this.data.set(busy, String(left))
+            return 1
+        }
+        if (script === LID_CACHE_SCRIPTS.publish) {
+            if (this.data.has(busy) || (this.data.get(gen) ?? '') !== argv[0]) return 0
+            this.data.set(key, argv[1])
+            return 1
+        }
+        throw new Error('unknown script')
+    }
 }
 
 const deferred = () => {
@@ -171,7 +196,8 @@ describe('contacts.lid ownership (WAB-1275)', () => {
         expect(await holderOf(L)).toBe(P2)
         expect(await lidOf(P1)).toBeNull()
         expect(await mappedPhone(L)).toBe(P2)
-        expect(redis.data.get(redisKey('phone', P1))).not.toBe(L)
+        // the write empties every affected key and publishes nothing
+        for (const key of [redisKey('lid', L), redisKey('phone', P1), redisKey('phone', P2)]) expect(redis.data.has(key)).toBe(false)
         expect(await handler.getPhoneNumberFromLid(L)).toBe(P2)
         expect(await handler.getLidFromPhoneNumber(P2)).toBe(L)
         expect(await handler.getLidFromPhoneNumber(P1)).toBeNull()
@@ -286,28 +312,20 @@ describe('contacts.lid ownership (WAB-1275)', () => {
     })
 
     describe('S8c: Redis and the local cache stay coherent', () => {
-        test.each([1, 2])('a failed cache publish (SET %i) leaves MongoDB moved and no stale cache value', async (failingSet) => {
+        test('a failed end-of-write Redis call leaves MongoDB moved, the keys empty, and no lookup caching while busy', async () => {
             const handler = await makeHandler()
             await owner(P1)
             redis.data.set(redisKey('lid', L), P1)
-            redis.data.set(redisKey('phone', P1), L)
-            const realSet = redis.set.bind(redis)
-            let sets = 0
-            jest.spyOn(redis, 'set').mockImplementation(async (key: string, value: string) => {
-                sets++
-                if (sets === failingSet) throw new Error('redis set failed')
-                return realSet(key, value)
-            })
+            redis.evalHook = async (script) => { if (script === LID_CACHE_SCRIPTS.endWrite) throw new Error('redis end failed') }
 
             await handler.handleLidMappingUpdate({ lid: L, pn: P2 })
+            redis.evalHook = null
 
             expect(await holderOf(L)).toBe(P2)
             expect(await mappedPhone(L)).toBe(P2)
-            expect(redis.data.get(redisKey('lid', L))).not.toBe(P1)
-            expect(redis.data.get(redisKey('phone', P1))).toBeUndefined()
             expect(await handler.getPhoneNumberFromLid(L)).toBe(P2)
-            expect(await handler.getLidFromPhoneNumber(P1)).toBeNull()
-            expect(lines(FAILED)).toHaveLength(1)
+            expect(redis.data.has(redisKey('lid', L))).toBe(false)
+            expect(lines(FAILED)).toEqual([])
         })
 
         test('a Redis outage during a move changes nothing; the repeat after recovery moves the LID', async () => {
@@ -510,6 +528,76 @@ describe('contacts.lid ownership (WAB-1275)', () => {
         expect(await lidOf(P2)).toBeNull()
         expect(await mappedPhone(L)).toBeNull()
         expect(lines(FAILED)).toHaveLength(1)
+    })
+
+    test('S8j (round 1): a lookup in another handler that read P1 does not republish it after a move', async () => {
+        const reader = await makeHandler()
+        const mover = await makeHandler()
+        await owner(P1)
+        const gate = deferred()
+        const reached = deferred()
+        const target = coll(reader, 'lidMappingsCollection')
+        const original = target.findOne.bind(target)
+        jest.spyOn(target, 'findOne').mockImplementation((async (filter: any, options?: any) => {
+            const result = await original(filter, options)
+            reached.resolve()
+            await gate.promise
+            return result
+        }) as any)
+
+        const lookup = reader.getPhoneNumberFromLid(L)
+        await Promise.race([reached.promise, lookup])
+        await mover.handleLidMappingUpdate({ lid: L, pn: P2 })
+        gate.resolve()
+        await lookup
+        jest.restoreAllMocks()
+
+        expect(redis.data.get(redisKey('lid', L))).not.toBe(P1)
+        expect(await reader.getPhoneNumberFromLid(L)).toBe(P2)
+    })
+
+    test('S8k (round 1): a lookup cache write that fails after a move does not fill the local fallback with P1', async () => {
+        const handler = await makeHandler()
+        await owner(P1)
+        const gate = deferred()
+        const reached = deferred()
+        let held = false
+        // hold the lookup's first cache write (publish script, or a plain SET in older code), then fail it
+        const holdFirst = async () => {
+            if (held) return
+            held = true
+            reached.resolve()
+            await gate.promise
+            throw new Error('delayed publish failure')
+        }
+        redis.evalHook = async (script) => { if (script === LID_CACHE_SCRIPTS.publish) await holdFirst() }
+        redis.setHook = holdFirst
+
+        const lookup = handler.getPhoneNumberFromLid(L)
+        await Promise.race([reached.promise, lookup])
+        await handler.handleLidMappingUpdate({ lid: L, pn: P2 })
+        gate.resolve()
+        await lookup
+        redis.evalHook = null
+        redis.setHook = null
+        redis.down = true
+
+        expect(await handler.getPhoneNumberFromLid(L)).toBe(P2)
+    })
+
+    test('S8l (round 1): a holder without an id is an owner for an ordinary pair and yields only to lid-mapping.update', async () => {
+        const handler = await makeHandler()
+        await contacts().insertOne({ instanceId: INSTANCE, lid: L, name: 'no id' })
+
+        await handler.storeLidMapping(L, P2)
+
+        expect((await contacts().findOne({ instanceId: INSTANCE, name: 'no id' }))?.lid).toBe(L)
+        expect(await lidOf(P2)).toBeNull()
+        expect(await mappedPhone(L)).toBeNull()
+        expect(lines(KEPT)).toHaveLength(1)
+
+        await handler.handleLidMappingUpdate({ lid: L, pn: P2 })
+        expect(await holderOf(L)).toBe(P2)
     })
 
     test('S9: concurrent moves of one LID in one handler leave contacts, mapping and cache in agreement', async () => {

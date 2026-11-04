@@ -82,15 +82,44 @@ export interface LidHandlerConfig {
     maxNegativeCacheTTL?: number
 }
 
+/**
+ * WAB-1275: Redis-side fence for the lookup cache. Every handler of an instance shares it.
+ * For cache key K: `{K}:gen` counts ownership writes and `{K}:busy` marks a write in progress.
+ * The hash tag keeps the three keys in one cluster slot. A lookup caches its result only when no
+ * write is in progress and no write started since the lookup began.
+ */
+export const LID_CACHE_SCRIPTS = Object.freeze({
+    // KEYS: key, gen, busy. ARGV: gen TTL s, busy TTL ms
+    beginWrite: `redis.call('DEL', KEYS[1])
+redis.call('INCR', KEYS[2]) redis.call('EXPIRE', KEYS[2], ARGV[1])
+redis.call('INCR', KEYS[3]) redis.call('PEXPIRE', KEYS[3], ARGV[2])
+return 1`,
+    // KEYS: key, gen, busy. ARGV: gen TTL s
+    endWrite: `redis.call('DEL', KEYS[1])
+redis.call('INCR', KEYS[2]) redis.call('EXPIRE', KEYS[2], ARGV[1])
+if redis.call('DECR', KEYS[3]) <= 0 then redis.call('DEL', KEYS[3]) end
+return 1`,
+    // KEYS: key, gen, busy. ARGV: generation seen when the lookup began ('' = none), value, TTL s
+    publish: `if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
+if (redis.call('GET', KEYS[2]) or '') ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1`,
+})
+
+type LookupFence = { stale: boolean; redisGeneration: string | null }
+
 export class LidHandler {
     private static readonly NEGATIVE_CACHE_SENTINEL = '__MISS__'
+    // A write in progress blocks lookup caching for at most this long if its end call fails
+    private static readonly FENCE_BUSY_TTL_MS = 5 * 60 * 1000
+    private static readonly FENCE_GENERATION_TTL_SECONDS = 60 * 60
     // WAB-1275: counts ordinary pairs that disagree with the current owner (no IDs are logged)
     private static readonly KEPT_LABEL = '[LidHandler] LID kept by existing owner'
     private static readonly PHONE_JID_PATTERN = /(@s\.whatsapp\.net|@c\.us)$/
     // WAB-1275: one ownership write per LID at a time in this process
     private lidLocks: Map<string, Promise<void>> = new Map()
     // WAB-1275: in-flight lookups per cache key; a write marks them stale so they do not cache old reads
-    private lookupFences: Map<string, Set<{ stale: boolean }>> = new Map()
+    private lookupFences: Map<string, Set<LookupFence>> = new Map()
     // WAB-1275: cache keys with an ownership write in progress; a lookup that starts then never caches
     private keysBeingWritten: Map<string, number> = new Map()
     private lidMappingsCollection: Collection<LidMapping> | null = null // legacy read-only fallback
@@ -166,37 +195,37 @@ export class LidHandler {
         return this.cache.get<string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL>(key)
     }
 
-    private async cacheSet(key: string, value: string | typeof LidHandler.NEGATIVE_CACHE_SENTINEL, ttlSeconds?: number): Promise<void> {
+    private fenceKeys(key: string): [string, string, string] {
+        return [key, `{${key}}:gen`, `{${key}}:busy`]
+    }
+
+    // WAB-1275: a write marks its keys busy and empties them, in Redis and in the local fallback.
+    // A Redis error throws, so the caller stops before it changes MongoDB.
+    private async beginCacheWrite(keys: string[]): Promise<void> {
+        this.startKeyWrites(keys)
+        keys.forEach(k => this.cache.del(k))
+        if (!this.redis) return
+        for (const key of keys) {
+            await this.redis.eval(LID_CACHE_SCRIPTS.beginWrite, 3, ...this.fenceKeys(key),
+                LidHandler.FENCE_GENERATION_TTL_SECONDS, LidHandler.FENCE_BUSY_TTL_MS)
+        }
+    }
+
+    // The write ends: empty the keys again and advance the generation, so no lookup that overlapped
+    // the write can cache what it read. A Redis error here only delays caching until busy expires.
+    private async endCacheWrite(keys: string[]): Promise<void> {
+        keys.forEach(k => this.cache.del(k))
         if (this.redis) {
-            try {
-                if (ttlSeconds && Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
-                    await this.redis.set(key, value as string, 'EX', Math.floor(ttlSeconds))
-                } else {
-                    await this.redis.set(key, value as string)
-                }
-                return
-            } catch (err) {
-                console.debug('[LidHandler] Redis set failed:', (err as any)?.message)
+            for (const key of keys) {
+                await this.redis.eval(LID_CACHE_SCRIPTS.endWrite, 3, ...this.fenceKeys(key), LidHandler.FENCE_GENERATION_TTL_SECONDS)
+                    .catch((error: unknown) => console.debug('[LidHandler] Cache fence end failed:', errorKind(error)))
             }
         }
-        const ttl = ttlSeconds && ttlSeconds > 0 ? ttlSeconds : this.config.cacheTTL
-        this.cache.set(key, value as any, ttl)
+        this.endKeyWrites(keys)
     }
 
-    // WAB-1275: ownership writes update Redis and the local fallback together. A Redis error throws,
-    // so the caller stops before MongoDB and Redis can disagree.
-    private async cacheDeleteBoth(keys: string[]): Promise<void> {
-        if (this.redis && keys.length > 0) await this.redis.del(...keys)
-        keys.forEach(k => this.cache.del(k))
-    }
-
-    private async cacheWriteBoth(key: string, value: string, ttlSeconds: number): Promise<void> {
-        if (this.redis) await this.redis.set(key, value, 'EX', Math.floor(ttlSeconds))
-        this.cache.set(key, value, ttlSeconds)
-    }
-
-    private beginFence(key: string): { stale: boolean } {
-        const fence = { stale: this.keysBeingWritten.has(key) }
+    private beginFence(key: string): LookupFence {
+        const fence: LookupFence = { stale: this.keysBeingWritten.has(key), redisGeneration: null }
         let fences = this.lookupFences.get(key)
         if (!fences) {
             fences = new Set()
@@ -206,7 +235,37 @@ export class LidHandler {
         return fence
     }
 
-    private endFence(key: string, fence: { stale: boolean }): void {
+    // Read the Redis write generation before the lookup reads MongoDB. Without it the lookup does not
+    // publish to Redis (only to the fenced local fallback).
+    private async readFenceGeneration(key: string, fence: LookupFence): Promise<void> {
+        if (!this.redis || !this.config.enableCache) return
+        try {
+            fence.redisGeneration = (await this.redis.get(this.fenceKeys(key)[1])) ?? ''
+        } catch (err) {
+            console.debug('[LidHandler] Redis get failed:', (err as any)?.message)
+        }
+    }
+
+    // Cache a lookup result only if no ownership write overlapped the lookup, in this handler or in
+    // any handler that shares Redis. A Redis failure falls back to the local cache, still fenced.
+    private async publishLookup(key: string, value: string, ttlSeconds: number, fence: LookupFence): Promise<void> {
+        if (fence.stale) return
+        if (this.redis) {
+            if (fence.redisGeneration !== null) {
+                try {
+                    await this.redis.eval(LID_CACHE_SCRIPTS.publish, 3, ...this.fenceKeys(key),
+                        fence.redisGeneration, value, Math.max(1, Math.floor(ttlSeconds)))
+                    return
+                } catch (err) {
+                    console.debug('[LidHandler] Redis set failed:', (err as any)?.message)
+                }
+            }
+            if (fence.stale) return
+        }
+        this.cache.set(key, value, ttlSeconds > 0 ? ttlSeconds : this.config.cacheTTL)
+    }
+
+    private endFence(key: string, fence: LookupFence): void {
         const fences = this.lookupFences.get(key)
         if (!fences) return
         fences.delete(fence)
@@ -588,7 +647,8 @@ export class LidHandler {
      * Order: invalidate caches, write the mapping (the cutover), release the holder, assign the
      * contact, publish the caches. A failed step stops the later steps; there is no duplicate-key
      * retry loop. Redis never disagrees with MongoDB: a Redis failure before the MongoDB writes leaves
-     * MongoDB unchanged; a failure while publishing leaves MongoDB moved and those cache keys empty.
+     * MongoDB unchanged. The write empties the affected keys and never publishes; the next lookup
+     * caches the new pair through the Redis-side fence (LID_CACHE_SCRIPTS).
      * An authoritative mapping write is the cutover and is kept if a later step fails.
      */
     async storeLidMapping(lid: string, phoneNumber: string, pushName?: string, options: { authoritative?: boolean } = {}): Promise<void> {
@@ -656,7 +716,8 @@ export class LidHandler {
             ])
             const holderId: string | null = holder ? (holder.id ?? null) : null
             const holderIsSelfRef = !!holder && typeof holderId === 'string' && normalizeJidForStorage(holderId) === lid
-            const contactOwner = holder && holderId !== phone && !holderIsSelfRef ? holderId : null
+            // Every holder except the target and a verified self-ref is an owner, also one without an id
+            const contactOwner = holder && holderId !== phone && !holderIsSelfRef ? (holderId ?? 'holder-without-id') : null
             const mappedPhone = this.asPhoneJid(mapping?.phoneNumber)
             const mappingOwner = mappedPhone && mappedPhone !== phone ? mappedPhone : null
 
@@ -673,9 +734,9 @@ export class LidHandler {
             for (const displaced of [contactOwner, mappingOwner]) {
                 if (displaced && isPhoneNumberFormat(displaced)) touchedKeys.push(this.getRedisKey('phone', normalizeJidForStorage(displaced)))
             }
-            this.startKeyWrites(touchedKeys)
             invalidated = true
-            if (this.config.enableCache) await this.cacheDeleteBoth(touchedKeys)
+            if (this.config.enableCache) await this.beginCacheWrite(touchedKeys)
+            else this.startKeyWrites(touchedKeys)
 
             // The mapping write is the cutover: lookups read lidMappings first. It also runs when the
             // mapping already agreed but contact work remains, because another writer can move the
@@ -727,10 +788,7 @@ export class LidHandler {
                 }
             }
 
-            if (this.config.enableCache) {
-                await this.cacheWriteBoth(this.getRedisKey('lid', lid), phone, this.config.cacheTTLSeconds)
-                await this.cacheWriteBoth(this.getRedisKey('phone', phone), lid, this.config.cacheTTLSeconds)
-            }
+            // No cache publication here: the next lookup caches the new pair through the fence
             console.log(`[LidHandler] Stored mapping in contacts: [redacted] -> [redacted]`)
         } catch (error) {
             const insertedId = insertedMappingId
@@ -744,7 +802,10 @@ export class LidHandler {
             reportBurst('[LidHandler] Failed to store LID mapping', errorKind(error))
         } finally {
             // A lookup that ran during this write must not cache what it read
-            if (invalidated) this.endKeyWrites(touchedKeys)
+            if (invalidated) {
+                if (this.config.enableCache) await this.endCacheWrite(touchedKeys)
+                else this.endKeyWrites(touchedKeys)
+            }
         }
     }
 
@@ -776,6 +837,7 @@ export class LidHandler {
         // WAB-1275: an ownership write during this lookup marks the fence; then the result is not cached
         const fence = this.beginFence(cacheKey)
         const lookupPromise = this.runWithLimiter(async () => {
+            await this.readFenceGeneration(cacheKey, fence)
             const result = await this.withConnectionCheck(
                 async () => {
                     if (!this.contactsCollection && !this.lidMappingsCollection) {
@@ -892,7 +954,7 @@ export class LidHandler {
             // WAB-1275: cache only this lookup's own key; the reverse key is written by its own lookup
             if (this.config.enableCache && !fence.stale) {
                 if (result) {
-                    await this.cacheSet(cacheKey, result, this.config.cacheTTLSeconds)
+                    await this.publishLookup(cacheKey, result, this.config.cacheTTLSeconds, fence)
                     // reset backoff on success
                     this.missBackoffCounts.delete(normalizedLid)
                 } else {
@@ -905,7 +967,7 @@ export class LidHandler {
                         const candidate = base * Math.pow(2, Math.max(0, misses - 1))
                         ttl = Math.min(this.config.maxNegativeCacheTTL, candidate)
                     }
-                    await this.cacheSet(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, ttl)
+                    await this.publishLookup(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, ttl, fence)
                 }
             }
             return result
@@ -937,6 +999,7 @@ export class LidHandler {
         // WAB-1275: see getPhoneNumberFromLid
         const fence = this.beginFence(cacheKey)
         const lookupPromise = this.runWithLimiter(async () => {
+            await this.readFenceGeneration(cacheKey, fence)
             const result = await this.withConnectionCheck(
                 async () => {
                     if (!this.contactsCollection && !this.lidMappingsCollection) {
@@ -1031,9 +1094,9 @@ export class LidHandler {
             const result = await lookupPromise
             if (this.config.enableCache && !fence.stale) {
                 if (result) {
-                    await this.cacheSet(cacheKey, result, this.config.cacheTTLSeconds)
+                    await this.publishLookup(cacheKey, result, this.config.cacheTTLSeconds, fence)
                 } else {
-                    await this.cacheSet(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL)
+                    await this.publishLookup(cacheKey, LidHandler.NEGATIVE_CACHE_SENTINEL, this.negativeCacheTTL, fence)
                 }
             }
             return result
