@@ -125,4 +125,23 @@ describe('WAB-1275 store ownership paths', () => {
         expect((await contacts().findOne({ instanceId, id: P2 }))?.lid).toBeUndefined()
         expect(await mappedPhone(instanceId)).toBe(P1)
     })
+
+    test('S14 (PR review): without the lidHandler option the store does not fetch LIDs it cannot store', async () => {
+        const instanceId = newInstance()
+        const getLIDsForPNs = jest.fn(async (pns: string[]) => pns.map((pn) => ({ pn, lid: L })))
+        const sock = {
+            signalRepository: { lidMapping: { getLIDForPN: async () => null, getLIDsForPNs } },
+            profilePictureUrl: async () => null,
+        }
+        const store = await make(instanceId, { sock, lidHandler: undefined, lidConfig: { requestDelay: 0, retryAttempts: 1 } })
+        const ev = new EventEmitter()
+        store.bind(ev)
+
+        ev.emit('contacts.upsert', [{ id: P2, notify: 'New' }])
+        await waitFor(async () => !!(await contacts().findOne({ instanceId, id: P2 })))
+        await new Promise((r) => setTimeout(r, 300))
+
+        expect(getLIDsForPNs).not.toHaveBeenCalled()
+        expect(await holderOf(instanceId)).toBeNull()
+    })
 })

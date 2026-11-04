@@ -663,6 +663,34 @@ describe('contacts.lid ownership (WAB-1275)', () => {
         expect(redis.data.get(redisKey('lid', L))).toBe(P2)
     })
 
+    test('S8o (PR review): an authoritative move whose reads are older than another handler\'s completed move still ends consistent', async () => {
+        const first = await makeHandler()
+        const second = await makeHandler()
+        await owner(P1)
+        const gate = deferred()
+        const reached = deferred()
+        // the second move pauses at its mapping write, after it read P1 as the owner
+        const target = coll(second, 'lidMappingsCollection')
+        const original = target.updateOne.bind(target)
+        jest.spyOn(target, 'updateOne').mockImplementation((async (filter: any, update: any, options?: any) => {
+            reached.resolve()
+            await gate.promise
+            return original(filter, update, options)
+        }) as any)
+
+        const pending = second.handleLidMappingUpdate({ lid: L, pn: P3 })
+        await Promise.race([reached.promise, pending])
+        await first.handleLidMappingUpdate({ lid: L, pn: P2 })
+        expect(await holderOf(L)).toBe(P2)
+        gate.resolve()
+        await pending
+
+        expect(await mappedPhone(L)).toBe(P3)
+        expect(await holderOf(L)).toBe(P3)
+        expect(await lidOf(P2)).toBeNull()
+        expect(lines(FAILED)).toEqual([])
+    })
+
     test('S9: concurrent moves of one LID in one handler leave contacts, mapping and cache in agreement', async () => {
         const handler = await makeHandler()
         await owner(P1)

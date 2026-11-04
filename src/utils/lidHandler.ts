@@ -766,17 +766,8 @@ export class LidHandler {
                 }
             }
 
-            if (holder && holderId !== phone) {
-                const released = await this.runOperation(() => contacts().updateOne(
-                    { _id: holder._id, instanceId, lid, id: holderId },
-                    { $unset: { lid: 1 }, $set: { updatedAt: now } }
-                ))
-                // The holder changed after our reads (for example a re-key): stop, never retry
-                if (released.matchedCount !== 1) throw Object.assign(new Error('LID holder changed'), { name: 'HolderChanged' })
-            }
-
-            if (!contactDone) {
-                const set = { lid, updatedAt: now, ...(setPushName ? { pushName, pushNameUpdatedAt: now } : {}) }
+            const set = { lid, updatedAt: now, ...(setPushName ? { pushName, pushNameUpdatedAt: now } : {}) }
+            const assign = async (): Promise<void> => {
                 try {
                     await this.runOperation(() => contacts().updateOne(
                         { instanceId, id: phone },
@@ -785,11 +776,26 @@ export class LidHandler {
                     ))
                 } catch (e: any) {
                     // A concurrent insert of the same contact id: update it once without upsert.
-                    // A conflict on the LID key is never retried.
+                    // A conflict on the LID key is never retried here.
                     const keyPattern = e?.keyPattern
                     if (e?.code !== 11000 || !keyPattern || !('id' in keyPattern) || 'lid' in keyPattern) throw e
                     await this.runOperation(() => contacts().updateOne({ instanceId, id: phone }, { $set: set }))
                 }
+            }
+
+            if (authoritative) {
+                if (mappings()) await this.reconcileAuthoritativeContact(lid, phone, now, assign)
+                else if (!contactDone) await assign()
+            } else {
+                if (holder && holderId !== phone) {
+                    const released = await this.runOperation(() => contacts().updateOne(
+                        { _id: holder._id, instanceId, lid, id: holderId },
+                        { $unset: { lid: 1 }, $set: { updatedAt: now } }
+                    ))
+                    // The holder changed after our reads (for example a re-key): stop, never retry
+                    if (released.matchedCount !== 1) throw Object.assign(new Error('LID holder changed'), { name: 'HolderChanged' })
+                }
+                if (!contactDone) await assign()
             }
 
             // No cache publication here: the next lookup caches the new pair through the fence
@@ -810,6 +816,45 @@ export class LidHandler {
                 if (this.config.enableCache) await this.endCacheWrite(touchedKeys, begunKeys)
                 else this.endKeyWrites(touchedKeys)
             }
+        }
+    }
+
+    /**
+     * WAB-1275: after an authoritative mapping write, give the contact LID to the phone that the
+     * mapping names. Another process can run its own authoritative write for the same LID at the same
+     * time. Each attempt re-reads the mapping: when it names a different phone, the later writer owns
+     * the completion and this one stops. Otherwise it releases the current holder (compare-and-set)
+     * and assigns. A lost race re-reads, at most three attempts.
+     */
+    private async reconcileAuthoritativeContact(lid: string, phone: string, now: Date, assign: () => Promise<void>): Promise<void> {
+        const instanceId = this.instanceId
+        const contacts = () => this.contactsCollection!
+        const mappings = () => this.lidMappingsCollection!
+        for (let attempt = 1; ; attempt++) {
+            const mapping = await this.runOperation(() => mappings().findOne({ instanceId, lid }, { projection: { phoneNumber: 1 } }))
+            if (this.asPhoneJid(mapping?.phoneNumber) !== phone) {
+                reportBurst(LidHandler.KEPT_LABEL, 'superseded')
+                return
+            }
+            const holder = await this.runOperation(() => contacts().findOne({ instanceId, lid }, { projection: { _id: 1, id: 1 } }))
+            let lost = false
+            if (holder && holder.id !== phone) {
+                const released = await this.runOperation(() => contacts().updateOne(
+                    { _id: holder._id, instanceId, lid, id: holder.id ?? null },
+                    { $unset: { lid: 1 }, $set: { updatedAt: now } }
+                ))
+                lost = released.matchedCount !== 1
+            }
+            if (!lost) {
+                try {
+                    await assign()
+                    return
+                } catch (e: any) {
+                    if (e?.code !== 11000) throw e
+                    lost = true
+                }
+            }
+            if (attempt >= 3) throw Object.assign(new Error('LID ownership race not settled'), { name: 'OwnershipRace' })
         }
     }
 

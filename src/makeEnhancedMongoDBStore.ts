@@ -4464,7 +4464,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
 
             // Fetch LIDs asynchronously in the background
             // Supports both Baileys v7 (signalRepository.lidMapping) and legacy (onWhatsApp) APIs
-            if (finalLidConfig?.enabled && sock) {
+            // WAB-1275: fetched LIDs are stored only through the LidHandler (the one ownership writer);
+            // without the lidHandler option there is nothing to store, so do not call WhatsApp
+            if (finalLidConfig?.enabled && sock && !lidHandler) {
+                log(`⏭️ [Contacts] Skipping LID fetch - no lidHandler configured`)
+            }
+            if (finalLidConfig?.enabled && sock && lidHandler) {
                 setImmediate(async () => {
                     const lidFetchPromise = (async () => {
                         if (isClosing || clearAllInProgress) {
