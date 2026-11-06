@@ -1310,6 +1310,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     
     // Operation locking for clearAll to prevent race conditions
     let clearAllInProgress = false
+    let activeClearAll: Promise<void> | null = null
     const pendingOperations = new Set<Promise<any>>()
     const pendingOperationsMetadata = new Map<Promise<any>, { startTime: number, description?: string }>()
     let historyDebounceTimer: NodeJS.Timeout | null = null
@@ -7215,7 +7216,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             // Check if clearAll is already in progress
             if (clearAllInProgress) {
-                log(`[${instanceId}] clearAll already in progress, skipping duplicate call`)
+                // WAB-1324: wait for it, so a caller (an isLatest history batch) cannot write inside its delete window
+                log(`[${instanceId}] clearAll already in progress, waiting for it instead of a duplicate call`)
+                await activeClearAll
                 return
             }
             
@@ -7226,6 +7229,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             clearAllInProgress = true
+            let finishClearAll!: () => void
+            activeClearAll = new Promise<void>((resolve) => { finishClearAll = resolve })
             const startTime = Date.now()
             
             try {
@@ -7250,9 +7255,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
 
                 // WAB-1324: history writes still queued would write the cleared history back; drop them and let the
-                // running ones finish before the delete.
-                const droppedHistoryWrites = historyWriteLimiter.clear(new Error(`clearAll dropped a queued history write for ${instanceId}`))
-                if (droppedHistoryWrites > 0 || historyWriteLimiter.active > 0) {
+                // running ones finish before the delete. A clear that keeps the messages keeps their queued writes.
+                const clearsMessages = !options?.preserve?.includes('messages')
+                const droppedHistoryWrites = clearsMessages
+                    ? historyWriteLimiter.clear(new Error(`clearAll dropped a queued history write for ${instanceId}`))
+                    : 0
+                if (clearsMessages && (droppedHistoryWrites > 0 || historyWriteLimiter.active > 0)) {
                     log(`[${instanceId}] clearAll dropped ${droppedHistoryWrites} queued history write(s); waiting for ${historyWriteLimiter.active} running`)
                     const maxWait = config.maxPendingOpsWait || config.clearAllTimeout || 10000
                     let waitTimer: NodeJS.Timeout | undefined
@@ -7361,6 +7369,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 clearAllInProgress = false
+                activeClearAll = null
+                finishClearAll()
             }
         },
 
