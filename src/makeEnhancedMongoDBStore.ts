@@ -6765,6 +6765,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
                 if (await shouldStoreEvent('messaging-history.set', historyData)) {
+                    // WAB-1324: close() may have run during the await; a closed store schedules no history
+                    if (isClosing) return
                     try {
                         // Add to pending data
                         pendingHistoryData.push(historyData)
@@ -6780,7 +6782,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             historyDebounceTimer = null
                             
                             try {
-                                if (pendingHistoryData.length === 0) return
+                                if (pendingHistoryData.length === 0 || isClosing) return
                                 
                                 const dataToProcess = [...pendingHistoryData]
                                 pendingHistoryData.length = 0 // Clear array
@@ -6794,6 +6796,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 if (hasLatest && config.clearAllOnHistorySync) {
                                 log(`[${instanceId}] Clearing data before syncing latest history (isLatest=true, clearAllOnHistorySync=true) while preserving contacts`)
                                 await storeImpl.clearAll({ preserve: ['contacts'] })
+                                // WAB-1324: close() may have run while this waited for an active clear
+                                if (isClosing) return
                                 }
                                 
                                 // Merge all history data

@@ -207,6 +207,110 @@ it('close cancels queued history writes', async () => {
     }
 })
 
+const within = async <T>(promise: Promise<T>, ms = 1500): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined
+    try {
+        return await Promise.race([promise, new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('test deadline')), ms) })])
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+// Review round 3 (R3-1): close() must also stop history that was still being admitted or waiting for a clear.
+it('close does not drain the queue and leaves no unhandled rejection', async () => {
+    const instanceId = 'inst-wab1324-g'
+    const store: any = await makeEnhancedMongoDBStore({ ...baseStoreConfig(h.uri), instanceId, historyWriteConcurrency: 1 } as any)
+    const ev = new EventEmitter()
+    const started = deferred()
+    const gate = deferred()
+    const unhandled: unknown[] = []
+    const onUnhandled = (error: unknown) => { unhandled.push(error) }
+    process.on('unhandledRejection', onUnhandled)
+    let calls = 0
+    try {
+        countInFlight(store, async () => { calls++; started.resolve(); await gate.promise })
+        store.bind(ev)
+        ev.emit('messaging-history.set', {
+            chats: [], contacts: [], isLatest: false,
+            messages: Array.from({ length: 20 }, (_, i) => historyMessage(`queued${i}`)),
+        })
+        await within(started.promise)
+        await within(store.close()) // the gate still holds the running write: close must not wait for the queue
+        expect(calls).toBe(1)
+        gate.resolve()
+        await sleep(100)
+        expect(calls).toBe(1)
+        expect(unhandled).toHaveLength(0)
+    } finally {
+        gate.resolve()
+        process.removeListener('unhandledRejection', onUnhandled)
+        await store.close()
+    }
+})
+
+it('history still being admitted when close() runs is never scheduled', async () => {
+    const instanceId = 'inst-wab1324-h'
+    const store: any = await makeEnhancedMongoDBStore({ ...baseStoreConfig(h.uri), instanceId, debounceHistoryEvents: true, debounceDelay: 500, historyWriteConcurrency: 1 } as any)
+    const ev = new EventEmitter()
+    let calls = 0
+    countInFlight(store, async () => { calls++ })
+    try {
+        store.bind(ev)
+        ev.emit('messaging-history.set', {
+            chats: [], contacts: [], isLatest: false,
+            messages: Array.from({ length: 20 }, (_, i) => historyMessage(`late${i}`)),
+        })
+        await within(store.close())
+        expect(calls).toBe(0)
+        await sleep(650)
+        expect(calls).toBe(0)
+    } finally {
+        await store.close()
+    }
+})
+
+it('a latest-history batch waiting for a clear enqueues nothing after close()', async () => {
+    const instanceId = 'inst-wab1324-i'
+    const store: any = await makeEnhancedMongoDBStore({ ...baseStoreConfig(h.uri), instanceId, historyWriteConcurrency: 1, clearAllOnHistorySync: true } as any)
+    const ev = new EventEmitter()
+    const started = deferred()
+    const gate = deferred()
+    const joined = deferred()
+    const originalClear = store.clearAll
+    let clearCalls = 0
+    let latestCalls = 0
+    jest.spyOn(store, 'clearAll').mockImplementation((...args: any[]) => {
+        const result = originalClear(...args)
+        if (++clearCalls === 2) joined.resolve()
+        return result
+    })
+    countInFlight(store, async (id) => {
+        if (id === 'old1') { started.resolve(); await gate.promise } else latestCalls++
+    })
+    let clearing: Promise<string> | undefined
+    try {
+        store.bind(ev)
+        ev.emit('messaging-history.set', { chats: [], contacts: [], isLatest: false, messages: [historyMessage('old1')] })
+        await within(started.promise)
+        clearing = store.clearAll({ preserve: ['contacts'] }).then(() => 'resolved', (error: Error) => error.name)
+        ev.emit('messaging-history.set', {
+            chats: [], contacts: [], isLatest: true,
+            messages: Array.from({ length: 20 }, (_, i) => historyMessage(`latest${i}`)),
+        })
+        await within(joined.promise)
+        await within(store.close())
+        expect(latestCalls).toBe(0)
+        gate.resolve()
+        await within(clearing as Promise<string>)
+        await sleep(150)
+        expect(latestCalls).toBe(0)
+    } finally {
+        gate.resolve()
+        if (clearing) await within(clearing)
+        await store.close()
+    }
+})
+
 it('keeps one limit per store across two history batches that overlap', async () => {
     const instanceId = 'inst-wab1324-b'
     const store: any = await makeEnhancedMongoDBStore({ ...baseStoreConfig(h.uri), instanceId, historyWriteConcurrency: 5 } as any)
