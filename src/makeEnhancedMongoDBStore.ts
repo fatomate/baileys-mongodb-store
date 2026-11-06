@@ -1304,9 +1304,13 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
     const lidMappingLimiter = createTaskLimiter(lidHandlerConfig?.mappingUpdateConcurrency ?? 16)
     let pendingLidMappingUpdates = 0
     const LID_DRAIN_TIMEOUT_MS = 15000
+    // WAB-1324: history upserts in flight per store, also across overlapping history batches. One upsert per
+    // message at once (150k for a large phone) exhausted the engine heap and the shared MongoDB pool.
+    const historyWriteLimiter = createTaskLimiter(config.historyWriteConcurrency ?? 10)
     
     // Operation locking for clearAll to prevent race conditions
     let clearAllInProgress = false
+    let activeClearAll: Promise<void> | null = null
     const pendingOperations = new Set<Promise<any>>()
     const pendingOperationsMetadata = new Map<Promise<any>, { startTime: number, description?: string }>()
     let historyDebounceTimer: NodeJS.Timeout | null = null
@@ -3826,6 +3830,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
         if (isBound && currentEventEmitter) {
             log(`[${instanceId}] Unbinding all event listeners during close`)
             storeImpl.unbind()
+        }
+
+        // WAB-1324: history writes not yet started would only fail after the close; drop them now (no drain, as before)
+        const droppedHistoryWrites = historyWriteLimiter.clear(new StoreClosedError(validatedInstanceId))
+        if (droppedHistoryWrites > 0) {
+            console.error(`[${instanceId}] close() dropped ${droppedHistoryWrites} queued history write(s), ${historyWriteLimiter.active} still running`)
         }
 
         // One deadline for the drain and for a reconnect in flight
@@ -6755,6 +6765,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 
                 const historyData = { chats: newChats, contacts: newContacts, messages: newMessages, isLatest }
                 if (await shouldStoreEvent('messaging-history.set', historyData)) {
+                    // WAB-1324: close() may have run during the await; a closed store schedules no history
+                    if (isClosing) return
                     try {
                         // Add to pending data
                         pendingHistoryData.push(historyData)
@@ -6770,7 +6782,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                             historyDebounceTimer = null
                             
                             try {
-                                if (pendingHistoryData.length === 0) return
+                                if (pendingHistoryData.length === 0 || isClosing) return
                                 
                                 const dataToProcess = [...pendingHistoryData]
                                 pendingHistoryData.length = 0 // Clear array
@@ -6784,6 +6796,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                 if (hasLatest && config.clearAllOnHistorySync) {
                                 log(`[${instanceId}] Clearing data before syncing latest history (isLatest=true, clearAllOnHistorySync=true) while preserving contacts`)
                                 await storeImpl.clearAll({ preserve: ['contacts'] })
+                                // WAB-1324: close() may have run while this waited for an active clear
+                                if (isClosing) return
                                 }
                                 
                                 // Merge all history data
@@ -6848,7 +6862,7 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                                     // Process messages for each chat
                                     for (const [chatId, messages] of messagesByChat) {
                                         for (const msg of messages) {
-                                            promises.push(storeImpl.upsertMessage(chatId, msg, true))
+                                            promises.push(historyWriteLimiter.run(() => storeImpl.upsertMessage(chatId, msg, true)))
                                         }
                                     }
                                 }
@@ -7212,7 +7226,9 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             // Check if clearAll is already in progress
             if (clearAllInProgress) {
-                log(`[${instanceId}] clearAll already in progress, skipping duplicate call`)
+                // WAB-1324: wait for it, so a caller (an isLatest history batch) cannot write inside its delete window
+                log(`[${instanceId}] clearAll already in progress, waiting for it instead of a duplicate call`)
+                await activeClearAll
                 return
             }
             
@@ -7223,6 +7239,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
             
             clearAllInProgress = true
+            let finishClearAll!: () => void
+            activeClearAll = new Promise<void>((resolve) => { finishClearAll = resolve })
             const startTime = Date.now()
             
             try {
@@ -7244,6 +7262,23 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                         new Promise(resolve => setTimeout(resolve, maxWait))
                     ])
                     pendingOperations.clear()
+                }
+
+                // WAB-1324: history writes still queued would write the cleared history back; drop them and let the
+                // running ones finish before the delete. A clear that keeps the messages keeps their queued writes.
+                const clearsMessages = !options?.preserve?.includes('messages')
+                const droppedHistoryWrites = clearsMessages
+                    ? historyWriteLimiter.clear(new Error(`clearAll dropped a queued history write for ${instanceId}`))
+                    : 0
+                if (clearsMessages && (droppedHistoryWrites > 0 || historyWriteLimiter.active > 0)) {
+                    log(`[${instanceId}] clearAll dropped ${droppedHistoryWrites} queued history write(s); waiting for ${historyWriteLimiter.active} running`)
+                    const maxWait = config.maxPendingOpsWait || config.clearAllTimeout || 10000
+                    let waitTimer: NodeJS.Timeout | undefined
+                    await Promise.race([
+                        historyWriteLimiter.idle(),
+                        new Promise(resolve => { waitTimer = setTimeout(resolve, maxWait) })
+                    ])
+                    clearTimeout(waitTimer)
                 }
                 
                 // Pause all queues if using Bull
@@ -7344,6 +7379,8 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
                 }
                 
                 clearAllInProgress = false
+                activeClearAll = null
+                finishClearAll()
             }
         },
 
