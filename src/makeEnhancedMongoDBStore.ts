@@ -3832,6 +3832,12 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             storeImpl.unbind()
         }
 
+        // WAB-1324: history writes not yet started would only fail after the close; drop them now (no drain, as before)
+        const droppedHistoryWrites = historyWriteLimiter.clear(new StoreClosedError(validatedInstanceId))
+        if (droppedHistoryWrites > 0) {
+            console.error(`[${instanceId}] close() dropped ${droppedHistoryWrites} queued history write(s), ${historyWriteLimiter.active} still running`)
+        }
+
         // One deadline for the drain and for a reconnect in flight
         const deadline = Date.now() + LID_DRAIN_TIMEOUT_MS
         await drainLidMappingUpdates(deadline)

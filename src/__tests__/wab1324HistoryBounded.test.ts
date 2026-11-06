@@ -178,6 +178,35 @@ it('an isLatest history batch during another clearAll keeps its messages', async
     }
 })
 
+// PR review (Codex P2): close() must not leave the queued history to start after it returns. Accepted history that
+// is not written is lost at close, as before the limiter (owner decision: no drain).
+it('close cancels queued history writes', async () => {
+    const instanceId = 'inst-wab1324-f'
+    const store: any = await makeEnhancedMongoDBStore({ ...baseStoreConfig(h.uri), instanceId, historyWriteConcurrency: 1 } as any)
+    const ev = new EventEmitter()
+    const started = deferred()
+    const gate = deferred()
+    let calls = 0
+    try {
+        countInFlight(store, async () => { calls++; started.resolve(); await gate.promise })
+        store.bind(ev)
+        ev.emit('messaging-history.set', {
+            chats: [], contacts: [], isLatest: false,
+            messages: Array.from({ length: 20 }, (_, i) => historyMessage(`closing${i}`)),
+        })
+        await started.promise
+        const closed = store.close()
+        await sleep(50)
+        gate.resolve()
+        await closed
+        await sleep(300)
+        expect(calls).toBe(1)
+    } finally {
+        gate.resolve()
+        await store.close()
+    }
+})
+
 it('keeps one limit per store across two history batches that overlap', async () => {
     const instanceId = 'inst-wab1324-b'
     const store: any = await makeEnhancedMongoDBStore({ ...baseStoreConfig(h.uri), instanceId, historyWriteConcurrency: 5 } as any)
