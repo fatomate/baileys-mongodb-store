@@ -423,6 +423,12 @@ export interface EnhancedMongoDBStoreConfig {
      * Time to wait for additional events before processing
      */
     debounceDelay?: number
+
+    /**
+     * Most history-sync message upserts in flight per store, across overlapping batches (WAB-1324)
+     * Default: 10
+     */
+    historyWriteConcurrency?: number
     
     /**
      * Whether to wait for pending operations before clearAll
