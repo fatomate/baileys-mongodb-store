@@ -750,7 +750,7 @@ async function downloadFromOfficialAPI(
             )
         
             // Check if the response is JSON (contains URL) or direct media
-            contentType = firstResponse.headers['content-type'] || ''
+            contentType = String(firstResponse.headers['content-type'] ?? '')
         
             if (contentType.includes('application/json')) {
                 // Convert stream to JSON
