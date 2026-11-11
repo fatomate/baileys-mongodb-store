@@ -1,7 +1,7 @@
 // WAB-859 acceptance: receipts do not move stored message times, LID-addressed messages are
 // stored under the phone jid, and a re-key conflict never drops a new message. Real mongod.
 // jest.mock factories are hoisted above imports, so they must use require().
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 

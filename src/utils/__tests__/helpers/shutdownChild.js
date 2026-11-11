@@ -1,7 +1,7 @@
 // WAB-866 child process for the SIGTERM shutdown test. Loads the TypeScript source with
 // typescript.transpileModule (no ts-node in this repo), starts one manager, holds one job for
 // 1.5 s, and lets the manager's own SIGTERM handler shut it down.
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('fs')
 const path = require('path')
 const ts = require('typescript')

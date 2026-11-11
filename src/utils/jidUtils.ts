@@ -129,7 +129,7 @@ export const extractLidPhonePair = (jid1: string, jid2: string): { lid: string; 
     }
     
     // Extract the LID and phone number
-    let result: { lid: string; phoneNumber: string } | null = null
+    let result: { lid: string; phoneNumber: string }
     
     if (isLidFormat(norm1) && isPhoneNumberFormat(norm2)) {
         result = { lid: norm1, phoneNumber: norm2 }

@@ -1,7 +1,7 @@
 // WAB-654 acceptance: messages written through the store's public API are stored with a
 // BSON Int32 seconds messageTimestamp, whatever shape the caller passes. Real mongod.
 // jest.mock factories are hoisted above imports, so they must use require().
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 

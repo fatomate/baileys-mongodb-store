@@ -1,7 +1,7 @@
 // WAB-484: writes that change what a Live Chat conversation summary shows (revoke preview,
 // grouping JID) must move updatedAt, because the backend list cache reads its delta by updatedAt.
 // Real mongod. jest.mock factories are hoisted above imports, so they must use require().
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 
