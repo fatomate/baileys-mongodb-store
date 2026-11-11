@@ -14,7 +14,7 @@ export type {
 } from './types/connection'
 
 // For CommonJS compatibility
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 module.exports = {
     makeMongoDBStore: require('./makeMongoDBStore').makeMongoDBStore,
     cleanupMongoDBStore: require('./makeMongoDBStore').cleanupMongoDBStore,

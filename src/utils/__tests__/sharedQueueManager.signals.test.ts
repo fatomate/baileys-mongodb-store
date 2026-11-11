@@ -2,7 +2,7 @@
 // the manager's own signal handler, which shuts the queues down and calls process.exit(0) before
 // the application can drain. The default stays as it was, so other users keep their behaviour.
 // Redis and BullMQ are fakes: these tests check signal wiring only.
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('ioredis', () => {
     class FakeRedis {
         on() { return this }

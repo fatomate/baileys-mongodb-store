@@ -757,7 +757,7 @@ export class SharedQueueManager extends EventEmitter {
         }
         
         // Determine owner for this instance so the correct worker handles the job
-        let ownerId: string | null = null
+        let ownerId: string | null
         if (this.claimedInstances.has(instanceId)) {
             ownerId = this.workerId
             await this.extendOwnership(instanceId)

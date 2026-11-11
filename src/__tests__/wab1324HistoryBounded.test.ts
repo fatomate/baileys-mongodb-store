@@ -2,7 +2,7 @@
 // The handler ran Promise.all over every message of the merged batch, so a 150k-message
 // history put 150k deep clones and MongoDB operations in flight and the engine ran out of heap.
 // Real mongod; the public upsertMessage is wrapped only to count calls in flight.
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 

@@ -1,6 +1,6 @@
 // WAB-1070: clearAll must not delete the messages of an instance while it keeps its chats.
 // That left chats with counted unread and no messages in the backend. Real mongod.
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 

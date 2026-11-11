@@ -1,7 +1,7 @@
 // WAB-866: a Baileys media message is downloaded inline only; the store must not also add a
 // MEDIA_DOWNLOAD job to the shared media queue. Real mongod; queue manager and downloader are fakes.
 // jest.mock factories are hoisted above imports, so they must use require().
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 jest.mock('../utils/sharedQueueManager', () => {

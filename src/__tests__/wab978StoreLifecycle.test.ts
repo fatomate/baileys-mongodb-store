@@ -1,6 +1,6 @@
 // WAB-978: a closed store, a duplicate store or a closed pool must not lose LID mappings
 // or break other stores that share the pool. Real mongod; shared ConnectionManager pools.
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 

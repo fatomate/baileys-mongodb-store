@@ -1,6 +1,6 @@
 // WAB-1275: the store paths that write contacts.lid follow the one ownership rule.
 // Real mongod; the store creates its production indexes (unique instanceId + lid).
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 jest.mock('baileys', () => require('./helpers/baileysDouble').baileysMock)
 jest.mock('baileys/lib/Types/LabelAssociation', () => ({ LabelAssociationType: { Chat: 'label_jid', Message: 'label_message' } }), { virtual: true })
 

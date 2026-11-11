@@ -19,7 +19,7 @@ module.exports = {
                 skipLibCheck: true,
                 forceConsistentCasingInFileNames: true,
                 resolveJsonModule: true,
-                moduleResolution: 'node',
+                moduleResolution: 'bundler',
                 types: ['node', 'jest']
             }
         }]
