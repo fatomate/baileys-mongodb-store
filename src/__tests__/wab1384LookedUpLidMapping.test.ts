@@ -120,11 +120,43 @@ describe('WAB-1384 storeLookedUpLidMapping', () => {
         expect(await holderOf(other)).toBe(P1)
     })
 
+    // Review round 3 (R1-1, R1-2): one owner rule for the pre-check, the write and the read-back. A digits-only
+    // phoneNumber is a phone owner, and a legacy LID spelling without the @lid suffix counts as the same LID.
+    test('a digits-only mapping of another phone is kept, not replaced', async () => {
+        const instanceId = newInstance()
+        const store = await make(instanceId)
+        await mappings().insertOne({ instanceId, lid: L, phoneNumber: '60123451011', firstSeen: new Date() })
+        expect(await store.storeLookedUpLidMapping(L, P2)).toBe('kept')
+        expect(await mappedPhone(instanceId)).toBe('60123451011')
+        expect(await holderOf(instanceId)).toBeNull()
+    })
+
+    test('a digits-only mapping of the same phone is upgraded to the phone JID', async () => {
+        const instanceId = newInstance()
+        const store = await make(instanceId)
+        await mappings().insertOne({ instanceId, lid: L, phoneNumber: '60123451011', firstSeen: new Date() })
+        expect(await store.storeLookedUpLidMapping(L, P1)).toBe('stored')
+        expect(await mappedPhone(instanceId)).toBe(P1)
+        expect(await holderOf(instanceId)).toBe(P1)
+    })
+
+    test('a legacy mapping under the LID without its @lid suffix, for another phone, is kept', async () => {
+        const instanceId = newInstance()
+        const store = await make(instanceId)
+        await mappings().insertOne({ instanceId, lid: '987651001', phoneNumber: P1, firstSeen: new Date() })
+        expect(await store.storeLookedUpLidMapping(L, P2)).toBe('kept')
+        expect(await mappings().countDocuments({ instanceId, lid: L })).toBe(0)
+        expect(await holderOf(instanceId)).toBeNull()
+    })
+
     test.each([
         ['a phone as the LID', P1, P2],
         ['a LID as the phone', L, '987651009@lid'],
         ['an empty LID', '', P1],
         ['a group as the phone', L, '1203630@g.us'],
+        ['an empty LID user', '@lid', P1],
+        ['a non-numeric LID user', 'not-a-number@lid', P1],
+        ['a non-numeric device', '987651001:x@lid', P1],
     ])('%s is invalid and writes nothing', async (_label, lid, pn) => {
         const instanceId = newInstance()
         const store = await make(instanceId)

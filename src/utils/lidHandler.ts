@@ -1849,31 +1849,56 @@ export class LidHandler {
      * another owner holds it, 'unavailable' when nothing could be written or read, 'invalid' for a bad LID or phone.
      */
     async storeLookedUpLidMapping(lid: string, phoneNumber: string): Promise<'stored' | 'kept' | 'unavailable' | 'invalid'> {
-        const normalizedLid = normalizeJidForStorage(lid)
+        const lidMatch = typeof lid === 'string' ? /^(\d{1,32})(?::\d+)?@lid$/.exec(lid.trim()) : null
         const normalizedPhone = canonicalPhoneJid(phoneNumber)
-        if (!normalizedLid || !this.isLidFormat(normalizedLid) || !normalizedPhone) return 'invalid'
+        if (!lidMatch || !normalizedPhone) return 'invalid'
+        const normalizedLid = `${lidMatch[1]}@lid`
         if (!this.isConnected()) return 'unavailable'
-        const instanceId = this.instanceId
         return this.withLidLock(normalizedLid, async () => {
+            try {
+                // Checked before the write as well: the ordinary write replaces a digits-only phoneNumber and ignores
+                // a legacy LID spelling, but both are owners here, as for the Chat History reader.
+                if ((await this.lookedUpLidOwners(normalizedLid, lidMatch[1])).other(normalizedPhone)) return 'kept'
+            } catch {
+                return 'unavailable'
+            }
             await this.writeLidOwnership(normalizedLid, normalizedPhone, undefined, false)
             try {
-                const [holder, mapping] = await Promise.all([
-                    this.runOperation(() => this.contactsCollection!.findOne({ instanceId, lid: normalizedLid }, { projection: { _id: 0, id: 1 } })),
-                    this.lidMappingsCollection
-                        ? this.runOperation(() => this.lidMappingsCollection!.findOne({ instanceId, lid: normalizedLid }, { projection: { _id: 0, phoneNumber: 1 } }))
-                        : Promise.resolve(null),
-                ])
-                // Same owner rule as writeLidOwnership: any holder except this phone and the LID's self-reference owns it
-                const holderId: string | null = holder ? (holder.id ?? null) : null
-                const holderIsSelfRef = typeof holderId === 'string' && normalizeJidForStorage(holderId) === normalizedLid
-                const mappedPhone = this.asPhoneJid(mapping?.phoneNumber)
-                if ((holder && holderId !== normalizedPhone && !holderIsSelfRef) || (mappedPhone && mappedPhone !== normalizedPhone)) return 'kept'
-                const mappingAgrees = !this.lidMappingsCollection || mappedPhone === normalizedPhone
-                return holderId === normalizedPhone && mappingAgrees ? 'stored' : 'unavailable'
+                const owners = await this.lookedUpLidOwners(normalizedLid, lidMatch[1])
+                if (owners.other(normalizedPhone)) return 'kept'
+                return owners.holds(normalizedPhone) ? 'stored' : 'unavailable'
             } catch {
                 return 'unavailable'
             }
         })
+    }
+
+    /**
+     * WAB-1384: every contact holder and mapping of a LID under both spellings (`<digits>@lid` and bare digits), with
+     * one owner rule: any contact holder except the phone and the LID's own self-reference, and any mapping whose
+     * phoneNumber is a phone in any form (JID, c.us or digits only).
+     */
+    private async lookedUpLidOwners(lid: string, lidUser: string): Promise<{ other: (phone: string) => boolean; holds: (phone: string) => boolean }> {
+        const instanceId = this.instanceId
+        const spellings = [lid, lidUser]
+        const [holders, mappings] = await Promise.all([
+            this.runOperation(() => this.contactsCollection!.find({ instanceId, lid: { $in: spellings } }, { projection: { _id: 0, id: 1 } }).limit(10).toArray()),
+            this.lidMappingsCollection
+                ? this.runOperation(() => this.lidMappingsCollection!.find({ instanceId, lid: { $in: spellings } }, { projection: { _id: 0, phoneNumber: 1 } }).limit(10).toArray())
+                : Promise.resolve([] as Array<{ phoneNumber?: string }>),
+        ])
+        const asPhone = (value: unknown): string | null => {
+            if (typeof value !== 'string') return null
+            return canonicalPhoneJid(value) ?? (/^\d{5,20}$/.test(value.trim()) ? `${value.trim()}@s.whatsapp.net` : null)
+        }
+        const holderIds = holders.map((h: any) => (typeof h.id === 'string' ? h.id : ''))
+        const mappedPhones = mappings.map((m: any) => asPhone(m.phoneNumber)).filter((p): p is string => !!p)
+        return {
+            other: (phone) => holderIds.some((id) => normalizeJidForStorage(id) !== lid && asPhone(id) !== phone)
+                || mappedPhones.some((p) => p !== phone),
+            holds: (phone) => holderIds.some((id) => asPhone(id) === phone)
+                && (!this.lidMappingsCollection || mappedPhones.includes(phone)),
+        }
     }
 
     /**
