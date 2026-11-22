@@ -1,11 +1,11 @@
 {
   "name": "@fatomate/baileys-mongodb-store",
-  "version": "2.30.6",
+  "version": "2.30.7",
   "description": "MongoDB store implementation for WhiskeySockets Baileys WhatsApp Web API with multi-instance support and TTL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-declarations.js",
     "dev": "tsc --watch",
     "test": "jest",
     "test:watch": "jest --watch",

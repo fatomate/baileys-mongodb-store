@@ -615,6 +615,18 @@ export interface EnhancedMongoDBStore {
     resetEventMetrics(eventType?: string): void
 
     /**
+     * WAB-1384: true while the store can save LID pairs (LID handler present, not closing or clearing)
+     */
+    canStoreLidMappings(): boolean
+
+    /**
+     * WAB-1384: save a PN-LID pair the caller looked up. An ordinary write that never takes the LID from its current
+     * owner. 'stored': contacts and lidMappings now give the LID to pn; 'kept': another owner holds it;
+     * 'unavailable': the store cannot write or the result could not be read; 'invalid': bad LID or phone.
+     */
+    storeLookedUpLidMapping(lid: string, pn: string): Promise<'stored' | 'kept' | 'unavailable' | 'invalid'>
+
+    /**
      * Get LID resolution metrics for specific operation type or all operation types
      */
     getLidResolutionMetrics(operationType?: string): LidResolutionMetrics | LidResolutionMetrics[]
