@@ -3995,6 +3995,18 @@ export const makeEnhancedMongoDBStore = async (config: EnhancedMongoDBStoreConfi
             }
         },
 
+        // WAB-1384: true while this store can save LID pairs: it has the LID handler and is not closing or clearing.
+        canStoreLidMappings(): boolean {
+            return !!lidHandler && !isClosing && !clearAllInProgress
+        },
+
+        // WAB-1384: save a PN-LID pair the caller looked up (Baileys getLIDForPN). An ordinary write: it never takes
+        // the LID from its current owner (WAB-1275), unlike lid-mapping.update. See LidHandler.storeLookedUpLidMapping.
+        async storeLookedUpLidMapping(lid: string, pn: string): Promise<'stored' | 'kept' | 'unavailable' | 'invalid'> {
+            if (!lidHandler || isClosing || clearAllInProgress) return 'unavailable'
+            return lidHandler.storeLookedUpLidMapping(lid, pn)
+        },
+
         getLidResolutionMetrics(operationType?: string): LidResolutionMetrics | LidResolutionMetrics[] {
             if (operationType) {
                 return lidResolutionMetricsMap.get(operationType) || {

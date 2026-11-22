@@ -1843,6 +1843,40 @@ export class LidHandler {
     }
 
     /**
+     * WAB-1384: save a pair the caller looked up itself (Baileys getLIDForPN). An ordinary write (WAB-1275): it never
+     * takes the LID from its current owner, because a looked-up answer can be a stale cached pair. Under the same LID
+     * lock it then reads the stored state: 'stored' when contacts and lidMappings give the LID to this phone, 'kept' when
+     * another owner holds it, 'unavailable' when nothing could be written or read, 'invalid' for a bad LID or phone.
+     */
+    async storeLookedUpLidMapping(lid: string, phoneNumber: string): Promise<'stored' | 'kept' | 'unavailable' | 'invalid'> {
+        const normalizedLid = normalizeJidForStorage(lid)
+        const normalizedPhone = canonicalPhoneJid(phoneNumber)
+        if (!normalizedLid || !this.isLidFormat(normalizedLid) || !normalizedPhone) return 'invalid'
+        if (!this.isConnected()) return 'unavailable'
+        const instanceId = this.instanceId
+        return this.withLidLock(normalizedLid, async () => {
+            await this.writeLidOwnership(normalizedLid, normalizedPhone, undefined, false)
+            try {
+                const [holder, mapping] = await Promise.all([
+                    this.runOperation(() => this.contactsCollection!.findOne({ instanceId, lid: normalizedLid }, { projection: { _id: 0, id: 1 } })),
+                    this.lidMappingsCollection
+                        ? this.runOperation(() => this.lidMappingsCollection!.findOne({ instanceId, lid: normalizedLid }, { projection: { _id: 0, phoneNumber: 1 } }))
+                        : Promise.resolve(null),
+                ])
+                // Same owner rule as writeLidOwnership: any holder except this phone and the LID's self-reference owns it
+                const holderId: string | null = holder ? (holder.id ?? null) : null
+                const holderIsSelfRef = typeof holderId === 'string' && normalizeJidForStorage(holderId) === normalizedLid
+                const mappedPhone = this.asPhoneJid(mapping?.phoneNumber)
+                if ((holder && holderId !== normalizedPhone && !holderIsSelfRef) || (mappedPhone && mappedPhone !== normalizedPhone)) return 'kept'
+                const mappingAgrees = !this.lidMappingsCollection || mappedPhone === normalizedPhone
+                return holderId === normalizedPhone && mappingAgrees ? 'stored' : 'unavailable'
+            } catch {
+                return 'unavailable'
+            }
+        })
+    }
+
+    /**
      * Handle lid-mapping.update event from Baileys v7
      * Stores the mapping in MongoDB
      * 
