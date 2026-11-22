@@ -140,6 +140,18 @@ describe('WAB-1384 storeLookedUpLidMapping', () => {
         expect(await holderOf(instanceId)).toBe(P1)
     })
 
+    // Accepted limitation (review round 4, R4-1, owner decision): the same phone stored only under a legacy alias
+    // (a c.us mapping or a digits-only contact holder) is not completed, because the WAB-1275 ordinary write treats the
+    // alias as another owner. The outcome is 'unavailable' with nothing changed, never a wrong owner.
+    test('a same-phone c.us mapping alone is left unchanged and reported unavailable (accepted limitation)', async () => {
+        const instanceId = newInstance()
+        const store = await make(instanceId)
+        await mappings().insertOne({ instanceId, lid: L, phoneNumber: '60123451011@c.us', firstSeen: new Date() })
+        expect(await store.storeLookedUpLidMapping(L, P1)).toBe('unavailable')
+        expect(await mappedPhone(instanceId)).toBe('60123451011@c.us')
+        expect(await holderOf(instanceId)).toBeNull()
+    })
+
     test('a legacy mapping under the LID without its @lid suffix, for another phone, is kept', async () => {
         const instanceId = newInstance()
         const store = await make(instanceId)
